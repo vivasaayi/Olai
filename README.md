@@ -226,6 +226,46 @@ book-reader/
     └── icons/               # App icons
 ```
 
+## Packaging Guides
+
+### macOS (local machine)
+```bash
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+cargo tauri build
+# Bundles appear under src-tauri/target/release/bundle/macos
+```
+
+### Windows (via GitHub Actions or Windows host)
+```powershell
+rustup target add x86_64-pc-windows-msvc
+cargo tauri build
+# Output: src-tauri/target/release/bundle/msi + exe
+```
+
+### Linux (Ubuntu example)
+```bash
+sudo apt-get update && sudo apt-get install -y \
+       build-essential libgtk-3-dev libayatana-appindicator3-dev \
+       webkit2gtk-4.1 libxdo-dev
+cargo tauri build
+# Output: src-tauri/target/release/bundle/appimage|deb
+```
+
+### iOS (experimental, requires Xcode)
+```bash
+rbenv init # ensure Xcode command-line tools installed
+rustup target add aarch64-apple-ios
+cargo tauri ios init
+cargo tauri ios build
+```
+
+### Android (experimental)
+```bash
+# Install Android Studio + SDK (33+), set ANDROID_HOME
+cargo tauri android init
+cargo tauri android build
+```
+
 ## 10. Roadmap
 
 ### ✅ Completed

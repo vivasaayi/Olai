@@ -1,0 +1,61 @@
+name: Build Tauri Bundles
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tauri:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: web/node_modules
+          key: ${{ matrix.platform }}-npm-${{ hashFiles('web/package-lock.json') }}
+          restore-keys: |
+            ${{ matrix.platform }}-npm-
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev webkit2gtk-4.0 libxdo-dev
+
+      - name: Install Windows dependencies
+        if: matrix.platform == 'windows-latest'
+        run: choco install microsoft-edge-webview2-runtime --no-progress --yes
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
+
+      - name: Build Tauri bundle
+        run: cargo tauri build
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bookforge-${{ matrix.platform }}
+          path: src-tauri/target/release/bundle
