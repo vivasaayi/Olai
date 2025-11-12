@@ -228,8 +228,11 @@ book-reader/
 
 ## Packaging Guides
 
+> 💡 Use `.github/workflows/tauri-build.yml` to generate macOS, Windows, and Linux bundles automatically on GitHub Actions.
+
 ### macOS (local machine)
 ```bash
+# Build universal bundle (Intel + Apple Silicon)
 rustup target add aarch64-apple-darwin x86_64-apple-darwin
 cargo tauri build
 # Bundles appear under src-tauri/target/release/bundle/macos
@@ -237,6 +240,7 @@ cargo tauri build
 
 ### Windows (via GitHub Actions or Windows host)
 ```powershell
+# Run on Windows or inside the CI workflow
 rustup target add x86_64-pc-windows-msvc
 cargo tauri build
 # Output: src-tauri/target/release/bundle/msi + exe
@@ -244,16 +248,18 @@ cargo tauri build
 
 ### Linux (Ubuntu example)
 ```bash
+# Install GTK/WebKit dependencies once per machine
 sudo apt-get update && sudo apt-get install -y \
        build-essential libgtk-3-dev libayatana-appindicator3-dev \
-       webkit2gtk-4.1 libxdo-dev
+       webkit2gtk-4.0 libxdo-dev
 cargo tauri build
 # Output: src-tauri/target/release/bundle/appimage|deb
 ```
 
 ### iOS (experimental, requires Xcode)
 ```bash
-rbenv init # ensure Xcode command-line tools installed
+# Requires Xcode 15+, CocoaPods, and Apple developer certificates to sign
+xcode-select --install # one-time command line tools setup
 rustup target add aarch64-apple-ios
 cargo tauri ios init
 cargo tauri ios build
