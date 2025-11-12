@@ -238,6 +238,11 @@ cargo tauri build
 # Bundles appear under src-tauri/target/release/bundle/macos
 ```
 
+> ⚠️ macOS Gatekeeper flags unsigned DMGs as “damaged”. For local testing run:
+> `xattr -cr /Applications/BookForge.app` (after copying) or ad-hoc sign via
+> `codesign --force --deep --sign - /path/to/BookForge.app`. Production builds
+> should be signed and notarized with an Apple Developer ID before distribution.
+
 ### Windows (via GitHub Actions or Windows host)
 ```powershell
 # Run on Windows or inside the CI workflow
@@ -245,13 +250,18 @@ rustup target add x86_64-pc-windows-msvc
 cargo tauri build
 # Output: src-tauri/target/release/bundle/msi + exe
 ```
+> The WebView2 runtime is required. Our CI installs it via `winget install --id
+> Microsoft.EdgeWebView2Runtime --silent`. For manual installs download the
+> evergreen installer from Microsoft.
 
 ### Linux (Ubuntu example)
 ```bash
 # Install GTK/WebKit dependencies once per machine
 sudo apt-get update && sudo apt-get install -y \
-       build-essential libgtk-3-dev libayatana-appindicator3-dev \
-       webkit2gtk-4.0 libxdo-dev
+       build-essential pkg-config libssl-dev \
+       libgtk-3-dev libayatana-appindicator3-dev \
+       libwebkit2gtk-4.1-dev libwebkit2gtk-4.1-0 \
+       librsvg2-dev libxdo-dev
 cargo tauri build
 # Output: src-tauri/target/release/bundle/appimage|deb
 ```
