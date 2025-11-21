@@ -5,7 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:host": "vite --host",
     "build": "vite build",
+    "tauri:ios:dev": "cd .. && cargo tauri ios dev",
+    "tauri:ios:build": "cd .. && cargo tauri ios build",
+    "tauri:android:dev": "cd .. && cargo tauri android dev",
+    "tauri:android:build": "cd .. && cargo tauri android build",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
   },
