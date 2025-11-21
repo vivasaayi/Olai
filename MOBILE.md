@@ -74,6 +74,17 @@ open src-tauri/gen/apple/*.xcworkspace
 Notes & Troubleshooting (iOS)
 - For a physical device, you need Apple Developer credentials and proper signing.
 - If the WebView can't see the dev server, ensure `vite` is started with `--host` and that your firewall allows the connection.
+	- The helper script `scripts/mobile/ios-dev.sh` will attempt to: start Vite (if needed), install brew packages, init the iOS scaffold and run `pod install --repo-update`. If you prefer, run the steps manually in order.
+	- If you see `cd ../web: No such file or directory` that means the `beforeDevCommand` expected the frontend in a different relative path — start the dev server manually first:
+
+```bash
+cd web
+npm run dev:host
+
+# then in another terminal:
+cd src-tauri
+cargo tauri ios dev
+```
 	- If `cargo tauri ios init` fails during `pod install` it may be because CocoaPods is missing. Try:
 
 ```bash
