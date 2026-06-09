@@ -15,9 +15,11 @@ import {
 import { WebView } from "react-native-webview";
 import { deleteStoredBook, loadStoredBooks, normalizeBook, saveStoredBook } from "./src/bookStore";
 import { buildAssistPrompt, localAssistFallback, runOpenAiCompatibleAssist, type AssistMode } from "./src/llmAssist";
+import { readBookSourceText } from "./src/paperAssets";
 import { importPaperFromInput } from "./src/paperImport";
 import { sampleBook } from "./src/sampleBook";
-import type { Book, Resource, Section } from "./src/types";
+import { defaultReaderSettings, loadReaderSettings, saveReaderSettings } from "./src/settingsStore";
+import type { AiNote, AiNoteKind, Book, Resource, Section } from "./src/types";
 
 type ThemeId = "paper" | "sepia" | "night";
 type AddMode = "paper" | "json";
@@ -98,10 +100,16 @@ function splitParagraphs(content: string) {
 
 function sourceResources(book: Book): Resource[] {
   const resources: Resource[] = [];
+  if (book.source?.localHtmlPath) {
+    resources.push({ id: "book-local-html", type: "link", label: "Offline Text", value: book.source.localHtmlPath });
+  }
+  if (book.source?.localPdfPath) {
+    resources.push({ id: "book-local-pdf", type: "pdf", label: "Offline PDF", value: book.source.localPdfPath });
+  }
   if (book.source?.url) {
     resources.push({ id: "book-source", type: "link", label: "Source", value: book.source.url });
   }
-  if (book.source?.pdfUrl) {
+  if (book.source?.pdfUrl && !book.source.localPdfPath) {
     resources.push({ id: "book-pdf", type: "pdf", label: "PDF", value: book.source.pdfUrl });
   }
   return resources;
@@ -117,6 +125,45 @@ function uniqueResources(resources: Resource[]) {
   });
 }
 
+function readingResourcesForBook(book: Book, section: Section) {
+  const sectionResources = book.source?.localPdfPath
+    ? section.resources.filter((resource) => resource.type !== "pdf" || resource.value !== book.source?.pdfUrl)
+    : section.resources;
+
+  return uniqueResources([...sectionResources, ...sourceResources(book)]);
+}
+
+function buildNotebookContext(book: Book) {
+  return (book.aiNotes ?? [])
+    .slice(0, 8)
+    .map((note, index) => {
+      const source = note.sourceSectionTitle ? ` (${note.sourceSectionTitle})` : "";
+      return `${index + 1}. ${note.title}${source}: ${note.content.slice(0, 900)}`;
+    })
+    .join("\n\n");
+}
+
+function noteKindForMode(mode: AssistMode): AiNoteKind {
+  if (mode === "paper") return "paper";
+  if (mode === "concept") return "concept";
+  if (mode === "summary") return "summary";
+  if (mode === "method") return "method";
+  if (mode === "critique") return "critique";
+  if (mode === "custom") return "question";
+  return "section";
+}
+
+function noteTitleForMode(mode: AssistMode, section: Section, question: string) {
+  const cleanQuestion = question.trim().replace(/\s+/g, " ");
+  if (mode === "paper") return "Paper Explanation";
+  if (mode === "concept") return cleanQuestion ? `Concept: ${cleanQuestion.slice(0, 72)}` : "Concept Explanation";
+  if (mode === "custom") return cleanQuestion ? `Question: ${cleanQuestion.slice(0, 72)}` : "Question";
+  if (mode === "summary") return `Summary: ${section.title}`;
+  if (mode === "method") return `Method: ${section.title}`;
+  if (mode === "critique") return `Critique: ${section.title}`;
+  return `Study Notes: ${section.title}`;
+}
+
 export default function App() {
   const [books, setBooks] = useState<Book[]>([sampleBook]);
   const [storedBookIds, setStoredBookIds] = useState<string[]>([]);
@@ -126,6 +173,7 @@ export default function App() {
   const [themeId, setThemeId] = useState<ThemeId>("sepia");
   const [fontSize, setFontSize] = useState(19);
   const [libraryOpen, setLibraryOpen] = useState(false);
+  const [notesOpen, setNotesOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("paper");
   const [importText, setImportText] = useState("");
@@ -135,11 +183,11 @@ export default function App() {
   const [webUrl, setWebUrl] = useState("");
   const [webTitle, setWebTitle] = useState("Source");
   const [assistOpen, setAssistOpen] = useState(false);
-  const [assistMode, setAssistMode] = useState<AssistMode>("summary");
+  const [assistMode, setAssistMode] = useState<AssistMode>("augment");
   const [assistQuestion, setAssistQuestion] = useState("");
-  const [assistEndpoint, setAssistEndpoint] = useState("");
+  const [assistEndpoint, setAssistEndpoint] = useState(defaultReaderSettings.assistEndpoint);
   const [assistApiKey, setAssistApiKey] = useState("");
-  const [assistModel, setAssistModel] = useState("local-model");
+  const [assistModel, setAssistModel] = useState(defaultReaderSettings.assistModel);
   const [assistAnswer, setAssistAnswer] = useState("");
   const [assistBusy, setAssistBusy] = useState(false);
 
@@ -157,6 +205,10 @@ export default function App() {
 
   useEffect(() => {
     refreshBooks();
+    loadReaderSettings().then((settings) => {
+      setAssistEndpoint(settings.assistEndpoint);
+      setAssistModel(settings.assistModel);
+    });
   }, []);
 
   const activeBook = books.find((book) => book.id === activeBookId) ?? books[0] ?? sampleBook;
@@ -173,7 +225,8 @@ export default function App() {
   );
   const progressLabel = `${Math.min(activeFlatIndex + 1, flatSections.length)} / ${flatSections.length}`;
   const contentParagraphs = splitParagraphs(sectionBody(activeSection));
-  const readingResources = uniqueResources([...activeSection.resources, ...sourceResources(activeBook)]);
+  const readingResources = readingResourcesForBook(activeBook, activeSection);
+  const aiNoteCount = activeBook.aiNotes?.length ?? 0;
 
   const openBook = (book: Book) => {
     setActiveBookId(book.id);
@@ -213,7 +266,7 @@ export default function App() {
       setAddOpen(false);
       await refreshBooks();
       openBook(parsed);
-      setStatusText(`Imported paper "${parsed.title}".`);
+      setStatusText(`Imported paper "${parsed.title}". ${offlineSummary(parsed)}`);
     } catch (error) {
       Alert.alert("Paper import failed", error instanceof Error ? error.message : String(error));
     } finally {
@@ -238,14 +291,30 @@ export default function App() {
   const runAssist = async () => {
     setAssistBusy(true);
     try {
-      const prompt = buildAssistPrompt(activeBook, activeChapter, activeSection, assistMode, assistQuestion);
-      if (!assistEndpoint.trim()) {
+      const endpoint = assistEndpoint.trim();
+      const model = assistModel.trim() || defaultReaderSettings.assistModel;
+      await saveReaderSettings({
+        assistEndpoint: endpoint,
+        assistModel: model,
+      });
+      const savedSourceText = await readBookSourceText(activeBook);
+      const savedNotesContext = buildNotebookContext(activeBook);
+      const prompt = buildAssistPrompt(
+        activeBook,
+        activeChapter,
+        activeSection,
+        assistMode,
+        assistQuestion,
+        savedSourceText,
+        savedNotesContext,
+      );
+      if (!endpoint.trim()) {
         setAssistAnswer(localAssistFallback(prompt));
       } else {
         const answer = await runOpenAiCompatibleAssist({
-          endpoint: assistEndpoint,
+          endpoint,
           apiKey: assistApiKey,
-          model: assistModel,
+          model,
           prompt,
         });
         setAssistAnswer(answer);
@@ -255,6 +324,48 @@ export default function App() {
     } finally {
       setAssistBusy(false);
     }
+  };
+
+  const saveAssistAsNote = async () => {
+    const answer = assistAnswer.trim();
+    if (!answer || activeBook.id === sampleBook.id) return;
+
+    const note: AiNote = {
+      id: `ai-note-${Date.now()}`,
+      kind: noteKindForMode(assistMode),
+      title: noteTitleForMode(assistMode, activeSection, assistQuestion),
+      content: answer,
+      createdAt: new Date().toISOString(),
+      sourceSectionId: activeSection.id,
+      sourceSectionTitle: activeSection.title,
+      question: assistQuestion.trim() || undefined,
+      model: assistModel.trim() || defaultReaderSettings.assistModel,
+      tags: [assistMode, ...activeSection.keywords.slice(0, 3)],
+    };
+
+    const updatedBook: Book = {
+      ...activeBook,
+      aiNotes: [note, ...(activeBook.aiNotes ?? [])],
+    };
+
+    await saveStoredBook(updatedBook);
+    setBooks((current) => current.map((book) => book.id === updatedBook.id ? updatedBook : book));
+    setStoredBookIds((current) => current.includes(updatedBook.id) ? current : [...current, updatedBook.id]);
+    setActiveBookId(updatedBook.id);
+    setAssistOpen(false);
+    setStatusText("Saved AI note into the paper notebook.");
+  };
+
+  const removeAiNote = async (noteId: string) => {
+    if (activeBook.id === sampleBook.id) return;
+    const updatedBook: Book = {
+      ...activeBook,
+      aiNotes: (activeBook.aiNotes ?? []).filter((note) => note.id !== noteId),
+    };
+
+    await saveStoredBook(updatedBook);
+    setBooks((current) => current.map((book) => book.id === updatedBook.id ? updatedBook : book));
+    setActiveBookId(updatedBook.id);
   };
 
   return (
@@ -334,6 +445,7 @@ export default function App() {
         </View>
         <View style={styles.controlsRow}>
           <AppButton label="Assist" onPress={() => setAssistOpen(true)} theme={theme} />
+          <AppButton label={aiNoteCount ? `Notes ${aiNoteCount}` : "Notes"} onPress={() => setNotesOpen(true)} theme={theme} variant="ghost" />
           <AppButton label="A-" onPress={() => setFontSize((value) => Math.max(15, value - 1))} theme={theme} variant="ghost" compact />
           <AppButton label="A+" onPress={() => setFontSize((value) => Math.min(28, value + 1))} theme={theme} variant="ghost" compact />
           {(["paper", "sepia", "night"] as ThemeId[]).map((id) => (
@@ -392,6 +504,16 @@ export default function App() {
         setMode={setAssistMode}
         setModel={setAssistModel}
         setQuestion={setAssistQuestion}
+        onSaveAnswer={saveAssistAsNote}
+        canSaveAnswer={activeBook.id !== sampleBook.id && Boolean(assistAnswer.trim())}
+        theme={theme}
+      />
+
+      <NotesModal
+        book={activeBook}
+        onClose={() => setNotesOpen(false)}
+        onRemove={removeAiNote}
+        open={notesOpen}
         theme={theme}
       />
 
@@ -403,6 +525,7 @@ export default function App() {
           </View>
           {webUrl ? (
             <WebView
+              originWhitelist={["*"]}
               source={{ uri: webUrl }}
               startInLoadingState
               renderLoading={() => (
@@ -416,6 +539,22 @@ export default function App() {
       </Modal>
     </SafeAreaView>
   );
+}
+
+function offlineSummary(book: Book) {
+  const saved = [
+    book.source?.localPdfPath ? "PDF" : "",
+    book.source?.localHtmlPath ? "HTML" : "",
+    book.source?.localTextPath ? "text" : "",
+  ].filter(Boolean);
+
+  return saved.length ? `Offline saved: ${saved.join(", ")}.` : "Source links are online only.";
+}
+
+function noteDateLabel(note: AiNote) {
+  const date = new Date(note.createdAt);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString();
 }
 
 function AppButton({
@@ -506,7 +645,7 @@ function AddReadingModal({
         {addMode === "paper" ? (
           <View style={styles.modalBody}>
             <Text style={[styles.helperText, { color: theme.muted }]}>
-              Paste an arXiv URL, arXiv ID, DOI landing page, or open-journal paper URL. arXiv imports metadata directly and attaches the PDF/source for in-app reading.
+              Paste an arXiv URL, arXiv ID, DOI landing page, or open-journal paper URL. The app saves metadata, a readable text snapshot, and the PDF when the source allows it.
             </Text>
             <TextInput
               autoCapitalize="none"
@@ -556,6 +695,8 @@ function AssistModal({
   setMode,
   setModel,
   setQuestion,
+  onSaveAnswer,
+  canSaveAnswer,
   theme,
 }: {
   answer: string;
@@ -573,9 +714,11 @@ function AssistModal({
   setMode: (value: AssistMode) => void;
   setModel: (value: string) => void;
   setQuestion: (value: string) => void;
+  onSaveAnswer: () => void;
+  canSaveAnswer: boolean;
   theme: Theme;
 }) {
-  const modes: AssistMode[] = ["summary", "kids", "method", "critique", "custom"];
+  const modes: AssistMode[] = ["paper", "concept", "augment", "summary", "kids", "method", "critique", "custom"];
 
   return (
     <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
@@ -586,7 +729,7 @@ function AssistModal({
         </View>
         <ScrollView contentContainerStyle={styles.assistContent} keyboardShouldPersistTaps="handled">
           <Text style={[styles.helperText, { color: theme.muted }]}>
-            Leave endpoint blank to generate a prompt. Add an OpenAI-compatible endpoint for LM Studio, Ollama gateway, or a remote LLM service.
+            Defaults to LM Studio through Tailscale with google/gemma-4-12b-qat. Edit these values when you want a different local server or model.
           </Text>
           <View style={styles.modeGrid}>
             {modes.map((entry) => (
@@ -604,7 +747,7 @@ function AssistModal({
             autoCapitalize="none"
             autoCorrect={false}
             onChangeText={setEndpoint}
-            placeholder="Endpoint, e.g. http://192.168.1.15:1234/v1"
+            placeholder="http://100.66.32.111:1235/v1"
             placeholderTextColor={theme.muted}
             style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
             value={endpoint}
@@ -637,12 +780,67 @@ function AssistModal({
             textAlignVertical="top"
             value={question}
           />
-          <AppButton label={busy ? "Thinking..." : "Run Assist"} onPress={onRun} disabled={busy} theme={theme} />
+          <View style={styles.assistActions}>
+            <AppButton label={busy ? "Thinking..." : "Run Assist"} onPress={onRun} disabled={busy} theme={theme} />
+            <AppButton label="Save Note" onPress={onSaveAnswer} disabled={!canSaveAnswer || busy} theme={theme} variant="ghost" />
+          </View>
           {answer ? (
             <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
               <Text style={[styles.assistAnswerText, { color: theme.text }]}>{answer}</Text>
             </View>
           ) : null}
+        </ScrollView>
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
+function NotesModal({
+  book,
+  onClose,
+  onRemove,
+  open,
+  theme,
+}: {
+  book: Book;
+  onClose: () => void;
+  onRemove: (noteId: string) => void;
+  open: boolean;
+  theme: Theme;
+}) {
+  const notes = book.aiNotes ?? [];
+
+  return (
+    <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
+      <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
+        <View style={styles.modalHeader}>
+          <Text style={[styles.modalTitle, { color: theme.text }]}>Notes</Text>
+          <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
+        </View>
+        <ScrollView contentContainerStyle={styles.notesList}>
+          {notes.length ? notes.map((note) => (
+            <View key={note.id} style={[styles.noteCard, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              <View style={styles.noteHeader}>
+                <View style={styles.noteTitleBlock}>
+                  <Text style={[styles.noteTitle, { color: theme.text }]}>{note.title}</Text>
+                  <Text style={[styles.noteMeta, { color: theme.muted }]}>
+                    {[note.kind, note.sourceSectionTitle, note.model, noteDateLabel(note)].filter(Boolean).join(" - ")}
+                  </Text>
+                </View>
+                <AppButton label="Delete" onPress={() => onRemove(note.id)} theme={theme} variant="ghost" compact />
+              </View>
+              {note.question ? (
+                <Text style={[styles.noteQuestion, { borderLeftColor: theme.border, color: theme.muted }]}>{note.question}</Text>
+              ) : null}
+              <Text style={[styles.noteContent, { color: theme.text }]}>{note.content}</Text>
+            </View>
+          )) : (
+            <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
+              <Text style={[styles.helperText, { color: theme.muted }]}>
+                Run Assist with LM Studio, then save explanations, concepts, and references here.
+              </Text>
+            </View>
+          )}
         </ScrollView>
       </SafeAreaView>
     </Modal>
@@ -925,11 +1123,61 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
   },
+  notesList: {
+    gap: 12,
+    paddingBottom: 32,
+  },
+  noteCard: {
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 14,
+  },
+  noteHeader: {
+    alignItems: "flex-start",
+    flexDirection: "row",
+    gap: 10,
+    justifyContent: "space-between",
+  },
+  noteTitleBlock: {
+    flex: 1,
+  },
+  noteTitle: {
+    fontSize: 17,
+    fontWeight: "800",
+    letterSpacing: 0,
+  },
+  noteMeta: {
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 4,
+  },
+  noteQuestion: {
+    borderLeftWidth: 2,
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 12,
+    paddingLeft: 10,
+  },
+  noteContent: {
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: 12,
+  },
+  emptyNotes: {
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 16,
+  },
   assistContent: {
     gap: 12,
     paddingBottom: 32,
   },
   modeGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  assistActions: {
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 8,

@@ -1,3 +1,4 @@
+import { downloadPdfAsset, saveHtmlSnapshotAsset, saveTextSnapshotAsset } from "./paperAssets";
 import type { Book, Resource } from "./types";
 
 type HtmlMeta = Record<string, string>;
@@ -46,6 +47,57 @@ function resource(id: string, label: string, value: string, type: Resource["type
   return { id, label, value, type };
 }
 
+async function tryDownloadPdf(bookId: string, pdfUrl: string, status: string[]) {
+  try {
+    const localPdfPath = await downloadPdfAsset(bookId, pdfUrl);
+    status.push("PDF saved for offline reading.");
+    return localPdfPath;
+  } catch (error) {
+    status.push(error instanceof Error ? error.message : "PDF download failed.");
+    return undefined;
+  }
+}
+
+async function trySaveHtmlSnapshot({
+  bookId,
+  title,
+  url,
+  textFallback,
+  status,
+}: {
+  bookId: string;
+  title: string;
+  url: string;
+  textFallback: string;
+  status: string[];
+}) {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTML snapshot request failed: ${response.status}`);
+    }
+
+    const snapshot = await saveHtmlSnapshotAsset({
+      bookId,
+      title,
+      url,
+      html: await response.text(),
+      textFallback,
+    });
+    status.push("Readable HTML/text snapshot saved for offline assist.");
+    return snapshot;
+  } catch (error) {
+    const fallback = await saveTextSnapshotAsset({
+      bookId,
+      title,
+      url,
+      text: textFallback,
+    });
+    status.push(error instanceof Error ? error.message : "HTML snapshot failed; saved fallback text.");
+    return fallback;
+  }
+}
+
 async function importArxivPaper(id: string): Promise<Book> {
   const response = await fetch(`https://export.arxiv.org/api/query?id_list=${encodeURIComponent(id)}`);
   if (!response.ok) {
@@ -67,9 +119,20 @@ async function importArxivPaper(id: string): Promise<Book> {
   const categories = Array.from(entryXml.matchAll(/<category[^>]+term=["']([^"']+)["']/gi), (match) => decodeEntities(match[1]));
   const sourceUrl = `https://arxiv.org/abs/${cleanId}`;
   const pdfUrl = readArxivPdfUrl(entryXml, cleanId);
+  const htmlUrl = `https://ar5iv.labs.arxiv.org/html/${cleanId}`;
+  const bookId = `arxiv-${cleanId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+  const offlineStatus: string[] = [];
+  const localPdfPath = await tryDownloadPdf(bookId, pdfUrl, offlineStatus);
+  const htmlSnapshot = await trySaveHtmlSnapshot({
+    bookId,
+    title,
+    url: htmlUrl,
+    textFallback: abstract,
+    status: offlineStatus,
+  });
 
   return {
-    id: `arxiv-${cleanId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`,
+    id: bookId,
     title,
     synopsis: abstract,
     audience: "Research reader",
@@ -79,9 +142,14 @@ async function importArxivPaper(id: string): Promise<Book> {
       type: "arxiv",
       id: cleanId,
       url: sourceUrl,
+      htmlUrl,
       pdfUrl,
+      localHtmlPath: htmlSnapshot.localHtmlPath,
+      localPdfPath,
+      localTextPath: htmlSnapshot.localTextPath,
       authors,
       publishedAt,
+      offlineStatus,
     },
     chapters: [
       {
@@ -185,8 +253,20 @@ async function importOpenJournalPage(url: string): Promise<Book> {
     .filter(Boolean);
 
   const safeId = parsedUrl.hostname.replace(/[^a-zA-Z0-9_.-]/g, "-") + "-" + Math.abs(parsedUrl.toString().split("").reduce((sum, char) => sum + char.charCodeAt(0), 0));
+  const bookId = `paper-${safeId}`;
+  const offlineStatus: string[] = [];
+  const htmlSnapshot = await saveHtmlSnapshotAsset({
+    bookId,
+    title,
+    url: parsedUrl.toString(),
+    html,
+    textFallback: abstract,
+  });
+  offlineStatus.push("Readable HTML/text snapshot saved for offline assist.");
+  const localPdfPath = pdfUrl ? await tryDownloadPdf(bookId, pdfUrl, offlineStatus) : undefined;
+
   return {
-    id: `paper-${safeId}`,
+    id: bookId,
     title,
     synopsis: abstract,
     audience: "Research reader",
@@ -196,8 +276,12 @@ async function importOpenJournalPage(url: string): Promise<Book> {
       type: pdfUrl ? "pdf" : "open-web",
       url: parsedUrl.toString(),
       pdfUrl,
+      localHtmlPath: htmlSnapshot.localHtmlPath,
+      localPdfPath,
+      localTextPath: htmlSnapshot.localTextPath,
       authors,
       journal,
+      offlineStatus,
     },
     chapters: [
       {

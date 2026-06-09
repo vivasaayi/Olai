@@ -46,6 +46,16 @@
       <false/>
       <key>NSAllowsLocalNetworking</key>
       <true/>
+      <key>NSExceptionDomains</key>
+      <dict>
+        <key>100.66.32.111</key>
+        <dict>
+          <key>NSExceptionAllowsInsecureHTTPLoads</key>
+          <true/>
+          <key>NSIncludesSubdomains</key>
+          <false/>
+        </dict>
+      </dict>
     </dict>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Connect to your private BookForge LLM gateway or local model server on your local network.</string>

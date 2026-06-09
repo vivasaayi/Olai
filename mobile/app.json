@@ -13,7 +13,13 @@
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": false,
-          "NSAllowsLocalNetworking": true
+          "NSAllowsLocalNetworking": true,
+          "NSExceptionDomains": {
+            "100.66.32.111": {
+              "NSExceptionAllowsInsecureHTTPLoads": true,
+              "NSIncludesSubdomains": false
+            }
+          }
         },
         "NSLocalNetworkUsageDescription": "Connect to your private BookForge LLM gateway or local model server on your local network.",
         "ITSAppUsesNonExemptEncryption": false

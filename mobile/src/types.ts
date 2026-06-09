@@ -30,14 +30,34 @@ export interface Chapter {
   sections: Section[];
 }
 
+export type AiNoteKind = "paper" | "concept" | "section" | "summary" | "method" | "critique" | "question";
+
+export interface AiNote {
+  id: string;
+  kind: AiNoteKind;
+  title: string;
+  content: string;
+  createdAt: string;
+  sourceSectionId?: string;
+  sourceSectionTitle?: string;
+  question?: string;
+  model?: string;
+  tags: string[];
+}
+
 export interface BookSource {
   type: "bookforge" | "arxiv" | "open-web" | "pdf";
   id?: string;
   url?: string;
+  htmlUrl?: string;
   pdfUrl?: string;
+  localHtmlPath?: string;
+  localPdfPath?: string;
+  localTextPath?: string;
   authors?: string[];
   publishedAt?: string;
   journal?: string;
+  offlineStatus?: string[];
 }
 
 export interface Book {
@@ -49,4 +69,5 @@ export interface Book {
   tags: string[];
   chapters: Chapter[];
   source?: BookSource;
+  aiNotes?: AiNote[];
 }

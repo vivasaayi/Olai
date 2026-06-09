@@ -66,9 +66,9 @@ class ReactNativeDelegate: ExpoReactNativeFactoryDelegate {
       return metroURL
     }
 
-    // Default debug builds to this Mac's LAN Metro endpoint so launching from
-    // the iPhone home screen does not fail with a nil script URL.
-    return URL(string: "http://192.168.1.152:8083/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&hot=false")
+    // Default debug builds to this Mac's Tailscale Metro endpoint so launching
+    // from the iPhone home screen works off the local Wi-Fi too.
+    return URL(string: "http://100.66.32.111:8083/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&hot=false")
 #else
     return Bundle.main.url(forResource: "main", withExtension: "jsbundle")
 #endif

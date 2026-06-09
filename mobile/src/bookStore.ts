@@ -1,8 +1,10 @@
 import * as FileSystem from "expo-file-system";
-import type { Book, BookSource, Chapter, Resource, ResourceType, Section, SectionPersona } from "./types";
+import { deletePaperAssets } from "./paperAssets";
+import type { AiNote, AiNoteKind, Book, BookSource, Chapter, Resource, ResourceType, Section, SectionPersona } from "./types";
 
 const resourceTypes: ResourceType[] = ["image", "video", "link", "prompt", "download", "pdf"];
 const personas: SectionPersona[] = ["default", "kids", "beginner", "formal", "college"];
+const aiNoteKinds: AiNoteKind[] = ["paper", "concept", "section", "summary", "method", "critique", "question"];
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -81,10 +83,32 @@ function normalizeSource(value: unknown): BookSource | undefined {
     type: type as BookSource["type"],
     id: asString(raw.id) || undefined,
     url: asString(raw.url) || undefined,
+    htmlUrl: asString(raw.htmlUrl) || undefined,
     pdfUrl: asString(raw.pdfUrl) || undefined,
+    localHtmlPath: asString(raw.localHtmlPath) || undefined,
+    localPdfPath: asString(raw.localPdfPath) || undefined,
+    localTextPath: asString(raw.localTextPath) || undefined,
     authors: asStringArray(raw.authors),
     publishedAt: asString(raw.publishedAt) || undefined,
     journal: asString(raw.journal) || undefined,
+    offlineStatus: asStringArray(raw.offlineStatus),
+  };
+}
+
+function normalizeAiNote(value: unknown, index: number): AiNote {
+  const raw = asRecord(value);
+  const kind = asString(raw.kind, "section") as AiNoteKind;
+  return {
+    id: stableId("note", String(index + 1), raw.id),
+    kind: aiNoteKinds.includes(kind) ? kind : "section",
+    title: asString(raw.title, `AI Note ${index + 1}`),
+    content: asString(raw.content),
+    createdAt: asString(raw.createdAt) || new Date(0).toISOString(),
+    sourceSectionId: asString(raw.sourceSectionId) || undefined,
+    sourceSectionTitle: asString(raw.sourceSectionTitle) || undefined,
+    question: asString(raw.question) || undefined,
+    model: asString(raw.model) || undefined,
+    tags: asStringArray(raw.tags),
   };
 }
 
@@ -112,6 +136,9 @@ export function normalizeBook(value: unknown): Book {
     tags: asStringArray(raw.tags),
     chapters,
     source: normalizeSource(raw.source),
+    aiNotes: Array.isArray(raw.aiNotes)
+      ? raw.aiNotes.map((note, index) => normalizeAiNote(note, index))
+      : [],
   };
 }
 
@@ -164,4 +191,5 @@ export async function deleteStoredBook(bookId: string) {
   if (info.exists) {
     await FileSystem.deleteAsync(path);
   }
+  await deletePaperAssets(bookId);
 }
