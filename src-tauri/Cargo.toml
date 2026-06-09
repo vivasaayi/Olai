@@ -23,3 +23,6 @@ serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
 tauri = { version = "2.9.2", features = [] }
 tauri-plugin-log = "2"
+uuid = { version = "1", features = ["v4"] }
+dirs-next = "2"
+reqwest = { version = "0.11", features = ["blocking", "json"] }

@@ -2,12 +2,13 @@
 
 ## Current Implementation Status
 
-**🚧 Work in Progress**: Basic Tauri desktop application with React frontend and Rust backend. Core AI features not yet implemented.
+**🚧 Work in Progress**: Tauri desktop authoring shell plus an Expo iPhone/iPad reader. Core AI features are still planned.
 
 ### Technology Stack
 - **Frontend**: React 18 + TypeScript + Vite
+- **Mobile**: Expo SDK 53 + React Native for iPhone/iPad reading
 - **Backend**: Rust + Tauri 2.0
-- **Platform**: Desktop (macOS, Windows, Linux) - Mobile support planned
+- **Platform**: Desktop (macOS, Windows, Linux) + iOS/iPadOS reader
 - **Build Tool**: Cargo + npm
 
 ### What's Built
@@ -15,11 +16,15 @@
 - ✅ React UI framework setup
 - ✅ Development environment
 - ✅ macOS desktop build
+- ✅ Expo iPhone/iPad reader app
+- ✅ Offline sample book and imported JSON storage on device
+- ✅ arXiv/open-journal import with in-app source/PDF viewing
+- ✅ LLM assist panel wired for OpenAI-compatible local or remote endpoints
 - 🔄 Windows cross-compilation support
 - ❌ AI/LLM integration
-- ❌ Content management
+- 🔄 Content management
 - ❌ PDF export
-- ❌ Mobile platforms
+- 🔄 Android reader app
 
 ## Getting Started
 
@@ -41,6 +46,11 @@ cd ..
 
 # Build and run in development mode
 cargo tauri dev
+
+# Run the iPhone/iPad reader
+cd mobile
+npm install
+npm run ios
 ```
 
 ### Development
@@ -50,6 +60,10 @@ cargo tauri dev
 
 # Build for production
 cargo tauri build
+
+# Start the Expo reader
+cd mobile
+npm run ios
 ```
 
 ## 1. Product Vision
@@ -181,17 +195,17 @@ cargo tauri build
 
 ### Current Implementation
 - **Desktop**: Tauri 2.0 provides native desktop apps for macOS, Windows, and Linux
-- **Mobile**: Not yet implemented - requires additional setup
+- **iPhone/iPad**: Expo SDK 53 reader app under `mobile/`
 
 ### Desktop Status
 - ✅ **macOS**: Fully working (Intel/Apple Silicon)
 - 🔄 **Windows**: Cross-compilation supported from macOS
 - 🔄 **Linux**: Cross-compilation supported
 
-### Mobile Strategy (Planned)
-- **iOS/iPadOS**: Tauri Mobile (experimental) or React Native
-- **Android**: Tauri Mobile (experimental) or React Native
-- Mobile apps will reuse React UI with native wrappers
+### Mobile Strategy
+- **iOS/iPadOS**: Expo/React Native is the primary mobile path because it matches the existing AruviStudio release workflow.
+- **Android**: Use the same Expo app once the iOS reader flow is stable.
+- **Tauri Mobile**: Keep as an experimental option, but do not make it the first shipping path.
 
 ### Development Commands
 ```bash
@@ -204,6 +218,10 @@ cargo tauri build
 # Build for specific targets
 cargo tauri build --target x86_64-pc-windows-msvc  # Windows
 cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
+
+# iPhone/iPad reader
+cd mobile
+npm run ios
 ```
 
 ## Project Structure
@@ -218,6 +236,11 @@ book-reader/
 │   ├── package.json         # Frontend dependencies
 │   ├── vite.config.ts       # Vite configuration
 │   └── index.html           # HTML template
+├── mobile/                   # Expo iPhone/iPad reader
+│   ├── App.tsx              # Reader app entry point
+│   ├── app.json             # Expo app configuration
+│   ├── eas.json             # EAS build profiles
+│   └── src/                 # Book types, sample content, local storage
 └── src-tauri/               # Rust backend
     ├── src/
     │   └── main.rs          # Tauri application entry
@@ -266,20 +289,22 @@ cargo tauri build
 # Output: src-tauri/target/release/bundle/appimage|deb
 ```
 
-### iOS (experimental, requires Xcode)
+### iOS Reader (Expo, requires Xcode)
 ```bash
-# Requires Xcode 15+, CocoaPods, and Apple developer certificates to sign
-xcode-select --install # one-time command line tools setup
-rustup target add aarch64-apple-ios
-cargo tauri ios init
-cargo tauri ios build
+cd mobile
+npm install
+npm run ios
+
+# EAS preview or production build
+npx eas-cli build --platform ios --profile preview
+npx eas-cli build --platform ios --profile production
 ```
 
-### Android (experimental)
+### Android Reader (Expo)
 ```bash
-# Install Android Studio + SDK (33+), set ANDROID_HOME
-cargo tauri android init
-cargo tauri android build
+cd mobile
+npm install
+npm run android
 ```
 
 ## 10. Roadmap
@@ -287,21 +312,23 @@ cargo tauri android build
 ### ✅ Completed
 1. **Tauri + React Setup**: Scaffold Tauri 2.0 app with React + TypeScript frontend
 2. **Cross-platform Desktop**: macOS app working, Windows/Linux cross-compilation ready
+3. **Expo iOS Reader**: iPhone/iPad reader with sample book, section navigation, themes, font sizing, BookForge JSON import, arXiv/open-journal import, in-app PDF/source viewing, and LLM assist
 
 ### 🔄 In Progress
-3. **AI Integration**: Add LLM gateway and local model support
-4. **Content Management**: Implement project/chapter/section data models
+4. **AI Integration**: Add LLM gateway and local model support
+5. **Content Management**: Implement project/chapter/section data models
 
 ### 📋 Planned
-5. **Author Workspace**: Outline builder, glossary manager, prompt lab
-6. **Learner View**: Adaptive reading panel, persona switching, export options
-7. **PDF/HTML Export**: Generation and download functionality
-8. **Quizzing Extension**: Auto-generated quizzes and analytics
+6. **Author Workspace**: Outline builder, glossary manager, prompt lab
+7. **Learner View**: Adaptive reading panel, persona switching, export options
+8. **PDF/HTML Export**: Generation and download functionality
+9. **Quizzing Extension**: Auto-generated quizzes and analytics
 
 ### Next Steps
 - Integrate Ollama for local LLM support
 - Add SQLite/PostgreSQL for data persistence
 - Implement basic content creation UI
+- Add direct mobile sync so iPhone can pull books without paste/import
 - Add vector database for semantic search
 
 This outline should give enough structure to start coding while leaving room to iterate on UX and LLM prompt strategies.

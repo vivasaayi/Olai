@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
+import { invoke } from '@tauri-apps/api/core'
 import './App.css'
+import ModelsPage from './pages/Models'
+import ChatPage from './pages/Chat'
 import type { Book, Chapter, Resource, ResourceType, Section } from './types'
 
 const createId = () =>
@@ -47,6 +50,9 @@ function App() {
   const [activeSectionId, setActiveSectionId] = useState<string>(
     initialBook.chapters[0]?.sections[0]?.id ?? '',
   )
+  const [page, setPage] = useState<'outline' | 'agents' | 'chat'>('outline')
+  const [savedBooks, setSavedBooks] = useState<string[]>([])
+  const [selectedSavedBook, setSelectedSavedBook] = useState<string>('')
 
   useEffect(() => {
     if (!book.chapters.length) {
@@ -196,6 +202,46 @@ function App() {
     URL.revokeObjectURL(link.href)
   }
 
+  const refreshSavedBooks = async () => {
+    try {
+      // list_books returns a Vec<String>
+      const items = (await invoke('list_books')) as string[]
+      setSavedBooks(items)
+      if (items.length && !items.includes(selectedSavedBook)) {
+        setSelectedSavedBook(items[0])
+      }
+    } catch (err) {
+      console.error('list_books error', err)
+    }
+  }
+
+  const saveToLocal = async () => {
+    try {
+      const payload = JSON.stringify(book, null, 2)
+      // save_book(book_id: String, payload: String)
+      const name = (await invoke('save_book', { book_id: book.id, payload })) as string
+      // result is the filename
+      await refreshSavedBooks()
+      console.log('Saved to', name)
+    } catch (err) {
+      console.error('save_book error', err)
+    }
+  }
+
+  const loadFromLocal = async () => {
+    try {
+      if (!selectedSavedBook) return
+      const content = (await invoke('load_book', { file_name: selectedSavedBook })) as string
+      const parsed = JSON.parse(content) as Book
+      setBook(parsed)
+      // select first chapter/section
+      setActiveChapterId(parsed.chapters[0].id)
+      setActiveSectionId(parsed.chapters[0].sections[0].id)
+    } catch (err) {
+      console.error('load_book error', err)
+    }
+  }
+
   const tagsValue = book.tags.join(', ')
   const keywordsValue = activeSection?.keywords.join(', ') ?? ''
 
@@ -210,8 +256,31 @@ function App() {
           <button className="button secondary" onClick={addChapter} type="button">
             + Chapter
           </button>
+            <button className="button" onClick={saveToLocal} type="button">
+              Save
+            </button>
+            <button className="button" onClick={refreshSavedBooks} type="button">
+              Refresh
+            </button>
+            <select value={selectedSavedBook} onChange={(e) => setSelectedSavedBook(e.target.value)}>
+              <option value="">(Select saved)</option>
+              {savedBooks.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            <button className="button" onClick={loadFromLocal} type="button">
+              Load
+            </button>
           <button className="button" onClick={exportStructure} type="button">
             Export JSON
+          </button>
+          <button className="button" onClick={() => setPage('agents')} type="button">
+            Agents
+          </button>
+          <button className="button" onClick={() => setPage('chat')} type="button">
+            Chat
           </button>
         </div>
       </header>
@@ -616,6 +685,18 @@ function App() {
             </section>
           )}
         </main>
+
+        {page === 'agents' && (
+          <aside className="panel preview-panel">
+            <ModelsPage />
+          </aside>
+        )}
+
+        {page === 'chat' && (
+          <aside className="panel preview-panel">
+            <ChatPage />
+          </aside>
+        )}
 
         <aside className="panel preview-panel">
           <header className="panel-heading">

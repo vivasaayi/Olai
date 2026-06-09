@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "BookForge Reader",
+    "slug": "bookforge-reader",
+    "scheme": "bookforge-reader",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.bookforge.reader",
+      "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": false,
+          "NSAllowsLocalNetworking": true
+        },
+        "NSLocalNetworkUsageDescription": "Connect to your private BookForge LLM gateway or local model server on your local network.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}

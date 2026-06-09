@@ -37,3 +37,11 @@ export interface Book {
   tags: string[]
   chapters: Chapter[]
 }
+
+export interface ModelInfo {
+  id: string
+  name: string
+  url: string
+  description?: string
+  size_mb?: number
+}
