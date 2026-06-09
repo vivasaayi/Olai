@@ -62,7 +62,13 @@ class ReactNativeDelegate: ExpoReactNativeFactoryDelegate {
 
   override func bundleURL() -> URL? {
 #if DEBUG
-    return RCTBundleURLProvider.sharedSettings().jsBundleURL(forBundleRoot: ".expo/.virtual-metro-entry")
+    if let metroURL = RCTBundleURLProvider.sharedSettings().jsBundleURL(forBundleRoot: ".expo/.virtual-metro-entry") {
+      return metroURL
+    }
+
+    // Default debug builds to this Mac's LAN Metro endpoint so launching from
+    // the iPhone home screen does not fail with a nil script URL.
+    return URL(string: "http://192.168.1.152:8083/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&hot=false")
 #else
     return Bundle.main.url(forResource: "main", withExtension: "jsbundle")
 #endif
