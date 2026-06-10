@@ -7,15 +7,21 @@ export const sampleBook: Book = {
   audience: "Beginner",
   tone: "Conversational",
   tags: ["STEM", "Robotics", "Beginner"],
-  chapters: [
+  outline: [
     {
       id: "chapter-what-is-a-robot",
+      type: "chapter",
       title: "What Is a Robot?",
-      synopsis: "Robots combine sensing, decision making, and action.",
-      goals: "Understand the basic loop behind most robots.",
-      sections: [
+      intent: "Understand the basic loop behind most robots.",
+      summary: "Robots combine sensing, decision making, and action.",
+      content: "",
+      keywords: [],
+      persona: "beginner",
+      resources: [],
+      children: [
         {
           id: "section-robot-loop",
+          type: "section",
           title: "The Robot Loop",
           intent: "Explain sense-think-act in simple language.",
           summary: "A robot observes the world, decides what to do, and acts.",
@@ -25,9 +31,11 @@ export const sampleBook: Book = {
           persona: "beginner",
           durationMinutes: 4,
           resources: [],
+          children: [],
         },
         {
           id: "section-human-instructions",
+          type: "section",
           title: "Why Instructions Matter",
           intent: "Show that robots need clear goals and constraints.",
           summary: "Robots follow goals, rules, and limits created by people.",
@@ -37,17 +45,24 @@ export const sampleBook: Book = {
           persona: "beginner",
           durationMinutes: 3,
           resources: [],
+          children: [],
         },
       ],
     },
     {
       id: "chapter-sensors",
+      type: "chapter",
       title: "Sensors and Decisions",
-      synopsis: "Sensors convert the real world into signals a computer can use.",
-      goals: "Connect common sensors to everyday robot behavior.",
-      sections: [
+      intent: "Connect common sensors to everyday robot behavior.",
+      summary: "Sensors convert the real world into signals a computer can use.",
+      content: "",
+      keywords: [],
+      persona: "beginner",
+      resources: [],
+      children: [
         {
           id: "section-sensors",
+          type: "section",
           title: "Sensors Are Clues",
           intent: "Introduce sensors as imperfect clues.",
           summary: "A sensor gives a robot clues, not perfect truth.",
@@ -57,6 +72,7 @@ export const sampleBook: Book = {
           persona: "beginner",
           durationMinutes: 5,
           resources: [],
+          children: [],
         },
       ],
     },

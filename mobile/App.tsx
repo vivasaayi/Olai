@@ -17,7 +17,15 @@ import {
   View,
 } from "react-native";
 import { WebView } from "react-native-webview";
-import { deleteStoredBook, loadStoredBooks, normalizeBook, saveStoredBook } from "./src/bookStore";
+import {
+  createInitialBook,
+  createOutlineNode,
+  deleteStoredBook,
+  loadStoredBooks,
+  normalizeBook,
+  outlineItemCount,
+  saveStoredBook,
+} from "./src/bookStore";
 import {
   buildAssistPrompt,
   fetchAssistModels,
@@ -30,10 +38,10 @@ import { readBookSourceText, readSelectableBookSourceText } from "./src/paperAss
 import { importPaperFromInput } from "./src/paperImport";
 import { sampleBook } from "./src/sampleBook";
 import { defaultReaderSettings, loadReaderSettings, saveReaderSettings } from "./src/settingsStore";
-import type { AiNote, AiNoteKind, Book, Resource, Section, TokenUsage } from "./src/types";
+import type { AiNote, AiNoteKind, Book, OutlineNode, Resource, Section, TokenUsage } from "./src/types";
 
 type ThemeId = "paper" | "sepia" | "night";
-type AddMode = "paper" | "json";
+type AddMode = "book" | "paper" | "json";
 
 const themes: Record<ThemeId, {
   background: string;
@@ -76,10 +84,18 @@ const themes: Record<ThemeId, {
 type Theme = (typeof themes)[ThemeId];
 
 type FlatSection = {
-  chapterIndex: number;
-  sectionIndex: number;
+  nodeId: string;
+  depth: number;
+  path: string[];
   chapterTitle: string;
+  chapter?: Section;
   section: Section;
+};
+
+type SuggestionItem = {
+  title: string;
+  summary: string;
+  children: SuggestionItem[];
 };
 
 const mobileAssistModels: AssistModelOption[] = [
@@ -114,14 +130,29 @@ function mobileAllowedModelsFromRouter(models: AssistModelOption[]) {
 }
 
 function flattenBook(book: Book): FlatSection[] {
-  return book.chapters.flatMap((chapter, chapterIndex) =>
-    chapter.sections.map((section, sectionIndex) => ({
-      chapterIndex,
-      sectionIndex,
-      chapterTitle: chapter.title,
-      section,
-    })),
-  );
+  const walk = (
+    nodes: OutlineNode[],
+    depth: number,
+    path: string[],
+    currentChapter: Section | undefined,
+  ): FlatSection[] =>
+    nodes.flatMap((node) => {
+      const chapter = node.type === "chapter" ? node : currentChapter;
+      const nextPath = [...path, node.title || "Untitled"];
+      return [
+        {
+          nodeId: node.id,
+          depth,
+          path: nextPath,
+          chapterTitle: chapter?.title ?? "Book",
+          chapter,
+          section: node,
+        },
+        ...walk(node.children, depth + 1, nextPath, chapter),
+      ];
+    });
+
+  return walk(book.outline, 0, [], undefined);
 }
 
 function sectionBody(section: Section) {
@@ -129,7 +160,7 @@ function sectionBody(section: Section) {
     section.content.trim() ||
     section.summary.trim() ||
     section.intent.trim() ||
-    "This section has no readable content yet. Generate or edit it in the authoring app, export the JSON, then import it here."
+    "This section has no readable content yet. Create or edit it in this app, then save the book."
   );
 }
 
@@ -173,6 +204,182 @@ function readingResourcesForBook(book: Book, section: Section) {
     : section.resources;
 
   return uniqueResources([...sectionResources, ...sourceResources(book)]);
+}
+
+function updateOutlineNode(
+  nodes: OutlineNode[],
+  id: string,
+  updater: (node: OutlineNode) => OutlineNode,
+): OutlineNode[] {
+  return nodes.map((node) => {
+    if (node.id === id) return updater(node);
+    return { ...node, children: updateOutlineNode(node.children, id, updater) };
+  });
+}
+
+function appendOutlineChild(nodes: OutlineNode[], parentId: string, child: OutlineNode): OutlineNode[] {
+  return updateOutlineNode(nodes, parentId, (node) => ({ ...node, children: [...node.children, child] }));
+}
+
+function removeOutlineNode(nodes: OutlineNode[], id: string): OutlineNode[] {
+  return nodes
+    .filter((node) => node.id !== id)
+    .map((node) => ({ ...node, children: removeOutlineNode(node.children, id) }));
+}
+
+function moveOutlineNode(nodes: OutlineNode[], id: string, direction: -1 | 1): { nodes: OutlineNode[]; moved: boolean } {
+  const index = nodes.findIndex((node) => node.id === id);
+  if (index >= 0) {
+    const target = index + direction;
+    if (target < 0 || target >= nodes.length) {
+      return { nodes, moved: false };
+    }
+    const next = [...nodes];
+    const current = next[index];
+    next[index] = next[target];
+    next[target] = current;
+    return { nodes: next, moved: true };
+  }
+
+  let moved = false;
+  const nextNodes = nodes.map((node) => {
+    if (moved) return node;
+    const result = moveOutlineNode(node.children, id, direction);
+    if (!result.moved) return node;
+    moved = true;
+    return { ...node, children: result.nodes };
+  });
+
+  return { nodes: nextNodes, moved };
+}
+
+function suggestionToNode(item: SuggestionItem, type: OutlineNode["type"]): OutlineNode {
+  return {
+    ...createOutlineNode(type, item.title, item.children.map((child) => suggestionToNode(child, "section"))),
+    summary: item.summary,
+    intent: item.summary,
+  };
+}
+
+function parseSuggestionItems(value: unknown): SuggestionItem[] {
+  const source = Array.isArray(value)
+    ? value
+    : value && typeof value === "object" && Array.isArray((value as { items?: unknown[] }).items)
+      ? (value as { items: unknown[] }).items
+      : [];
+
+  return source
+    .map((entry): SuggestionItem | null => {
+      if (!entry || typeof entry !== "object") return null;
+      const raw = entry as Record<string, unknown>;
+      const title = typeof raw.title === "string" ? raw.title.trim() : "";
+      if (!title) return null;
+      return {
+        title,
+        summary: typeof raw.summary === "string"
+          ? raw.summary
+          : typeof raw.description === "string"
+            ? raw.description
+            : "",
+        children: parseSuggestionItems(raw.children),
+      };
+    })
+    .filter((entry): entry is SuggestionItem => Boolean(entry));
+}
+
+function extractJsonPayload(text: string) {
+  const cleaned = text.replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      return JSON.parse(cleaned.slice(start, end + 1));
+    }
+    throw new Error("The model did not return valid JSON suggestions.");
+  }
+}
+
+async function requestOutlineSuggestions({
+  apiKey,
+  book,
+  endpoint,
+  model,
+  target,
+}: {
+  apiKey: string;
+  book: Book;
+  endpoint: string;
+  model: string;
+  target: OutlineNode;
+}) {
+  const cleanEndpoint = endpoint.trim().replace(/\/$/, "");
+  if (!cleanEndpoint) {
+    throw new Error("Configure the Assist endpoint before requesting suggestions.");
+  }
+  const url = cleanEndpoint.endsWith("/chat/completions") ? cleanEndpoint : `${cleanEndpoint}/chat/completions`;
+  const existingChildren = target.children.map((child) => child.title).filter(Boolean).join(", ");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45_000);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
+      },
+      body: JSON.stringify({
+        model: model.trim() || defaultReaderSettings.assistModel,
+        temperature: 0.4,
+        messages: [
+          {
+            role: "system",
+            content: "You are a book outline architect. Return only strict JSON. Do not include markdown.",
+          },
+          {
+            role: "user",
+            content: [
+              `Book title: ${book.title}`,
+              book.audience ? `Audience: ${book.audience}` : "",
+              book.tone ? `Tone: ${book.tone}` : "",
+              book.synopsis ? `Synopsis: ${book.synopsis}` : "",
+              `Target ${target.type}: ${target.title}`,
+              target.summary ? `Target summary: ${target.summary}` : "",
+              existingChildren ? `Existing children to avoid duplicating: ${existingChildren}` : "",
+              "Suggest useful child topics and subtopics for this target.",
+              "Return JSON only with this shape: {\"items\":[{\"title\":\"Topic\",\"summary\":\"Short useful description\",\"children\":[{\"title\":\"Subtopic\",\"summary\":\"Short useful description\",\"children\":[]}]}]}.",
+              "Keep titles concise. Prefer 3 to 6 suggestions.",
+            ].filter(Boolean).join("\n"),
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Suggestion request failed: ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const content = payload?.choices?.[0]?.message?.content;
+    if (typeof content !== "string") {
+      throw new Error("Suggestion response did not include content.");
+    }
+    const suggestions = parseSuggestionItems(extractJsonPayload(content));
+    if (!suggestions.length) {
+      throw new Error("The model did not return any suggestions.");
+    }
+    return suggestions;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Suggestion request timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function buildNotebookContext(book: Book) {
@@ -232,14 +439,14 @@ export default function App() {
   const [books, setBooks] = useState<Book[]>([sampleBook]);
   const [storedBookIds, setStoredBookIds] = useState<string[]>([]);
   const [activeBookId, setActiveBookId] = useState(sampleBook.id);
-  const [chapterIndex, setChapterIndex] = useState(0);
-  const [sectionIndex, setSectionIndex] = useState(0);
+  const [activeNodeId, setActiveNodeId] = useState(() => flattenBook(sampleBook)[0]?.nodeId ?? "");
   const [themeId, setThemeId] = useState<ThemeId>("sepia");
   const [fontSize, setFontSize] = useState(19);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [notesOpen, setNotesOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
-  const [addMode, setAddMode] = useState<AddMode>("paper");
+  const [editOpen, setEditOpen] = useState(false);
+  const [addMode, setAddMode] = useState<AddMode>("book");
   const [importText, setImportText] = useState("");
   const [paperInput, setPaperInput] = useState("");
   const [paperBusy, setPaperBusy] = useState(false);
@@ -291,16 +498,10 @@ export default function App() {
 
   const activeBook = books.find((book) => book.id === activeBookId) ?? books[0] ?? sampleBook;
   const flatSections = useMemo(() => flattenBook(activeBook), [activeBook]);
-  const activeChapter = activeBook.chapters[Math.min(chapterIndex, activeBook.chapters.length - 1)];
-  const activeSection =
-    activeChapter?.sections[Math.min(sectionIndex, activeChapter.sections.length - 1)] ??
-    flatSections[0]?.section;
-  const activeFlatIndex = Math.max(
-    0,
-    flatSections.findIndex(
-      (entry) => entry.chapterIndex === chapterIndex && entry.sectionIndex === sectionIndex,
-    ),
-  );
+  const activeFlatIndex = Math.max(0, flatSections.findIndex((entry) => entry.nodeId === activeNodeId));
+  const activeFlatSection = flatSections[activeFlatIndex] ?? flatSections[0];
+  const activeChapter = activeFlatSection?.chapter;
+  const activeSection = activeFlatSection?.section ?? activeBook.outline[0];
   const progressLabel = `${Math.min(activeFlatIndex + 1, flatSections.length)} / ${flatSections.length}`;
   const contentParagraphs = splitParagraphs(sectionBody(activeSection));
   const readingResources = readingResourcesForBook(activeBook, activeSection);
@@ -317,10 +518,16 @@ export default function App() {
     setAssistUsage(cachedAssistNote?.tokenUsage);
   }, [assistOpen, assistBusy, cachedAssistNote?.id, cachedAssistNote?.content, cachedAssistNote?.tokenUsage, assistMode, assistQuestion, activeAssistModel, activeSection.id]);
 
+  useEffect(() => {
+    if (flatSections.length && !flatSections.some((entry) => entry.nodeId === activeNodeId)) {
+      setActiveNodeId(flatSections[0].nodeId);
+    }
+  }, [activeBook.id, activeNodeId, flatSections]);
+
   const openBook = (book: Book) => {
+    const firstSection = flattenBook(book)[0];
     setActiveBookId(book.id);
-    setChapterIndex(0);
-    setSectionIndex(0);
+    setActiveNodeId(firstSection?.nodeId ?? book.outline[0]?.id ?? "");
     setLibraryOpen(false);
     setStatusText("");
   };
@@ -328,8 +535,7 @@ export default function App() {
   const moveSection = (delta: number) => {
     const next = flatSections[activeFlatIndex + delta];
     if (!next) return;
-    setChapterIndex(next.chapterIndex);
-    setSectionIndex(next.sectionIndex);
+    setActiveNodeId(next.nodeId);
   };
 
   const refreshAssistModels = async () => {
@@ -357,7 +563,9 @@ export default function App() {
       if (!mobileAssistModelIds.has(assistModel.trim())) {
         setAssistModel(defaultReaderSettings.assistModel);
       }
-      setAssistModelsError(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      setAssistModelsError(message);
+      setStatusText(`Model list error: ${message}`);
     } finally {
       setAssistModelsBusy(false);
     }
@@ -374,6 +582,40 @@ export default function App() {
       setStatusText(`Imported "${parsed.title}".`);
     } catch (error) {
       Alert.alert("Import failed", error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const createBook = async (draft: Book) => {
+    try {
+      const parsed = normalizeBook({
+        ...draft,
+        title: draft.title.trim(),
+        source: draft.source ?? { type: "bookforge" },
+      });
+      await saveStoredBook(parsed);
+      setAddOpen(false);
+      await refreshBooks();
+      openBook(parsed);
+      setStatusText(`Created "${parsed.title}".`);
+    } catch (error) {
+      Alert.alert("Create book failed", error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const updateBook = async (draft: Book) => {
+    try {
+      const parsed = normalizeBook({
+        ...draft,
+        title: draft.title.trim(),
+        source: draft.source ?? { type: "bookforge" },
+      });
+      await saveStoredBook(parsed);
+      setEditOpen(false);
+      await refreshBooks();
+      openBook(parsed);
+      setStatusText(`Updated "${parsed.title}".`);
+    } catch (error) {
+      Alert.alert("Update book failed", error instanceof Error ? error.message : String(error));
     }
   };
 
@@ -514,7 +756,10 @@ export default function App() {
         setStatusText("Saved AI response locally with this paper.");
       }
     } catch (error) {
-      setAssistAnswer(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      setAssistAnswer(message);
+      setStatusText(`Assist error: ${message}`);
+      Alert.alert("Assist error", message);
     } finally {
       setAssistBusy(false);
     }
@@ -523,15 +768,21 @@ export default function App() {
   const saveAssistAsNote = async () => {
     const answer = assistAnswer.trim();
     if (!answer) return;
-    await persistAssistAnswer(
-      answer,
-      assistMode,
-      assistQuestion,
-      normalizeMobileAssistModel(assistModel),
-      assistUsage,
-    );
-    setAssistOpen(false);
-    setStatusText("Saved AI note into the paper notebook.");
+    try {
+      await persistAssistAnswer(
+        answer,
+        assistMode,
+        assistQuestion,
+        normalizeMobileAssistModel(assistModel),
+        assistUsage,
+      );
+      setAssistOpen(false);
+      setStatusText("Saved AI note into the paper notebook.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatusText(`Save note error: ${message}`);
+      Alert.alert("Save note failed", message);
+    }
   };
 
   const askAboutSelectedText = async (action: "explain" | "summarize" | "define", selectedText: string) => {
@@ -587,6 +838,7 @@ export default function App() {
         </View>
         <View style={styles.headerActions}>
           <AppButton label="Library" onPress={() => setLibraryOpen(true)} theme={theme} variant="ghost" compact />
+          <AppButton label="Edit" onPress={() => setEditOpen(true)} theme={theme} variant="ghost" compact />
           <AppButton label="Add" onPress={() => setAddOpen(true)} theme={theme} compact />
         </View>
       </View>
@@ -684,6 +936,10 @@ export default function App() {
         activeBookId={activeBookId}
         onClose={() => setLibraryOpen(false)}
         onOpen={openBook}
+        onEdit={(book) => {
+          openBook(book);
+          setEditOpen(true);
+        }}
         onRemove={removeBook}
         open={libraryOpen}
         theme={theme}
@@ -691,9 +947,13 @@ export default function App() {
 
       <AddReadingModal
         addMode={addMode}
+        apiKey={assistApiKey}
+        createBook={createBook}
+        endpoint={assistEndpoint}
         importBook={importBook}
         importPaper={importPaper}
         importText={importText}
+        model={activeAssistModel}
         onClose={() => setAddOpen(false)}
         open={addOpen}
         paperBusy={paperBusy}
@@ -701,6 +961,17 @@ export default function App() {
         setAddMode={setAddMode}
         setImportText={setImportText}
         setPaperInput={setPaperInput}
+        theme={theme}
+      />
+
+      <BookEditModal
+        apiKey={assistApiKey}
+        book={activeBook}
+        endpoint={assistEndpoint}
+        model={activeAssistModel}
+        onClose={() => setEditOpen(false)}
+        onSave={updateBook}
+        open={editOpen}
         theme={theme}
       />
 
@@ -843,9 +1114,13 @@ function Pill({ text, theme }: { text: string; theme: Theme }) {
 
 function AddReadingModal({
   addMode,
+  apiKey,
+  createBook,
+  endpoint,
   importBook,
   importPaper,
   importText,
+  model,
   onClose,
   open,
   paperBusy,
@@ -856,9 +1131,13 @@ function AddReadingModal({
   theme,
 }: {
   addMode: AddMode;
+  apiKey: string;
+  createBook: (book: Book) => void;
+  endpoint: string;
   importBook: () => void;
   importPaper: () => void;
   importText: string;
+  model: string;
   onClose: () => void;
   open: boolean;
   paperBusy: boolean;
@@ -876,11 +1155,23 @@ function AddReadingModal({
           <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
         </View>
         <View style={styles.segmentRow}>
+          <AppButton label="Book" onPress={() => setAddMode("book")} theme={theme} variant={addMode === "book" ? "solid" : "ghost"} />
           <AppButton label="Paper" onPress={() => setAddMode("paper")} theme={theme} variant={addMode === "paper" ? "solid" : "ghost"} />
           <AppButton label="JSON" onPress={() => setAddMode("json")} theme={theme} variant={addMode === "json" ? "solid" : "ghost"} />
         </View>
 
-        {addMode === "paper" ? (
+        {addMode === "book" ? (
+          <BookEditorForm
+            apiKey={apiKey}
+            endpoint={endpoint}
+            mode="create"
+            model={model}
+            onSave={createBook}
+            open={open}
+            saveLabel="Create Book"
+            theme={theme}
+          />
+        ) : addMode === "paper" ? (
           <View style={styles.modalBody}>
             <Text style={[styles.helperText, { color: theme.muted }]}>
               Paste an arXiv URL, arXiv ID, DOI landing page, or open-journal paper URL. The app saves metadata, a readable text snapshot, and the PDF when the source allows it.
@@ -914,6 +1205,304 @@ function AddReadingModal({
         )}
       </SafeAreaView>
     </Modal>
+  );
+}
+
+function BookEditModal({
+  apiKey,
+  book,
+  endpoint,
+  model,
+  onClose,
+  onSave,
+  open,
+  theme,
+}: {
+  apiKey: string;
+  book: Book;
+  endpoint: string;
+  model: string;
+  onClose: () => void;
+  onSave: (book: Book) => void;
+  open: boolean;
+  theme: Theme;
+}) {
+  return (
+    <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
+      <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
+        <View style={styles.modalHeader}>
+          <Text style={[styles.modalTitle, { color: theme.text }]}>Edit Book</Text>
+          <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
+        </View>
+        <BookEditorForm
+          apiKey={apiKey}
+          endpoint={endpoint}
+          initialBook={book}
+          mode="edit"
+          model={model}
+          onSave={onSave}
+          open={open}
+          saveLabel="Save Book"
+          theme={theme}
+        />
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
+function BookEditorForm({
+  apiKey,
+  endpoint,
+  initialBook,
+  mode,
+  model,
+  onSave,
+  open,
+  saveLabel,
+  theme,
+}: {
+  apiKey: string;
+  endpoint: string;
+  initialBook?: Book;
+  mode: "create" | "edit";
+  model: string;
+  onSave: (book: Book) => void;
+  open: boolean;
+  saveLabel: string;
+  theme: Theme;
+}) {
+  const [draft, setDraft] = useState<Book>(() => initialBook ? normalizeBook(initialBook) : createInitialBook());
+  const [activeDraftNodeId, setActiveDraftNodeId] = useState("");
+  const [suggestBusy, setSuggestBusy] = useState(false);
+  const flatDraft = useMemo(() => flattenBook(draft), [draft]);
+  const activeEntry = flatDraft.find((entry) => entry.nodeId === activeDraftNodeId) ?? flatDraft[0];
+  const activeNode = activeEntry?.section;
+  const tagsValue = draft.tags.join(", ");
+  const keywordsValue = activeNode?.keywords.join(", ") ?? "";
+
+  useEffect(() => {
+    if (!open) return;
+    const next = initialBook ? normalizeBook(initialBook) : createInitialBook();
+    setDraft(next);
+    setActiveDraftNodeId(flattenBook(next)[0]?.nodeId ?? "");
+  }, [initialBook?.id, mode, open]);
+
+  useEffect(() => {
+    if (flatDraft.length && !flatDraft.some((entry) => entry.nodeId === activeDraftNodeId)) {
+      setActiveDraftNodeId(flatDraft[0].nodeId);
+    }
+  }, [activeDraftNodeId, flatDraft]);
+
+  const updateDraft = (updater: (book: Book) => Book) => {
+    setDraft((current) => ({ ...updater(current), updatedAt: new Date().toISOString() }));
+  };
+
+  const updateDraftNode = (id: string, updater: (node: OutlineNode) => OutlineNode) => {
+    updateDraft((book) => ({ ...book, outline: updateOutlineNode(book.outline, id, updater) }));
+  };
+
+  const addChapter = () => {
+    const chapter = createOutlineNode("chapter", "New Chapter", [createOutlineNode("section", "New Section")]);
+    updateDraft((book) => ({ ...book, outline: [...book.outline, chapter] }));
+    setActiveDraftNodeId(chapter.id);
+  };
+
+  const addChild = (parent: OutlineNode) => {
+    const title = parent.type === "chapter" ? "New Section" : "New Subsection";
+    const child = createOutlineNode("section", title);
+    updateDraft((book) => ({ ...book, outline: appendOutlineChild(book.outline, parent.id, child) }));
+    setActiveDraftNodeId(child.id);
+  };
+
+  const moveNode = (id: string, direction: -1 | 1) => {
+    updateDraft((book) => {
+      const result = moveOutlineNode(book.outline, id, direction);
+      return result.moved ? { ...book, outline: result.nodes } : book;
+    });
+    setActiveDraftNodeId(id);
+  };
+
+  const suggestChildren = async (target: OutlineNode) => {
+    setSuggestBusy(true);
+    try {
+      const suggestions = await requestOutlineSuggestions({
+        apiKey,
+        book: draft,
+        endpoint,
+        model,
+        target,
+      });
+      const children = suggestions.map((item) => suggestionToNode(item, "section"));
+      updateDraft((book) => ({ ...book, outline: appendOutlineChild(book.outline, target.id, children[0]) }));
+      if (children.length > 1) {
+        updateDraft((book) => ({
+          ...book,
+          outline: children.slice(1).reduce(
+            (outline, child) => appendOutlineChild(outline, target.id, child),
+            book.outline,
+          ),
+        }));
+      }
+      setActiveDraftNodeId(children[0]?.id ?? target.id);
+      Alert.alert("Suggestions added", `Added ${children.length} suggested item${children.length === 1 ? "" : "s"}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      Alert.alert("Suggestion failed", message);
+    } finally {
+      setSuggestBusy(false);
+    }
+  };
+
+  const removeNode = (id: string) => {
+    if (flatDraft.length <= 1) return;
+    const nextOutline = removeOutlineNode(draft.outline, id);
+    const nextBook = { ...draft, outline: nextOutline.length ? nextOutline : createInitialBook().outline };
+    const nextActive = flattenBook(nextBook)[0]?.nodeId ?? "";
+    setDraft(nextBook);
+    setActiveDraftNodeId(nextActive);
+  };
+
+  const createDisabled = !draft.title.trim() || !draft.outline.length;
+
+  return (
+    <ScrollView contentContainerStyle={styles.bookCreatorContent} keyboardShouldPersistTaps="handled">
+      <TextInput
+        onChangeText={(value) => updateDraft((book) => ({ ...book, title: value }))}
+        placeholder="Book title"
+        placeholderTextColor={theme.muted}
+        style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+        value={draft.title}
+      />
+      <TextInput
+        onChangeText={(value) => updateDraft((book) => ({ ...book, audience: value }))}
+        placeholder="Audience"
+        placeholderTextColor={theme.muted}
+        style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+        value={draft.audience}
+      />
+      <TextInput
+        onChangeText={(value) => updateDraft((book) => ({ ...book, tone: value }))}
+        placeholder="Tone"
+        placeholderTextColor={theme.muted}
+        style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+        value={draft.tone}
+      />
+      <TextInput
+        multiline
+        onChangeText={(value) => updateDraft((book) => ({ ...book, synopsis: value }))}
+        placeholder="Synopsis"
+        placeholderTextColor={theme.muted}
+        style={[styles.questionInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+        textAlignVertical="top"
+        value={draft.synopsis}
+      />
+      <TextInput
+        onChangeText={(value) =>
+          updateDraft((book) => ({
+            ...book,
+            tags: value.split(",").map((tag) => tag.trim()).filter(Boolean),
+          }))
+        }
+        placeholder="Tags, comma separated"
+        placeholderTextColor={theme.muted}
+        style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+        value={tagsValue}
+      />
+
+      <View style={styles.creatorSectionHeader}>
+        <Text style={[styles.previewLabel, { color: theme.muted }]}>Contents</Text>
+        <AppButton label="+ Chapter" onPress={addChapter} theme={theme} variant="ghost" compact />
+      </View>
+      <View style={[styles.outlineEditor, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+        {flatDraft.map((entry) => {
+          const selected = entry.nodeId === activeDraftNodeId;
+          return (
+            <Pressable
+              key={entry.nodeId}
+              onPress={() => setActiveDraftNodeId(entry.nodeId)}
+              style={[
+                styles.outlineEditorRow,
+                {
+                  borderColor: theme.border,
+                  paddingLeft: 10 + entry.depth * 14,
+                  backgroundColor: selected ? theme.accent : "transparent",
+                },
+              ]}
+            >
+              <View style={styles.outlineEditorText}>
+                <Text style={[styles.outlineEditorType, { color: selected ? theme.accentText : theme.muted }]}>
+                  {entry.section.type}
+                </Text>
+                <Text numberOfLines={1} style={[styles.outlineEditorTitle, { color: selected ? theme.accentText : theme.text }]}>
+                  {entry.section.title || "Untitled"}
+                </Text>
+              </View>
+              <View style={styles.outlineEditorActions}>
+                <AppButton label="Up" onPress={() => moveNode(entry.nodeId, -1)} theme={theme} variant="ghost" compact />
+                <AppButton label="Down" onPress={() => moveNode(entry.nodeId, 1)} theme={theme} variant="ghost" compact />
+                <AppButton label="+" onPress={() => addChild(entry.section)} theme={theme} variant={selected ? "solid" : "ghost"} compact />
+                <AppButton label="x" onPress={() => removeNode(entry.nodeId)} theme={theme} variant="ghost" compact disabled={flatDraft.length <= 1} />
+              </View>
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {activeNode ? (
+        <View style={[styles.nodeEditor, { borderColor: theme.border }]}>
+          <View style={styles.creatorSectionHeader}>
+            <Text style={[styles.previewLabel, { color: theme.muted }]}>Selected Item</Text>
+            <AppButton
+              label={suggestBusy ? "Suggesting..." : "Suggest"}
+              onPress={() => void suggestChildren(activeNode)}
+              disabled={suggestBusy}
+              theme={theme}
+              variant="ghost"
+              compact
+            />
+          </View>
+          <TextInput
+            onChangeText={(value) => updateDraftNode(activeNode.id, (node) => ({ ...node, title: value }))}
+            placeholder="Title"
+            placeholderTextColor={theme.muted}
+            style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+            value={activeNode.title}
+          />
+          <TextInput
+            multiline
+            onChangeText={(value) => updateDraftNode(activeNode.id, (node) => ({ ...node, summary: value }))}
+            placeholder="Summary"
+            placeholderTextColor={theme.muted}
+            style={[styles.questionInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+            textAlignVertical="top"
+            value={activeNode.summary}
+          />
+          <TextInput
+            multiline
+            onChangeText={(value) => updateDraftNode(activeNode.id, (node) => ({ ...node, content: value }))}
+            placeholder="Readable content"
+            placeholderTextColor={theme.muted}
+            style={[styles.contentInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+            textAlignVertical="top"
+            value={activeNode.content}
+          />
+          <TextInput
+            onChangeText={(value) =>
+              updateDraftNode(activeNode.id, (node) => ({
+                ...node,
+                keywords: value.split(",").map((keyword) => keyword.trim()).filter(Boolean),
+              }))
+            }
+            placeholder="Keywords, comma separated"
+            placeholderTextColor={theme.muted}
+            style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+            value={keywordsValue}
+          />
+        </View>
+      ) : null}
+
+      <AppButton label={saveLabel} onPress={() => onSave(draft)} disabled={createDisabled} theme={theme} />
+    </ScrollView>
   );
 }
 
@@ -1505,6 +2094,7 @@ function LibraryModal({
   activeBookId,
   books,
   onClose,
+  onEdit,
   onOpen,
   onRemove,
   open,
@@ -1514,44 +2104,69 @@ function LibraryModal({
   activeBookId: string;
   books: Book[];
   onClose: () => void;
+  onEdit: (book: Book) => void;
   onOpen: (book: Book) => void;
   onRemove: (book: Book) => void;
   open: boolean;
   storedBookIds: string[];
   theme: Theme;
 }) {
+  const storedBooks = books.filter((book) => storedBookIds.includes(book.id));
+  const starterBooks = books.filter((book) => !storedBookIds.includes(book.id));
+
+  const renderBook = (book: Book) => {
+    const stored = storedBookIds.includes(book.id);
+    return (
+      <View
+        key={book.id}
+        style={[styles.libraryItem, { backgroundColor: theme.surface, borderColor: theme.border }]}
+      >
+        <View style={styles.libraryItemText}>
+          <Text style={[styles.libraryTitle, { color: theme.text }]}>{book.title}</Text>
+          <Text numberOfLines={2} style={[styles.libraryMeta, { color: theme.muted }]}>
+            {book.audience || "Reader"} - {book.outline.length} chapters - {outlineItemCount(book)} items
+            {book.source?.type ? ` - ${book.source.type}` : ""}
+            {book.id === activeBookId ? " - Open" : ""}
+          </Text>
+        </View>
+        <View style={styles.libraryActions}>
+          <AppButton label="Read" onPress={() => onOpen(book)} theme={theme} compact />
+          <AppButton label="Edit" onPress={() => onEdit(book)} theme={theme} variant="ghost" compact />
+          {stored ? (
+            <AppButton label="Delete" onPress={() => onRemove(book)} theme={theme} variant="ghost" compact />
+          ) : null}
+        </View>
+      </View>
+    );
+  };
+
   return (
     <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
       <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
         <View style={styles.modalHeader}>
-          <Text style={[styles.modalTitle, { color: theme.text }]}>Library</Text>
+          <View style={styles.noteTitleBlock}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Books</Text>
+            <Text style={[styles.noteMeta, { color: theme.muted }]}>
+              {storedBooks.length} saved locally - {books.length} total
+            </Text>
+          </View>
           <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
         </View>
         <ScrollView contentContainerStyle={styles.libraryList}>
-          {books.map((book) => {
-            const stored = storedBookIds.includes(book.id);
-            return (
-              <View
-                key={book.id}
-                style={[styles.libraryItem, { backgroundColor: theme.surface, borderColor: theme.border }]}
-              >
-                <View style={styles.libraryItemText}>
-                  <Text style={[styles.libraryTitle, { color: theme.text }]}>{book.title}</Text>
-                  <Text numberOfLines={2} style={[styles.libraryMeta, { color: theme.muted }]}>
-                    {book.audience || "Reader"} - {book.chapters.length} chapters
-                    {book.source?.type ? ` - ${book.source.type}` : ""}
-                    {book.id === activeBookId ? " - Open" : ""}
-                  </Text>
-                </View>
-                <View style={styles.libraryActions}>
-                  <AppButton label="Read" onPress={() => onOpen(book)} theme={theme} compact />
-                  {stored ? (
-                    <AppButton label="Delete" onPress={() => onRemove(book)} theme={theme} variant="ghost" compact />
-                  ) : null}
-                </View>
-              </View>
-            );
-          })}
+          <Text style={[styles.previewLabel, { color: theme.muted }]}>My Books</Text>
+          {storedBooks.length ? storedBooks.map(renderBook) : (
+            <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
+              <Text style={[styles.helperText, { color: theme.muted }]}>
+                Created and imported books will appear here.
+              </Text>
+            </View>
+          )}
+          {starterBooks.length ? (
+            <>
+              <Text style={[styles.previewLabel, { color: theme.muted }]}>Starter Books</Text>
+              {starterBooks.map(renderBook)}
+            </>
+          ) : null}
         </ScrollView>
       </SafeAreaView>
     </Modal>
@@ -1753,6 +2368,61 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginBottom: 14,
+    padding: 12,
+  },
+  bookCreatorContent: {
+    gap: 12,
+    paddingBottom: 32,
+  },
+  creatorSectionHeader: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 4,
+  },
+  outlineEditor: {
+    borderRadius: 8,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  outlineEditorRow: {
+    alignItems: "center",
+    borderBottomWidth: 1,
+    flexDirection: "row",
+    gap: 8,
+    minHeight: 58,
+    paddingRight: 8,
+    paddingVertical: 8,
+  },
+  outlineEditorText: {
+    flex: 1,
+  },
+  outlineEditorType: {
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 0,
+    textTransform: "uppercase",
+  },
+  outlineEditorTitle: {
+    fontSize: 15,
+    fontWeight: "800",
+    letterSpacing: 0,
+    marginTop: 2,
+  },
+  outlineEditorActions: {
+    flexDirection: "row",
+    gap: 6,
+  },
+  nodeEditor: {
+    borderTopWidth: 1,
+    gap: 10,
+    paddingTop: 12,
+  },
+  contentInput: {
+    borderRadius: 8,
+    borderWidth: 1,
+    fontSize: 15,
+    minHeight: 150,
     padding: 12,
   },
   paperTextBody: {

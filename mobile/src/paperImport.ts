@@ -151,15 +151,21 @@ async function importArxivPaper(id: string): Promise<Book> {
       publishedAt,
       offlineStatus,
     },
-    chapters: [
+    outline: [
       {
         id: `arxiv-${cleanId}-overview`,
+        type: "chapter",
         title: "Paper Overview",
-        synopsis: abstract,
-        goals: "Capture the paper metadata and reading plan.",
-        sections: [
+        intent: "Capture the paper metadata and reading plan.",
+        summary: abstract,
+        content: "",
+        keywords: categories.slice(0, 4),
+        persona: "college",
+        resources: [],
+        children: [
           {
             id: `arxiv-${cleanId}-abstract`,
+            type: "section",
             title: "Abstract",
             intent: "Read the official abstract before opening the full paper.",
             summary: abstract,
@@ -171,9 +177,11 @@ async function importArxivPaper(id: string): Promise<Book> {
               resource("source", "arXiv Page", sourceUrl),
               resource("pdf", "Original PDF", pdfUrl, "pdf"),
             ],
+            children: [],
           },
           {
             id: `arxiv-${cleanId}-reading-route`,
+            type: "section",
             title: "Reading Route",
             intent: "Convert a dense paper into a practical reading checklist.",
             summary: "Use this checklist while reading the original PDF.",
@@ -188,6 +196,7 @@ async function importArxivPaper(id: string): Promise<Book> {
               resource("source", "arXiv Page", sourceUrl),
               resource("pdf", "Original PDF", pdfUrl, "pdf"),
             ],
+            children: [],
           },
         ],
       },
@@ -283,15 +292,21 @@ async function importOpenJournalPage(url: string): Promise<Book> {
       journal,
       offlineStatus,
     },
-    chapters: [
+    outline: [
       {
         id: `paper-${safeId}-overview`,
+        type: "chapter",
         title: "Paper Overview",
-        synopsis: abstract,
-        goals: "Import open-journal metadata and keep the source attached.",
-        sections: [
+        intent: "Import open-journal metadata and keep the source attached.",
+        summary: abstract,
+        content: "",
+        keywords: [journal || parsedUrl.hostname, "paper"],
+        persona: "college",
+        resources: [],
+        children: [
           {
             id: `paper-${safeId}-abstract`,
+            type: "section",
             title: "Abstract and Source",
             intent: "Read the available metadata and open the original source in-app.",
             summary: abstract,
@@ -306,6 +321,7 @@ async function importOpenJournalPage(url: string): Promise<Book> {
               resource("source", "Original Source", parsedUrl.toString()),
               ...(pdfUrl ? [resource("pdf", "Original PDF", pdfUrl, "pdf")] : []),
             ],
+            children: [],
           },
         ],
       },

@@ -2,9 +2,12 @@
 pub fn run() {
   tauri::Builder::default()
     .invoke_handler(tauri::generate_handler![
+      app_data_dir,
       save_book,
       load_book,
       list_books,
+      delete_book,
+      suggest_outline_topics,
       list_available_models,
       download_model,
       list_local_models,
@@ -31,7 +34,7 @@ use serde::{Deserialize, Serialize};
 // use std::io::copy; // previously used for simple copy; replaced by chunked copy for progress
 use std::fs::File;
 use std::io::{Read, Write};
-use tauri::Manager;
+use tauri::Emitter;
 use reqwest::blocking::Client;
 use std::process::Command;
 
@@ -138,7 +141,7 @@ fn download_model(app: tauri::AppHandle, model_id: String) -> Result<String, Str
     downloaded += n as u64;
     // emit progress to frontend
     let payload = serde_json::json!({"model_id": info.id, "downloaded": downloaded, "total": total});
-    let _ = <tauri::AppHandle as tauri::Manager>::emit_all(&app, "model-download-progress", payload);
+    let _ = app.emit("model-download-progress", payload);
   }
 
   Ok(target.file_name().unwrap().to_string_lossy().into_owned())
@@ -219,6 +222,97 @@ fn load_book(file_name: String) -> Result<String, String> {
   let mut path = books_dir()?;
   path.push(file_name);
   fs::read_to_string(path).map_err(|e| format!("read_file: {}", e))
+}
+
+#[tauri::command]
+fn delete_book(file_name: String) -> Result<(), String> {
+  if file_name.contains('/') || file_name.contains('\\') || file_name == "." || file_name == ".." {
+    return Err("invalid book file name".into());
+  }
+
+  let mut path = books_dir()?;
+  path.push(file_name);
+  if path.exists() {
+    fs::remove_file(path).map_err(|e| format!("delete_file: {}", e))?;
+  }
+  Ok(())
+}
+
+fn router_chat_url(endpoint: &str) -> Result<String, String> {
+  let trimmed = endpoint.trim().trim_end_matches('/');
+  if trimmed.is_empty() {
+    return Err("router endpoint is required".into());
+  }
+
+  let client_endpoint = trimmed.replace("://0.0.0.0", "://localhost");
+  if client_endpoint.ends_with("/chat/completions") {
+    Ok(client_endpoint)
+  } else if client_endpoint.ends_with("/v1") {
+    Ok(format!("{}/chat/completions", client_endpoint))
+  } else {
+    Ok(format!("{}/v1/chat/completions", client_endpoint))
+  }
+}
+
+#[tauri::command]
+fn suggest_outline_topics(endpoint: String, model: String, prompt: String) -> Result<String, String> {
+  let url = router_chat_url(&endpoint)?;
+  let model_name = if model.trim().is_empty() { "default" } else { model.trim() };
+  let client = Client::builder()
+    .user_agent("bookforge-designer/0.1")
+    .build()
+    .map_err(|e| format!("client build: {}", e))?;
+
+  let base_payload = serde_json::json!({
+    "model": model_name,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a book outline architect. Return only strict JSON. Do not include markdown."
+      },
+      {
+        "role": "user",
+        "content": prompt
+      }
+    ],
+    "temperature": 0.4
+  });
+
+  let payload_with_format = {
+    let mut value = base_payload.clone();
+    value["response_format"] = serde_json::json!({ "type": "json_object" });
+    value
+  };
+
+  let mut response = client
+    .post(&url)
+    .json(&payload_with_format)
+    .send()
+    .map_err(|e| format!("router request: {}", e))?;
+
+  if response.status() == reqwest::StatusCode::BAD_REQUEST || response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+    response = client
+      .post(&url)
+      .json(&base_payload)
+      .send()
+      .map_err(|e| format!("router request: {}", e))?;
+  }
+
+  let status = response.status();
+  let body = response.text().map_err(|e| format!("router response read: {}", e))?;
+  if !status.is_success() {
+    return Err(format!("router request failed: {} {}", status, body));
+  }
+
+  let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("router response json: {}", e))?;
+  parsed
+    .get("choices")
+    .and_then(|choices| choices.get(0))
+    .and_then(|choice| choice.get("message"))
+    .and_then(|message| message.get("content"))
+    .and_then(|content| content.as_str())
+    .map(|content| content.to_string())
+    .ok_or_else(|| "router response did not include choices[0].message.content".into())
 }
 
 #[tauri::command]

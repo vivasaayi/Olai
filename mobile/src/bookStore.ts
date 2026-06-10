@@ -1,10 +1,23 @@
 import * as FileSystem from "expo-file-system";
 import { deletePaperAssets } from "./paperAssets";
-import type { AiNote, AiNoteKind, Book, BookSource, Chapter, Resource, ResourceType, Section, SectionPersona, TokenUsage } from "./types";
+import type {
+  AiNote,
+  AiNoteKind,
+  Book,
+  BookSource,
+  NodePersona,
+  OutlineNode,
+  OutlineNodeType,
+  Resource,
+  ResourceType,
+  TokenUsage,
+} from "./types";
 
 const resourceTypes: ResourceType[] = ["image", "video", "link", "prompt", "download", "pdf"];
-const personas: SectionPersona[] = ["default", "kids", "beginner", "formal", "college"];
+const personas: NodePersona[] = ["default", "kids", "beginner", "formal", "college"];
 const aiNoteKinds: AiNoteKind[] = ["paper", "concept", "section", "summary", "method", "critique", "question"];
+
+export const createId = () => `id-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -52,37 +65,84 @@ function normalizeResource(value: unknown, index: number): Resource {
   };
 }
 
-function normalizeSection(value: unknown, chapterIndex: number, sectionIndex: number): Section {
-  const raw = asRecord(value);
-  const persona = asString(raw.persona, "default") as SectionPersona;
+export function createOutlineNode(type: OutlineNodeType, title?: string, children: OutlineNode[] = []): OutlineNode {
   return {
-    id: stableId("section", `${chapterIndex + 1}-${sectionIndex + 1}`, raw.id),
-    title: asString(raw.title, `Section ${sectionIndex + 1}`),
-    intent: asString(raw.intent),
-    summary: asString(raw.summary),
+    id: createId(),
+    type,
+    title: title ?? (type === "chapter" ? "New Chapter" : "New Section"),
+    intent: "",
+    summary: "",
+    content: "",
+    keywords: [],
+    persona: "default",
+    durationMinutes: undefined,
+    resources: [],
+    children,
+  };
+}
+
+export function createInitialBook(): Book {
+  const now = new Date().toISOString();
+  return {
+    id: createId(),
+    title: "Untitled Book",
+    synopsis: "",
+    audience: "",
+    tone: "Neutral",
+    tags: [],
+    outline: [createOutlineNode("chapter", "New Chapter", [createOutlineNode("section", "New Section")])],
+    createdAt: now,
+    updatedAt: now,
+    source: { type: "bookforge" },
+    aiNotes: [],
+  };
+}
+
+function normalizeOutlineNode(value: unknown, fallbackType: OutlineNodeType, index: number): OutlineNode {
+  const raw = asRecord(value);
+  const rawType = asString(raw.type, fallbackType) as OutlineNodeType;
+  const type: OutlineNodeType = rawType === "chapter" || rawType === "section" ? rawType : fallbackType;
+  const persona = asString(raw.persona, "default") as NodePersona;
+  const legacySections = Array.isArray(raw.sections) ? raw.sections : undefined;
+  const rawChildren = Array.isArray(raw.children) ? raw.children : legacySections;
+  const children = rawChildren
+    ? rawChildren.map((child, childIndex) => normalizeOutlineNode(child, "section", childIndex))
+    : [];
+
+  return {
+    id: stableId(type, String(index + 1), raw.id),
+    type,
+    title: asString(raw.title, type === "chapter" ? `Chapter ${index + 1}` : `Section ${index + 1}`),
+    intent: asString(raw.intent) || asString(raw.goals),
+    summary: asString(raw.summary) || asString(raw.synopsis),
     content: asString(raw.content),
     keywords: asStringArray(raw.keywords),
     persona: personas.includes(persona) ? persona : "default",
     durationMinutes: asOptionalNumber(raw.durationMinutes),
     resources: Array.isArray(raw.resources)
-      ? raw.resources.map((resource, index) => normalizeResource(resource, index))
+      ? raw.resources.map((resource, resourceIndex) => normalizeResource(resource, resourceIndex))
       : [],
+    children,
   };
 }
 
-function normalizeChapter(value: unknown, index: number): Chapter {
+function normalizeLegacyChapter(value: unknown, index: number): OutlineNode {
   const raw = asRecord(value);
   const sections = Array.isArray(raw.sections)
-    ? raw.sections.map((section, sectionIndex) => normalizeSection(section, index, sectionIndex))
+    ? raw.sections.map((section, sectionIndex) => normalizeOutlineNode(section, "section", sectionIndex))
     : [];
 
-  return {
-    id: stableId("chapter", String(index + 1), raw.id),
-    title: asString(raw.title, `Chapter ${index + 1}`),
-    synopsis: asString(raw.synopsis),
-    goals: asString(raw.goals),
-    sections: sections.length ? sections : [normalizeSection({}, index, 0)],
-  };
+  return normalizeOutlineNode(
+    {
+      ...raw,
+      type: "chapter",
+      intent: asString(raw.goals),
+      summary: asString(raw.synopsis),
+      children: sections.length ? sections : [normalizeOutlineNode({}, "section", 0)],
+    },
+    "chapter",
+    index,
+  );
 }
 
 function normalizeSource(value: unknown): BookSource | undefined {
@@ -128,17 +188,20 @@ function normalizeAiNote(value: unknown, index: number): AiNote {
 
 export function normalizeBook(value: unknown): Book {
   const raw = asRecord(value);
-  const chapters = Array.isArray(raw.chapters)
-    ? raw.chapters.map((chapter, index) => normalizeChapter(chapter, index))
+  const legacyOutline = Array.isArray(raw.chapters)
+    ? raw.chapters.map((chapter, index) => normalizeLegacyChapter(chapter, index))
     : [];
-
+  const outline = Array.isArray(raw.outline)
+    ? raw.outline.map((node, index) => normalizeOutlineNode(node, "chapter", index))
+    : legacyOutline;
   const title = asString(raw.title).trim();
+
   if (!title) {
     throw new Error("Book JSON must include a title.");
   }
 
-  if (!chapters.length) {
-    throw new Error("Book JSON must include at least one chapter.");
+  if (!outline.length) {
+    throw new Error("Book JSON must include at least one outline item.");
   }
 
   return {
@@ -148,11 +211,29 @@ export function normalizeBook(value: unknown): Book {
     audience: asString(raw.audience),
     tone: asString(raw.tone, "Neutral"),
     tags: asStringArray(raw.tags),
-    chapters,
+    outline,
+    createdAt: asString(raw.createdAt) || new Date().toISOString(),
+    updatedAt: asString(raw.updatedAt) || new Date().toISOString(),
     source: normalizeSource(raw.source),
     aiNotes: Array.isArray(raw.aiNotes)
       ? raw.aiNotes.map((note, index) => normalizeAiNote(note, index))
       : [],
+  };
+}
+
+export function outlineItemCount(book: Book) {
+  const countNodes = (nodes: OutlineNode[]): number =>
+    nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
+  return countNodes(book.outline);
+}
+
+function prepareBookForSave(book: Book): Book {
+  const now = new Date().toISOString();
+  return {
+    ...book,
+    createdAt: book.createdAt || now,
+    updatedAt: now,
+    outline: book.outline.length ? book.outline : createInitialBook().outline,
   };
 }
 
@@ -196,7 +277,8 @@ export async function loadStoredBooks() {
 
 export async function saveStoredBook(book: Book) {
   await ensureBookDirectory();
-  await FileSystem.writeAsStringAsync(bookPath(book.id), JSON.stringify(book, null, 2));
+  const prepared = prepareBookForSave(book);
+  await FileSystem.writeAsStringAsync(bookPath(prepared.id), JSON.stringify(prepared, null, 2));
 }
 
 export async function deleteStoredBook(bookId: string) {

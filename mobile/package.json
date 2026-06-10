@@ -5,8 +5,9 @@
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
+    "start:tailscale": "REACT_NATIVE_PACKAGER_HOSTNAME=100.66.32.111 EXPO_DEVTOOLS_LISTEN_ADDRESS=0.0.0.0 expo start --dev-client --port 8083 --host lan",
     "ios": "LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 expo run:ios",
-    "ios:device": "LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 expo run:ios --device --port 8083",
+    "ios:device": "REACT_NATIVE_PACKAGER_HOSTNAME=100.66.32.111 EXPO_DEVTOOLS_LISTEN_ADDRESS=0.0.0.0 LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 expo run:ios --device --port 8083",
     "android": "expo run:android",
     "web": "expo start --web",
     "lmstudio:proxy": "node scripts/lmstudio-proxy.mjs",

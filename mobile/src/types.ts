@@ -10,8 +10,12 @@ export interface Resource {
 
 export type SectionPersona = "default" | "kids" | "beginner" | "formal" | "college";
 
-export interface Section {
+export type OutlineNodeType = "chapter" | "section";
+export type NodePersona = SectionPersona;
+
+export interface OutlineNode {
   id: string;
+  type: OutlineNodeType;
   title: string;
   intent: string;
   summary: string;
@@ -20,15 +24,11 @@ export interface Section {
   persona: SectionPersona;
   durationMinutes?: number;
   resources: Resource[];
+  children: OutlineNode[];
 }
 
-export interface Chapter {
-  id: string;
-  title: string;
-  synopsis: string;
-  goals: string;
-  sections: Section[];
-}
+export type Section = OutlineNode;
+export type Chapter = OutlineNode;
 
 export type AiNoteKind = "paper" | "concept" | "section" | "summary" | "method" | "critique" | "question";
 
@@ -74,7 +74,9 @@ export interface Book {
   audience: string;
   tone: string;
   tags: string[];
-  chapters: Chapter[];
+  outline: OutlineNode[];
+  createdAt?: string;
+  updatedAt?: string;
   source?: BookSource;
   aiNotes?: AiNote[];
 }

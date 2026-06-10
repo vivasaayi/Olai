@@ -8,24 +8,21 @@ export interface Resource {
   description?: string
 }
 
-export interface Section {
+export type OutlineNodeType = 'chapter' | 'section'
+export type NodePersona = 'default' | 'kids' | 'beginner' | 'formal' | 'college'
+
+export interface OutlineNode {
   id: string
+  type: OutlineNodeType
   title: string
   intent: string
   summary: string
   content: string
   keywords: string[]
-  persona: 'default' | 'kids' | 'beginner' | 'formal' | 'college'
+  persona: NodePersona
   durationMinutes?: number
   resources: Resource[]
-}
-
-export interface Chapter {
-  id: string
-  title: string
-  synopsis: string
-  goals: string
-  sections: Section[]
+  children: OutlineNode[]
 }
 
 export interface Book {
@@ -35,7 +32,9 @@ export interface Book {
   audience: string
   tone: string
   tags: string[]
-  chapters: Chapter[]
+  outline: OutlineNode[]
+  createdAt?: string
+  updatedAt?: string
 }
 
 export interface ModelInfo {

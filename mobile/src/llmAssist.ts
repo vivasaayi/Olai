@@ -25,6 +25,14 @@ const modeInstructions: Record<AssistMode, string> = {
   custom: "Answer the custom question using only the provided reading context.",
 };
 
+const requestTimeoutMs = 45_000;
+
+function timeoutSignal() {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
+  return { controller, timeout };
+}
+
 export function buildAssistPrompt(
   book: Book,
   chapter: Chapter | undefined,
@@ -80,24 +88,37 @@ export async function runOpenAiCompatibleAssist({
 }): Promise<AssistRunResult> {
   const cleanEndpoint = endpoint.trim().replace(/\/$/, "");
   const url = cleanEndpoint.endsWith("/chat/completions") ? cleanEndpoint : `${cleanEndpoint}/chat/completions`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
-    },
-    body: JSON.stringify({
-      model: model.trim() || "google/gemma-4-12b-qat",
-      temperature: 0.2,
-      messages: [
-        {
-          role: "system",
-          content: "You help readers understand research papers. Be precise, concise, and honest about uncertainty.",
-        },
-        { role: "user", content: prompt },
-      ],
-    }),
-  });
+  const { controller, timeout } = timeoutSignal();
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
+      },
+      body: JSON.stringify({
+        model: model.trim() || "google/gemma-4-12b-qat",
+        temperature: 0.2,
+        messages: [
+          {
+            role: "system",
+            content: "You help readers understand research papers. Be precise, concise, and honest about uncertainty.",
+          },
+          { role: "user", content: prompt },
+        ],
+      }),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("LLM request timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     throw new Error(`LLM request failed: ${response.status}`);
@@ -154,13 +175,26 @@ export async function fetchAssistModels({
   }
 
   const url = cleanEndpoint.endsWith("/models") ? cleanEndpoint : `${cleanEndpoint}/models`;
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
-    },
-  });
+  const { controller, timeout } = timeoutSignal();
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
+      },
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("Model list request timed out.");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     throw new Error(`Model list request failed: ${response.status}`);
