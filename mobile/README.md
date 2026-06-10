@@ -164,7 +164,9 @@ The mobile Assist screen calls `http://100.66.32.111:1235/v1/models`, but only e
 
 The selected model is sent in each `/chat/completions` request. The router then forwards to the right upstream provider. The router also registers `deepseek-v4-pro` for non-mobile callers.
 
-Assist responses are rendered as markdown in the app and are also stored locally with the paper as notebook notes. When the same section, mode, question, and model are selected again, the saved note is loaded from local storage instead of calling the LLM again. The Assist markdown source editor supports selecting generated text and asking quick follow-up actions such as Explain, Summarize, and Define.
+Assist responses are rendered as markdown in the app and are also stored locally with the paper as notebook notes. When the same section, mode, question, and model are selected again, the saved note is loaded from local storage instead of calling the LLM again. The Assist markdown source editor supports selecting generated text and asking quick follow-up actions such as Explain, Summarize, and Define. Saved notes also expose selectable note text with the same quick actions.
+
+For paper passages, open **Sources > Paper Text**, select a block from the saved extracted text, then tap **Explain**, **Summarize**, or **Define**. The app sends that selected passage through the same Assist flow and stores the response as a local paper note.
 
 The app does not send the full PDF to the LLM. It sends the current section plus up to 48,000 characters from the saved extracted paper text snapshot. If the router/upstream provider returns token usage, the Assist screen shows input, output, and total tokens, and the same usage metadata is stored with the saved note.
 

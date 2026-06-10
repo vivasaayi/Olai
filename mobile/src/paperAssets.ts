@@ -3,6 +3,7 @@ import type { Book } from "./types";
 
 const maxStoredTextLength = 1_000_000;
 const defaultAssistTextLimit = 48_000;
+const defaultSelectableTextLimit = 160_000;
 
 type HtmlSnapshotInput = {
   bookId: string;
@@ -170,6 +171,10 @@ export async function readBookSourceText(book: Book, limit = defaultAssistTextLi
 
   const text = await FileSystem.readAsStringAsync(path);
   return text.trim().slice(0, limit);
+}
+
+export async function readSelectableBookSourceText(book: Book, limit = defaultSelectableTextLimit) {
+  return readBookSourceText(book, limit);
 }
 
 export async function deletePaperAssets(bookId: string) {

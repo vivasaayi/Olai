@@ -2,8 +2,10 @@ import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  KeyboardAvoidingView,
   Modal,
   type NativeSyntheticEvent,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -24,7 +26,7 @@ import {
   type AssistMode,
   type AssistModelOption,
 } from "./src/llmAssist";
-import { readBookSourceText } from "./src/paperAssets";
+import { readBookSourceText, readSelectableBookSourceText } from "./src/paperAssets";
 import { importPaperFromInput } from "./src/paperImport";
 import { sampleBook } from "./src/sampleBook";
 import { defaultReaderSettings, loadReaderSettings, saveReaderSettings } from "./src/settingsStore";
@@ -244,6 +246,9 @@ export default function App() {
   const [statusText, setStatusText] = useState("");
   const [webUrl, setWebUrl] = useState("");
   const [webTitle, setWebTitle] = useState("Source");
+  const [paperTextOpen, setPaperTextOpen] = useState(false);
+  const [paperText, setPaperText] = useState("");
+  const [paperTextBusy, setPaperTextBusy] = useState(false);
   const [assistOpen, setAssistOpen] = useState(false);
   const [assistMode, setAssistMode] = useState<AssistMode>("augment");
   const [assistQuestion, setAssistQuestion] = useState("");
@@ -403,6 +408,19 @@ export default function App() {
     setWebUrl(resource.value);
   };
 
+  const openPaperText = async () => {
+    setPaperTextOpen(true);
+    setPaperTextBusy(true);
+    try {
+      const text = await readSelectableBookSourceText(activeBook);
+      setPaperText(text || "No extracted paper text is available for this paper.");
+    } catch (error) {
+      setPaperText(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPaperTextBusy(false);
+    }
+  };
+
   const persistAssistAnswer = async (
     answer: string,
     mode: AssistMode,
@@ -530,6 +548,22 @@ export default function App() {
     await runAssist({ mode, question });
   };
 
+  const askAboutPaperTextSelection = async (action: "explain" | "summarize" | "define", selectedText: string) => {
+    const cleanSelection = selectedText.trim().replace(/\s+/g, " ");
+    if (!cleanSelection) return;
+
+    const question =
+      action === "explain"
+        ? `Explain this selected passage from the paper text: "${cleanSelection}"`
+        : action === "summarize"
+          ? `Summarize this selected passage from the paper text: "${cleanSelection}"`
+          : `Define the key terms and concepts in this selected passage from the paper text: "${cleanSelection}"`;
+    const mode: AssistMode = action === "summarize" ? "summary" : "concept";
+    setPaperTextOpen(false);
+    setAssistOpen(true);
+    await runAssist({ mode, question });
+  };
+
   const removeAiNote = async (noteId: string) => {
     const updatedBook: Book = {
       ...activeBook,
@@ -591,10 +625,19 @@ export default function App() {
           ))}
         </View>
 
-        {readingResources.length ? (
+        {readingResources.length || activeBook.source?.localTextPath ? (
           <View style={styles.resourcePanel}>
             <Text style={[styles.resourceTitle, { color: theme.muted }]}>Sources</Text>
             <View style={styles.resourceButtons}>
+              {activeBook.source?.localTextPath ? (
+                <AppButton
+                  label="Paper Text"
+                  onPress={openPaperText}
+                  theme={theme}
+                  variant="ghost"
+                  compact
+                />
+              ) : null}
               {readingResources.map((resource) => (
                 <AppButton
                   key={`${resource.label}-${resource.value}`}
@@ -661,6 +704,16 @@ export default function App() {
         theme={theme}
       />
 
+      <PaperTextModal
+        busy={paperTextBusy}
+        onAskSelection={askAboutPaperTextSelection}
+        onClose={() => setPaperTextOpen(false)}
+        open={paperTextOpen}
+        text={paperText}
+        theme={theme}
+        title={activeBook.title}
+      />
+
       <AssistModal
         answer={assistAnswer}
         apiKey={assistApiKey}
@@ -691,6 +744,11 @@ export default function App() {
 
       <NotesModal
         book={activeBook}
+        onAskSelection={(action, selectedText) => {
+          setNotesOpen(false);
+          setAssistOpen(true);
+          void askAboutSelectedText(action, selectedText);
+        }}
         onClose={() => setNotesOpen(false)}
         onRemove={removeAiNote}
         open={notesOpen}
@@ -859,6 +917,80 @@ function AddReadingModal({
   );
 }
 
+function PaperTextModal({
+  busy,
+  onAskSelection,
+  onClose,
+  open,
+  text,
+  theme,
+  title,
+}: {
+  busy: boolean;
+  onAskSelection: (action: "explain" | "summarize" | "define", selectedText: string) => void;
+  onClose: () => void;
+  open: boolean;
+  text: string;
+  theme: Theme;
+  title: string;
+}) {
+  const [selectedText, setSelectedText] = useState("");
+
+  useEffect(() => {
+    setSelectedText("");
+  }, [open, text]);
+
+  const updateSelectedText = (event: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
+    const { start, end } = event.nativeEvent.selection;
+    const selected = start === end ? "" : text.slice(Math.min(start, end), Math.max(start, end));
+    setSelectedText(selected);
+  };
+
+  return (
+    <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
+      <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
+        <View style={styles.modalHeader}>
+          <View style={styles.noteTitleBlock}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Paper Text</Text>
+            <Text numberOfLines={1} style={[styles.noteMeta, { color: theme.muted }]}>{title}</Text>
+          </View>
+          <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
+        </View>
+        {busy ? (
+          <View style={styles.webLoading}>
+            <ActivityIndicator />
+          </View>
+        ) : (
+          <View style={styles.paperTextBody}>
+            <Text style={[styles.helperText, { color: theme.muted }]}>
+              Select a passage from the saved paper text, then ask Assist to explain, summarize, or define it.
+            </Text>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              multiline
+              onChangeText={() => undefined}
+              onSelectionChange={updateSelectedText}
+              scrollEnabled
+              showSoftInputOnFocus={false}
+              style={[styles.paperTextInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              textAlignVertical="top"
+              value={text}
+            />
+            {selectedText.trim() ? (
+              <View style={styles.selectionActions}>
+                <AppButton label="Explain" onPress={() => onAskSelection("explain", selectedText)} theme={theme} compact />
+                <AppButton label="Summarize" onPress={() => onAskSelection("summarize", selectedText)} theme={theme} variant="ghost" compact />
+                <AppButton label="Define" onPress={() => onAskSelection("define", selectedText)} theme={theme} variant="ghost" compact />
+              </View>
+            ) : null}
+          </View>
+        )}
+      </SafeAreaView>
+    </Modal>
+  );
+}
+
 function AssistModal({
   answer,
   apiKey,
@@ -929,157 +1061,167 @@ function AssistModal({
   return (
     <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
       <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
-        <View style={styles.modalHeader}>
-          <Text style={[styles.modalTitle, { color: theme.text }]}>Assist</Text>
-          <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
-        </View>
-        <ScrollView contentContainerStyle={styles.assistContent} keyboardShouldPersistTaps="handled">
-          <Text style={[styles.helperText, { color: theme.muted }]}>
-            Defaults to the BookForge router. Load models from the router, then choose the model to send with every Assist request.
-          </Text>
-          <View style={styles.modeGrid}>
-            {modes.map((entry) => (
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          keyboardVerticalOffset={Platform.OS === "ios" ? 8 : 0}
+          style={styles.keyboardAvoiding}
+        >
+          <View style={styles.modalHeader}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Assist</Text>
+            <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
+          </View>
+          <ScrollView
+            automaticallyAdjustKeyboardInsets
+            contentContainerStyle={styles.assistContent}
+            keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+            keyboardShouldPersistTaps="handled"
+          >
+            <Text style={[styles.helperText, { color: theme.muted }]}>
+              Defaults to the BookForge router. Load models from the router, then choose the model to send with every Assist request.
+            </Text>
+            <View style={styles.modeGrid}>
+              {modes.map((entry) => (
+                <AppButton
+                  key={entry}
+                  label={entry}
+                  onPress={() => setMode(entry)}
+                  theme={theme}
+                  variant={mode === entry ? "solid" : "ghost"}
+                  compact
+                />
+              ))}
+            </View>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setEndpoint}
+              placeholder="http://100.66.32.111:1235/v1"
+              placeholderTextColor={theme.muted}
+              style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              value={endpoint}
+            />
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={false}
+              onChangeText={setModel}
+              placeholder="Model"
+              placeholderTextColor={theme.muted}
+              style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              value={model}
+            />
+            <View style={styles.modelPickerActions}>
               <AppButton
-                key={entry}
-                label={entry}
-                onPress={() => setMode(entry)}
+                label={modelsBusy ? "Loading..." : "Load Models"}
+                onPress={onRefreshModels}
+                disabled={modelsBusy || !endpoint.trim()}
                 theme={theme}
-                variant={mode === entry ? "solid" : "ghost"}
+                variant="ghost"
                 compact
               />
-            ))}
-          </View>
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            onChangeText={setEndpoint}
-            placeholder="http://100.66.32.111:1235/v1"
-            placeholderTextColor={theme.muted}
-            style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
-            value={endpoint}
-          />
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            editable={false}
-            onChangeText={setModel}
-            placeholder="Model"
-            placeholderTextColor={theme.muted}
-            style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
-            value={model}
-          />
-          <View style={styles.modelPickerActions}>
-            <AppButton
-              label={modelsBusy ? "Loading..." : "Load Models"}
-              onPress={onRefreshModels}
-              disabled={modelsBusy || !endpoint.trim()}
-              theme={theme}
-              variant="ghost"
-              compact
-            />
-            <AppButton
-              label={modelsOpen ? "Hide Models" : `Models ${models.length || ""}`.trim()}
-              onPress={() => setModelsOpen((value) => !value)}
-              disabled={!models.length}
-              theme={theme}
-              variant="ghost"
-              compact
-            />
-          </View>
-          {modelError ? (
-            <Text style={[styles.helperText, { color: theme.muted }]}>
-              {modelError}
-            </Text>
-          ) : null}
-          {modelsOpen && models.length ? (
-            <View style={[styles.modelDropdown, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-              {models.map((entry) => {
-                const selected = entry.id === model;
-                return (
-                  <Pressable
-                    key={`${entry.provider ?? "provider"}-${entry.id}`}
-                    onPress={() => {
-                      setModel(entry.id);
-                      setModelsOpen(false);
-                    }}
-                    style={({ pressed }) => [
-                      styles.modelOption,
-                      {
-                        borderColor: theme.border,
-                        backgroundColor: selected ? theme.accent : "transparent",
-                        opacity: pressed ? 0.75 : 1,
-                      },
-                    ]}
-                  >
-                    <Text style={[styles.modelOptionTitle, { color: selected ? theme.accentText : theme.text }]}>
-                      {entry.label || entry.id}
-                    </Text>
-                    {entry.id || entry.provider || entry.upstreamId ? (
-                      <Text style={[styles.modelOptionMeta, { color: selected ? theme.accentText : theme.muted }]}>
-                        {[entry.id, entry.provider, entry.upstreamId ? `upstream ${entry.upstreamId}` : ""].filter(Boolean).join(" - ")}
-                      </Text>
-                    ) : null}
-                  </Pressable>
-                );
-              })}
+              <AppButton
+                label={modelsOpen ? "Hide Models" : `Models ${models.length || ""}`.trim()}
+                onPress={() => setModelsOpen((value) => !value)}
+                disabled={!models.length}
+                theme={theme}
+                variant="ghost"
+                compact
+              />
             </View>
-          ) : null}
-          <TextInput
-            autoCapitalize="none"
-            autoCorrect={false}
-            onChangeText={setApiKey}
-            placeholder="API key (optional for local servers)"
-            placeholderTextColor={theme.muted}
-            secureTextEntry
-            style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
-            value={apiKey}
-          />
-          <TextInput
-            multiline
-            onChangeText={setQuestion}
-            placeholder="Optional question, e.g. what is the paper's main claim?"
-            placeholderTextColor={theme.muted}
-            style={[styles.questionInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
-            textAlignVertical="top"
-            value={question}
-          />
-          <View style={styles.assistActions}>
-            <AppButton label={busy ? "Thinking..." : "Run Assist"} onPress={onRun} disabled={busy} theme={theme} />
-            <AppButton label="Save Note" onPress={onSaveAnswer} disabled={!canSaveAnswer || busy} theme={theme} variant="ghost" />
-          </View>
-          {usage ? <TokenUsageBadge usage={usage} theme={theme} /> : null}
-          {answer ? (
-            <>
-              <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-                <Text style={[styles.previewLabel, { color: theme.muted }]}>Preview</Text>
-                <MarkdownPreview content={answer} theme={theme} />
+            {modelError ? (
+              <Text style={[styles.helperText, { color: theme.muted }]}>
+                {modelError}
+              </Text>
+            ) : null}
+            {modelsOpen && models.length ? (
+              <View style={[styles.modelDropdown, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                {models.map((entry) => {
+                  const selected = entry.id === model;
+                  return (
+                    <Pressable
+                      key={`${entry.provider ?? "provider"}-${entry.id}`}
+                      onPress={() => {
+                        setModel(entry.id);
+                        setModelsOpen(false);
+                      }}
+                      style={({ pressed }) => [
+                        styles.modelOption,
+                        {
+                          borderColor: theme.border,
+                          backgroundColor: selected ? theme.accent : "transparent",
+                          opacity: pressed ? 0.75 : 1,
+                        },
+                      ]}
+                    >
+                      <Text style={[styles.modelOptionTitle, { color: selected ? theme.accentText : theme.text }]}>
+                        {entry.label || entry.id}
+                      </Text>
+                      {entry.id || entry.provider || entry.upstreamId ? (
+                        <Text style={[styles.modelOptionMeta, { color: selected ? theme.accentText : theme.muted }]}>
+                          {[entry.id, entry.provider, entry.upstreamId ? `upstream ${entry.upstreamId}` : ""].filter(Boolean).join(" - ")}
+                        </Text>
+                      ) : null}
+                    </Pressable>
+                  );
+                })}
               </View>
-              <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-                <Text style={[styles.previewLabel, { color: theme.muted }]}>Markdown Source</Text>
-                <TextInput
-                  multiline
-                  onChangeText={onAnswerChange}
-                  onSelectionChange={updateSelectedAnswerText}
-                  style={[styles.markdownEditor, { color: theme.text, borderColor: theme.border }]}
-                  textAlignVertical="top"
-                  value={answer}
-                />
-                {selectedAnswerText.trim() ? (
-                  <View style={styles.selectionActions}>
-                    <AppButton label="Explain" onPress={() => onAskSelection("explain", selectedAnswerText)} disabled={busy} theme={theme} compact />
-                    <AppButton label="Summarize" onPress={() => onAskSelection("summarize", selectedAnswerText)} disabled={busy} theme={theme} variant="ghost" compact />
-                    <AppButton label="Define" onPress={() => onAskSelection("define", selectedAnswerText)} disabled={busy} theme={theme} variant="ghost" compact />
-                  </View>
-                ) : null}
-              </View>
-            </>
-          ) : null}
-        </ScrollView>
+            ) : null}
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setApiKey}
+              placeholder="API key (optional for local servers)"
+              placeholderTextColor={theme.muted}
+              secureTextEntry
+              style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              value={apiKey}
+            />
+            <TextInput
+              multiline
+              onChangeText={setQuestion}
+              placeholder="Optional question, e.g. what is the paper's main claim?"
+              placeholderTextColor={theme.muted}
+              style={[styles.questionInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              textAlignVertical="top"
+              value={question}
+            />
+            <View style={styles.assistActions}>
+              <AppButton label={busy ? "Thinking..." : "Run Assist"} onPress={onRun} disabled={busy} theme={theme} />
+              <AppButton label="Save Note" onPress={onSaveAnswer} disabled={!canSaveAnswer || busy} theme={theme} variant="ghost" />
+            </View>
+            {usage ? <TokenUsageBadge usage={usage} theme={theme} /> : null}
+            {answer ? (
+              <>
+                <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                  <Text style={[styles.previewLabel, { color: theme.muted }]}>Preview</Text>
+                  <MarkdownPreview content={answer} theme={theme} />
+                </View>
+                <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                  <Text style={[styles.previewLabel, { color: theme.muted }]}>Markdown Source</Text>
+                  <TextInput
+                    multiline
+                    onChangeText={onAnswerChange}
+                    onSelectionChange={updateSelectedAnswerText}
+                    style={[styles.markdownEditor, { color: theme.text, borderColor: theme.border }]}
+                    textAlignVertical="top"
+                    value={answer}
+                  />
+                  {selectedAnswerText.trim() ? (
+                    <View style={styles.selectionActions}>
+                      <AppButton label="Explain" onPress={() => onAskSelection("explain", selectedAnswerText)} disabled={busy} theme={theme} compact />
+                      <AppButton label="Summarize" onPress={() => onAskSelection("summarize", selectedAnswerText)} disabled={busy} theme={theme} variant="ghost" compact />
+                      <AppButton label="Define" onPress={() => onAskSelection("define", selectedAnswerText)} disabled={busy} theme={theme} variant="ghost" compact />
+                    </View>
+                  ) : null}
+                </View>
+              </>
+            ) : null}
+          </ScrollView>
+        </KeyboardAvoidingView>
       </SafeAreaView>
     </Modal>
   );
 }
-
 function MarkdownPreview({ content, theme }: { content: string; theme: Theme }) {
   const blocks: React.ReactNode[] = [];
   const paragraph: string[] = [];
@@ -1257,12 +1399,14 @@ function tokenUsageLabel(usage: TokenUsage | undefined) {
 
 function NotesModal({
   book,
+  onAskSelection,
   onClose,
   onRemove,
   open,
   theme,
 }: {
   book: Book;
+  onAskSelection: (action: "explain" | "summarize" | "define", selectedText: string) => void;
   onClose: () => void;
   onRemove: (noteId: string) => void;
   open: boolean;
@@ -1295,6 +1439,7 @@ function NotesModal({
               <View style={styles.noteContent}>
                 <MarkdownPreview content={note.content} theme={theme} />
               </View>
+              <SelectableNoteText content={note.content} onAskSelection={onAskSelection} theme={theme} />
             </View>
           )) : (
             <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
@@ -1306,6 +1451,53 @@ function NotesModal({
         </ScrollView>
       </SafeAreaView>
     </Modal>
+  );
+}
+
+function SelectableNoteText({
+  content,
+  onAskSelection,
+  theme,
+}: {
+  content: string;
+  onAskSelection: (action: "explain" | "summarize" | "define", selectedText: string) => void;
+  theme: Theme;
+}) {
+  const [selectedText, setSelectedText] = useState("");
+
+  useEffect(() => {
+    setSelectedText("");
+  }, [content]);
+
+  const updateSelectedText = (event: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
+    const { start, end } = event.nativeEvent.selection;
+    const selected = start === end ? "" : content.slice(Math.min(start, end), Math.max(start, end));
+    setSelectedText(selected);
+  };
+
+  return (
+    <View style={[styles.noteSelectableText, { borderColor: theme.border }]}>
+      <Text style={[styles.previewLabel, { color: theme.muted }]}>Selectable Note Text</Text>
+      <TextInput
+        autoCapitalize="none"
+        autoCorrect={false}
+        multiline
+        onChangeText={() => undefined}
+        onSelectionChange={updateSelectedText}
+        scrollEnabled
+        showSoftInputOnFocus={false}
+        style={[styles.noteTextInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.background }]}
+        textAlignVertical="top"
+        value={content}
+      />
+      {selectedText.trim() ? (
+        <View style={styles.selectionActions}>
+          <AppButton label="Explain" onPress={() => onAskSelection("explain", selectedText)} theme={theme} compact />
+          <AppButton label="Summarize" onPress={() => onAskSelection("summarize", selectedText)} theme={theme} variant="ghost" compact />
+          <AppButton label="Define" onPress={() => onAskSelection("define", selectedText)} theme={theme} variant="ghost" compact />
+        </View>
+      ) : null}
+    </View>
   );
 }
 
@@ -1512,6 +1704,9 @@ const styles = StyleSheet.create({
     flex: 1,
     padding: 16,
   },
+  keyboardAvoiding: {
+    flex: 1,
+  },
   modalHeader: {
     alignItems: "center",
     flexDirection: "row",
@@ -1558,6 +1753,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 19,
     marginBottom: 14,
+    padding: 12,
+  },
+  paperTextBody: {
+    flex: 1,
+    gap: 12,
+  },
+  paperTextInput: {
+    borderRadius: 8,
+    borderWidth: 1,
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 21,
     padding: 12,
   },
   libraryList: {
@@ -1623,6 +1830,21 @@ const styles = StyleSheet.create({
   noteContent: {
     marginTop: 12,
   },
+  noteSelectableText: {
+    borderTopWidth: 1,
+    marginTop: 14,
+    paddingTop: 12,
+  },
+  noteTextInput: {
+    borderRadius: 8,
+    borderWidth: 1,
+    fontFamily: "Menlo",
+    fontSize: 12,
+    lineHeight: 18,
+    maxHeight: 180,
+    minHeight: 92,
+    padding: 10,
+  },
   emptyNotes: {
     borderRadius: 8,
     borderWidth: 1,
@@ -1630,7 +1852,7 @@ const styles = StyleSheet.create({
   },
   assistContent: {
     gap: 12,
-    paddingBottom: 32,
+    paddingBottom: 180,
   },
   modeGrid: {
     flexDirection: "row",
