@@ -32,6 +32,12 @@ export interface Chapter {
 
 export type AiNoteKind = "paper" | "concept" | "section" | "summary" | "method" | "critique" | "question";
 
+export interface TokenUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+}
+
 export interface AiNote {
   id: string;
   kind: AiNoteKind;
@@ -42,6 +48,7 @@ export interface AiNote {
   sourceSectionTitle?: string;
   question?: string;
   model?: string;
+  tokenUsage?: TokenUsage;
   tags: string[];
 }
 

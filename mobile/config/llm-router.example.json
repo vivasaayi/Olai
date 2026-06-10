@@ -1,0 +1,27 @@
+{
+  "providers": [
+    {
+      "id": "office-lmstudio",
+      "label": "Office LM Studio",
+      "adapter": "openai-compatible",
+      "baseUrl": "http://office-mac:1234/v1",
+      "apiKeyEnv": "OFFICE_LMSTUDIO_API_KEY",
+      "models": ["office/*"]
+    }
+  ],
+  "models": [
+    {
+      "id": "paper-fast",
+      "provider": "deepseek",
+      "upstreamId": "deepseek-v4-flash",
+      "label": "Fast paper explanations",
+      "aliases": ["fast-paper"]
+    },
+    {
+      "id": "paper-deep",
+      "provider": "anthropic",
+      "upstreamId": "claude-sonnet-4-5",
+      "label": "Deep paper explanations"
+    }
+  ]
+}

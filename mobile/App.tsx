@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
+  type NativeSyntheticEvent,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -10,16 +11,24 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  type TextInputSelectionChangeEventData,
   View,
 } from "react-native";
 import { WebView } from "react-native-webview";
 import { deleteStoredBook, loadStoredBooks, normalizeBook, saveStoredBook } from "./src/bookStore";
-import { buildAssistPrompt, localAssistFallback, runOpenAiCompatibleAssist, type AssistMode } from "./src/llmAssist";
+import {
+  buildAssistPrompt,
+  fetchAssistModels,
+  localAssistFallback,
+  runOpenAiCompatibleAssist,
+  type AssistMode,
+  type AssistModelOption,
+} from "./src/llmAssist";
 import { readBookSourceText } from "./src/paperAssets";
 import { importPaperFromInput } from "./src/paperImport";
 import { sampleBook } from "./src/sampleBook";
 import { defaultReaderSettings, loadReaderSettings, saveReaderSettings } from "./src/settingsStore";
-import type { AiNote, AiNoteKind, Book, Resource, Section } from "./src/types";
+import type { AiNote, AiNoteKind, Book, Resource, Section, TokenUsage } from "./src/types";
 
 type ThemeId = "paper" | "sepia" | "night";
 type AddMode = "paper" | "json";
@@ -70,6 +79,37 @@ type FlatSection = {
   chapterTitle: string;
   section: Section;
 };
+
+const mobileAssistModels: AssistModelOption[] = [
+  {
+    id: "google/gemma-4-12b-qat",
+    label: "Local LLM (Gemma)",
+    provider: "lmstudio",
+  },
+  {
+    id: "deepseek-v4-flash",
+    label: "DeepSeek V4 Flash",
+    provider: "deepseek",
+  },
+  {
+    id: "gpt-5.4-nano",
+    label: "GPT 5.4 Nano",
+    provider: "openai",
+  },
+];
+
+const mobileAssistModelIds = new Set(mobileAssistModels.map((model) => model.id));
+
+function normalizeMobileAssistModel(model: string) {
+  return mobileAssistModelIds.has(model.trim()) ? model.trim() : defaultReaderSettings.assistModel;
+}
+
+function mobileAllowedModelsFromRouter(models: AssistModelOption[]) {
+  return mobileAssistModels.map((allowed) => {
+    const routerModel = models.find((model) => model.id === allowed.id);
+    return routerModel ? { ...allowed, ...routerModel, label: allowed.label } : allowed;
+  });
+}
 
 function flattenBook(book: Book): FlatSection[] {
   return book.chapters.flatMap((chapter, chapterIndex) =>
@@ -164,6 +204,28 @@ function noteTitleForMode(mode: AssistMode, section: Section, question: string) 
   return `Study Notes: ${section.title}`;
 }
 
+function normalizedQuestion(question: string | undefined) {
+  return (question ?? "").trim().replace(/\s+/g, " ");
+}
+
+function noteMatchesAssist(
+  note: AiNote,
+  section: Section,
+  mode: AssistMode,
+  question: string,
+  model: string,
+) {
+  return note.sourceSectionId === section.id
+    && note.kind === noteKindForMode(mode)
+    && note.tags.includes(mode)
+    && normalizedQuestion(note.question) === normalizedQuestion(question)
+    && (note.model ?? "") === model;
+}
+
+function findAssistNote(book: Book, section: Section, mode: AssistMode, question: string, model: string) {
+  return (book.aiNotes ?? []).find((note) => noteMatchesAssist(note, section, mode, question, model));
+}
+
 export default function App() {
   const [books, setBooks] = useState<Book[]>([sampleBook]);
   const [storedBookIds, setStoredBookIds] = useState<string[]>([]);
@@ -188,7 +250,11 @@ export default function App() {
   const [assistEndpoint, setAssistEndpoint] = useState(defaultReaderSettings.assistEndpoint);
   const [assistApiKey, setAssistApiKey] = useState("");
   const [assistModel, setAssistModel] = useState(defaultReaderSettings.assistModel);
+  const [assistModels, setAssistModels] = useState<AssistModelOption[]>(mobileAssistModels);
+  const [assistModelsBusy, setAssistModelsBusy] = useState(false);
+  const [assistModelsError, setAssistModelsError] = useState("");
   const [assistAnswer, setAssistAnswer] = useState("");
+  const [assistUsage, setAssistUsage] = useState<TokenUsage | undefined>(undefined);
   const [assistBusy, setAssistBusy] = useState(false);
 
   const theme = themes[themeId];
@@ -196,7 +262,8 @@ export default function App() {
   const refreshBooks = async () => {
     try {
       const storedBooks = await loadStoredBooks();
-      setBooks([sampleBook, ...storedBooks.filter((book) => book.id !== sampleBook.id)]);
+      const storedSample = storedBooks.find((book) => book.id === sampleBook.id);
+      setBooks([storedSample ?? sampleBook, ...storedBooks.filter((book) => book.id !== sampleBook.id)]);
       setStoredBookIds(storedBooks.map((book) => book.id));
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : String(error));
@@ -207,9 +274,15 @@ export default function App() {
     refreshBooks();
     loadReaderSettings().then((settings) => {
       setAssistEndpoint(settings.assistEndpoint);
-      setAssistModel(settings.assistModel);
+      setAssistModel(normalizeMobileAssistModel(settings.assistModel));
     });
   }, []);
+
+  useEffect(() => {
+    if (assistOpen) {
+      void refreshAssistModels();
+    }
+  }, [assistOpen]);
 
   const activeBook = books.find((book) => book.id === activeBookId) ?? books[0] ?? sampleBook;
   const flatSections = useMemo(() => flattenBook(activeBook), [activeBook]);
@@ -227,6 +300,17 @@ export default function App() {
   const contentParagraphs = splitParagraphs(sectionBody(activeSection));
   const readingResources = readingResourcesForBook(activeBook, activeSection);
   const aiNoteCount = activeBook.aiNotes?.length ?? 0;
+  const activeAssistModel = normalizeMobileAssistModel(assistModel);
+  const cachedAssistNote = useMemo(
+    () => findAssistNote(activeBook, activeSection, assistMode, assistQuestion, activeAssistModel),
+    [activeBook, activeSection, assistMode, assistQuestion, activeAssistModel],
+  );
+
+  useEffect(() => {
+    if (!assistOpen || assistBusy) return;
+    setAssistAnswer(cachedAssistNote?.content ?? "");
+    setAssistUsage(cachedAssistNote?.tokenUsage);
+  }, [assistOpen, assistBusy, cachedAssistNote?.id, cachedAssistNote?.content, cachedAssistNote?.tokenUsage, assistMode, assistQuestion, activeAssistModel, activeSection.id]);
 
   const openBook = (book: Book) => {
     setActiveBookId(book.id);
@@ -241,6 +325,37 @@ export default function App() {
     if (!next) return;
     setChapterIndex(next.chapterIndex);
     setSectionIndex(next.sectionIndex);
+  };
+
+  const refreshAssistModels = async () => {
+    const endpoint = assistEndpoint.trim();
+    if (!endpoint) {
+      setAssistModels([]);
+      setAssistModelsError("");
+      return;
+    }
+
+    setAssistModelsBusy(true);
+    setAssistModelsError("");
+    try {
+      const models = await fetchAssistModels({
+        endpoint,
+        apiKey: assistApiKey,
+      });
+      const allowedModels = mobileAllowedModelsFromRouter(models);
+      setAssistModels(allowedModels);
+      if (!mobileAssistModelIds.has(assistModel.trim()) && allowedModels[0]) {
+        setAssistModel(allowedModels[0].id);
+      }
+    } catch (error) {
+      setAssistModels(mobileAssistModels);
+      if (!mobileAssistModelIds.has(assistModel.trim())) {
+        setAssistModel(defaultReaderSettings.assistModel);
+      }
+      setAssistModelsError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAssistModelsBusy(false);
+    }
   };
 
   const importBook = async () => {
@@ -288,36 +403,97 @@ export default function App() {
     setWebUrl(resource.value);
   };
 
-  const runAssist = async () => {
+  const persistAssistAnswer = async (
+    answer: string,
+    mode: AssistMode,
+    question: string,
+    model: string,
+    tokenUsage?: TokenUsage,
+  ) => {
+    const cleanAnswer = answer.trim();
+    if (!cleanAnswer) return null;
+
+    const existing = findAssistNote(activeBook, activeSection, mode, question, model);
+    const note: AiNote = {
+      id: existing?.id ?? `ai-note-${Date.now()}`,
+      kind: noteKindForMode(mode),
+      title: noteTitleForMode(mode, activeSection, question),
+      content: cleanAnswer,
+      createdAt: new Date().toISOString(),
+      sourceSectionId: activeSection.id,
+      sourceSectionTitle: activeSection.title,
+      question: normalizedQuestion(question) || undefined,
+      model,
+      tokenUsage,
+      tags: [mode, ...activeSection.keywords.slice(0, 3)],
+    };
+
+    const updatedBook: Book = {
+      ...activeBook,
+      aiNotes: [
+        note,
+        ...(activeBook.aiNotes ?? []).filter((entry) => !noteMatchesAssist(entry, activeSection, mode, question, model)),
+      ],
+    };
+
+    await saveStoredBook(updatedBook);
+    setBooks((current) => current.map((book) => book.id === updatedBook.id ? updatedBook : book));
+    setStoredBookIds((current) => current.includes(updatedBook.id) ? current : [...current, updatedBook.id]);
+    setActiveBookId(updatedBook.id);
+    return note;
+  };
+
+  const runAssist = async (overrides?: { mode?: AssistMode; question?: string }) => {
     setAssistBusy(true);
     try {
       const endpoint = assistEndpoint.trim();
-      const model = assistModel.trim() || defaultReaderSettings.assistModel;
+      const model = normalizeMobileAssistModel(assistModel);
+      const mode = overrides?.mode ?? assistMode;
+      const question = overrides?.question ?? assistQuestion;
+      const cachedNote = findAssistNote(activeBook, activeSection, mode, question, model);
+      setAssistModel(model);
+      if (overrides?.mode) {
+        setAssistMode(overrides.mode);
+      }
+      if (overrides?.question !== undefined) {
+        setAssistQuestion(overrides.question);
+      }
       await saveReaderSettings({
         assistEndpoint: endpoint,
         assistModel: model,
       });
+      if (cachedNote) {
+        setAssistAnswer(cachedNote.content);
+        setAssistUsage(cachedNote.tokenUsage);
+        setStatusText("Loaded saved AI note from local paper cache.");
+        return;
+      }
       const savedSourceText = await readBookSourceText(activeBook);
       const savedNotesContext = buildNotebookContext(activeBook);
       const prompt = buildAssistPrompt(
         activeBook,
         activeChapter,
         activeSection,
-        assistMode,
-        assistQuestion,
+        mode,
+        question,
         savedSourceText,
         savedNotesContext,
       );
       if (!endpoint.trim()) {
         setAssistAnswer(localAssistFallback(prompt));
+        setAssistUsage(undefined);
       } else {
-        const answer = await runOpenAiCompatibleAssist({
+        const result = await runOpenAiCompatibleAssist({
           endpoint,
           apiKey: assistApiKey,
           model,
           prompt,
         });
+        const answer = result.content;
         setAssistAnswer(answer);
+        setAssistUsage(result.tokenUsage);
+        await persistAssistAnswer(answer, mode, question, model, result.tokenUsage);
+        setStatusText("Saved AI response locally with this paper.");
       }
     } catch (error) {
       setAssistAnswer(error instanceof Error ? error.message : String(error));
@@ -328,36 +504,33 @@ export default function App() {
 
   const saveAssistAsNote = async () => {
     const answer = assistAnswer.trim();
-    if (!answer || activeBook.id === sampleBook.id) return;
-
-    const note: AiNote = {
-      id: `ai-note-${Date.now()}`,
-      kind: noteKindForMode(assistMode),
-      title: noteTitleForMode(assistMode, activeSection, assistQuestion),
-      content: answer,
-      createdAt: new Date().toISOString(),
-      sourceSectionId: activeSection.id,
-      sourceSectionTitle: activeSection.title,
-      question: assistQuestion.trim() || undefined,
-      model: assistModel.trim() || defaultReaderSettings.assistModel,
-      tags: [assistMode, ...activeSection.keywords.slice(0, 3)],
-    };
-
-    const updatedBook: Book = {
-      ...activeBook,
-      aiNotes: [note, ...(activeBook.aiNotes ?? [])],
-    };
-
-    await saveStoredBook(updatedBook);
-    setBooks((current) => current.map((book) => book.id === updatedBook.id ? updatedBook : book));
-    setStoredBookIds((current) => current.includes(updatedBook.id) ? current : [...current, updatedBook.id]);
-    setActiveBookId(updatedBook.id);
+    if (!answer) return;
+    await persistAssistAnswer(
+      answer,
+      assistMode,
+      assistQuestion,
+      normalizeMobileAssistModel(assistModel),
+      assistUsage,
+    );
     setAssistOpen(false);
     setStatusText("Saved AI note into the paper notebook.");
   };
 
+  const askAboutSelectedText = async (action: "explain" | "summarize" | "define", selectedText: string) => {
+    const cleanSelection = selectedText.trim().replace(/\s+/g, " ");
+    if (!cleanSelection) return;
+
+    const question =
+      action === "explain"
+        ? `Explain this selected text from the current paper note: "${cleanSelection}"`
+        : action === "summarize"
+          ? `Summarize this selected text from the current paper note: "${cleanSelection}"`
+          : `Define the key terms and concepts in this selected text: "${cleanSelection}"`;
+    const mode: AssistMode = action === "summarize" ? "summary" : "concept";
+    await runAssist({ mode, question });
+  };
+
   const removeAiNote = async (noteId: string) => {
-    if (activeBook.id === sampleBook.id) return;
     const updatedBook: Book = {
       ...activeBook,
       aiNotes: (activeBook.aiNotes ?? []).filter((note) => note.id !== noteId),
@@ -495,17 +668,24 @@ export default function App() {
         endpoint={assistEndpoint}
         mode={assistMode}
         model={assistModel}
+        modelError={assistModelsError}
+        models={assistModels}
+        modelsBusy={assistModelsBusy}
+        onAnswerChange={setAssistAnswer}
+        onAskSelection={askAboutSelectedText}
         onClose={() => setAssistOpen(false)}
+        onRefreshModels={refreshAssistModels}
         onRun={runAssist}
         open={assistOpen}
         question={assistQuestion}
         setApiKey={setAssistApiKey}
+        usage={assistUsage}
         setEndpoint={setAssistEndpoint}
         setMode={setAssistMode}
         setModel={setAssistModel}
         setQuestion={setAssistQuestion}
         onSaveAnswer={saveAssistAsNote}
-        canSaveAnswer={activeBook.id !== sampleBook.id && Boolean(assistAnswer.trim())}
+        canSaveAnswer={Boolean(assistAnswer.trim())}
         theme={theme}
       />
 
@@ -686,11 +866,18 @@ function AssistModal({
   endpoint,
   mode,
   model,
+  modelError,
+  models,
+  modelsBusy,
+  onAnswerChange,
+  onAskSelection,
   onClose,
+  onRefreshModels,
   onRun,
   open,
   question,
   setApiKey,
+  usage,
   setEndpoint,
   setMode,
   setModel,
@@ -705,11 +892,18 @@ function AssistModal({
   endpoint: string;
   mode: AssistMode;
   model: string;
+  modelError: string;
+  models: AssistModelOption[];
+  modelsBusy: boolean;
+  onAnswerChange: (value: string) => void;
+  onAskSelection: (action: "explain" | "summarize" | "define", selectedText: string) => void;
   onClose: () => void;
+  onRefreshModels: () => void;
   onRun: () => void;
   open: boolean;
   question: string;
   setApiKey: (value: string) => void;
+  usage?: TokenUsage;
   setEndpoint: (value: string) => void;
   setMode: (value: AssistMode) => void;
   setModel: (value: string) => void;
@@ -719,6 +913,18 @@ function AssistModal({
   theme: Theme;
 }) {
   const modes: AssistMode[] = ["paper", "concept", "augment", "summary", "kids", "method", "critique", "custom"];
+  const [modelsOpen, setModelsOpen] = useState(false);
+  const [selectedAnswerText, setSelectedAnswerText] = useState("");
+
+  useEffect(() => {
+    setSelectedAnswerText("");
+  }, [answer]);
+
+  const updateSelectedAnswerText = (event: NativeSyntheticEvent<TextInputSelectionChangeEventData>) => {
+    const { start, end } = event.nativeEvent.selection;
+    const selected = start === end ? "" : answer.slice(Math.min(start, end), Math.max(start, end));
+    setSelectedAnswerText(selected);
+  };
 
   return (
     <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
@@ -729,7 +935,7 @@ function AssistModal({
         </View>
         <ScrollView contentContainerStyle={styles.assistContent} keyboardShouldPersistTaps="handled">
           <Text style={[styles.helperText, { color: theme.muted }]}>
-            Defaults to LM Studio through Tailscale with google/gemma-4-12b-qat. Edit these values when you want a different local server or model.
+            Defaults to the BookForge router. Load models from the router, then choose the model to send with every Assist request.
           </Text>
           <View style={styles.modeGrid}>
             {modes.map((entry) => (
@@ -755,12 +961,69 @@ function AssistModal({
           <TextInput
             autoCapitalize="none"
             autoCorrect={false}
+            editable={false}
             onChangeText={setModel}
             placeholder="Model"
             placeholderTextColor={theme.muted}
             style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
             value={model}
           />
+          <View style={styles.modelPickerActions}>
+            <AppButton
+              label={modelsBusy ? "Loading..." : "Load Models"}
+              onPress={onRefreshModels}
+              disabled={modelsBusy || !endpoint.trim()}
+              theme={theme}
+              variant="ghost"
+              compact
+            />
+            <AppButton
+              label={modelsOpen ? "Hide Models" : `Models ${models.length || ""}`.trim()}
+              onPress={() => setModelsOpen((value) => !value)}
+              disabled={!models.length}
+              theme={theme}
+              variant="ghost"
+              compact
+            />
+          </View>
+          {modelError ? (
+            <Text style={[styles.helperText, { color: theme.muted }]}>
+              {modelError}
+            </Text>
+          ) : null}
+          {modelsOpen && models.length ? (
+            <View style={[styles.modelDropdown, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              {models.map((entry) => {
+                const selected = entry.id === model;
+                return (
+                  <Pressable
+                    key={`${entry.provider ?? "provider"}-${entry.id}`}
+                    onPress={() => {
+                      setModel(entry.id);
+                      setModelsOpen(false);
+                    }}
+                    style={({ pressed }) => [
+                      styles.modelOption,
+                      {
+                        borderColor: theme.border,
+                        backgroundColor: selected ? theme.accent : "transparent",
+                        opacity: pressed ? 0.75 : 1,
+                      },
+                    ]}
+                  >
+                    <Text style={[styles.modelOptionTitle, { color: selected ? theme.accentText : theme.text }]}>
+                      {entry.label || entry.id}
+                    </Text>
+                    {entry.id || entry.provider || entry.upstreamId ? (
+                      <Text style={[styles.modelOptionMeta, { color: selected ? theme.accentText : theme.muted }]}>
+                        {[entry.id, entry.provider, entry.upstreamId ? `upstream ${entry.upstreamId}` : ""].filter(Boolean).join(" - ")}
+                      </Text>
+                    ) : null}
+                  </Pressable>
+                );
+              })}
+            </View>
+          ) : null}
           <TextInput
             autoCapitalize="none"
             autoCorrect={false}
@@ -784,15 +1047,212 @@ function AssistModal({
             <AppButton label={busy ? "Thinking..." : "Run Assist"} onPress={onRun} disabled={busy} theme={theme} />
             <AppButton label="Save Note" onPress={onSaveAnswer} disabled={!canSaveAnswer || busy} theme={theme} variant="ghost" />
           </View>
+          {usage ? <TokenUsageBadge usage={usage} theme={theme} /> : null}
           {answer ? (
-            <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-              <Text style={[styles.assistAnswerText, { color: theme.text }]}>{answer}</Text>
-            </View>
+            <>
+              <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                <Text style={[styles.previewLabel, { color: theme.muted }]}>Preview</Text>
+                <MarkdownPreview content={answer} theme={theme} />
+              </View>
+              <View style={[styles.assistAnswer, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+                <Text style={[styles.previewLabel, { color: theme.muted }]}>Markdown Source</Text>
+                <TextInput
+                  multiline
+                  onChangeText={onAnswerChange}
+                  onSelectionChange={updateSelectedAnswerText}
+                  style={[styles.markdownEditor, { color: theme.text, borderColor: theme.border }]}
+                  textAlignVertical="top"
+                  value={answer}
+                />
+                {selectedAnswerText.trim() ? (
+                  <View style={styles.selectionActions}>
+                    <AppButton label="Explain" onPress={() => onAskSelection("explain", selectedAnswerText)} disabled={busy} theme={theme} compact />
+                    <AppButton label="Summarize" onPress={() => onAskSelection("summarize", selectedAnswerText)} disabled={busy} theme={theme} variant="ghost" compact />
+                    <AppButton label="Define" onPress={() => onAskSelection("define", selectedAnswerText)} disabled={busy} theme={theme} variant="ghost" compact />
+                  </View>
+                ) : null}
+              </View>
+            </>
           ) : null}
         </ScrollView>
       </SafeAreaView>
     </Modal>
   );
+}
+
+function MarkdownPreview({ content, theme }: { content: string; theme: Theme }) {
+  const blocks: React.ReactNode[] = [];
+  const paragraph: string[] = [];
+  const codeLines: string[] = [];
+  let inCodeBlock = false;
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return;
+    const text = paragraph.join(" ").trim();
+    if (text) {
+      blocks.push(
+        <Text key={`p-${blocks.length}`} style={[styles.markdownParagraph, { color: theme.text }]}>
+          {renderInlineMarkdown(text, theme, `p-${blocks.length}`)}
+        </Text>,
+      );
+    }
+    paragraph.length = 0;
+  };
+
+  const flushCodeBlock = () => {
+    if (!codeLines.length) return;
+    blocks.push(
+      <Text key={`code-${blocks.length}`} style={[styles.markdownCodeBlock, { color: theme.text, borderColor: theme.border }]}>
+        {codeLines.join("\n")}
+      </Text>,
+    );
+    codeLines.length = 0;
+  };
+
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith("```")) {
+      if (inCodeBlock) {
+        flushCodeBlock();
+        inCodeBlock = false;
+      } else {
+        flushParagraph();
+        inCodeBlock = true;
+      }
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeLines.push(line);
+      continue;
+    }
+
+    if (!trimmed) {
+      flushParagraph();
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      const level = heading[1].length;
+      blocks.push(
+        <Text
+          key={`h-${blocks.length}`}
+          style={[
+            level <= 2 ? styles.markdownHeadingLarge : styles.markdownHeadingSmall,
+            { color: theme.text },
+          ]}
+        >
+          {renderInlineMarkdown(heading[2], theme, `h-${blocks.length}`)}
+        </Text>,
+      );
+      continue;
+    }
+
+    const bullet = trimmed.match(/^[-*]\s+(.+)$/);
+    if (bullet) {
+      flushParagraph();
+      blocks.push(
+        <View key={`b-${blocks.length}`} style={styles.markdownListRow}>
+          <Text style={[styles.markdownListMarker, { color: theme.muted }]}>{"\u2022"}</Text>
+          <Text style={[styles.markdownListText, { color: theme.text }]}>
+            {renderInlineMarkdown(bullet[1], theme, `b-${blocks.length}`)}
+          </Text>
+        </View>,
+      );
+      continue;
+    }
+
+    const numbered = trimmed.match(/^(\d+)[.)]\s+(.+)$/);
+    if (numbered) {
+      flushParagraph();
+      blocks.push(
+        <View key={`n-${blocks.length}`} style={styles.markdownListRow}>
+          <Text style={[styles.markdownListMarker, { color: theme.muted }]}>{numbered[1]}.</Text>
+          <Text style={[styles.markdownListText, { color: theme.text }]}>
+            {renderInlineMarkdown(numbered[2], theme, `n-${blocks.length}`)}
+          </Text>
+        </View>,
+      );
+      continue;
+    }
+
+    if (trimmed.startsWith(">")) {
+      flushParagraph();
+      blocks.push(
+        <Text key={`q-${blocks.length}`} style={[styles.markdownQuote, { color: theme.muted, borderLeftColor: theme.border }]}>
+          {renderInlineMarkdown(trimmed.replace(/^>\s?/, ""), theme, `q-${blocks.length}`)}
+        </Text>,
+      );
+      continue;
+    }
+
+    paragraph.push(trimmed);
+  }
+
+  flushParagraph();
+  flushCodeBlock();
+
+  return <View style={styles.markdownPreview}>{blocks}</View>;
+}
+
+function renderInlineMarkdown(text: string, theme: Theme, keyPrefix: string) {
+  return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g).map((part, index) => {
+    if (!part) return null;
+    if (part.startsWith("**") && part.endsWith("**")) {
+      return (
+        <Text key={`${keyPrefix}-strong-${index}`} style={styles.markdownStrong}>
+          {part.slice(2, -2)}
+        </Text>
+      );
+    }
+    if (part.startsWith("*") && part.endsWith("*")) {
+      return (
+        <Text key={`${keyPrefix}-em-${index}`} style={styles.markdownEmphasis}>
+          {part.slice(1, -1)}
+        </Text>
+      );
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <Text key={`${keyPrefix}-code-${index}`} style={[styles.markdownInlineCode, { borderColor: theme.border }]}>
+          {part.slice(1, -1)}
+        </Text>
+      );
+    }
+    return part;
+  });
+}
+
+function TokenUsageBadge({ usage, theme }: { usage: TokenUsage; theme: Theme }) {
+  const parts = [
+    usage.inputTokens !== undefined ? `Input ${usage.inputTokens}` : "",
+    usage.outputTokens !== undefined ? `Output ${usage.outputTokens}` : "",
+    usage.totalTokens !== undefined ? `Total ${usage.totalTokens}` : "",
+  ].filter(Boolean);
+
+  if (!parts.length) return null;
+
+  return (
+    <View style={[styles.tokenUsageBadge, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+      <Text style={[styles.tokenUsageText, { color: theme.muted }]}>
+        {parts.join(" - ")} tokens
+      </Text>
+    </View>
+  );
+}
+
+function tokenUsageLabel(usage: TokenUsage | undefined) {
+  if (!usage) return "";
+  const parts = [
+    usage.inputTokens !== undefined ? `in ${usage.inputTokens}` : "",
+    usage.outputTokens !== undefined ? `out ${usage.outputTokens}` : "",
+    usage.totalTokens !== undefined ? `total ${usage.totalTokens}` : "",
+  ].filter(Boolean);
+  return parts.length ? parts.join(" / ") : "";
 }
 
 function NotesModal({
@@ -824,7 +1284,7 @@ function NotesModal({
                 <View style={styles.noteTitleBlock}>
                   <Text style={[styles.noteTitle, { color: theme.text }]}>{note.title}</Text>
                   <Text style={[styles.noteMeta, { color: theme.muted }]}>
-                    {[note.kind, note.sourceSectionTitle, note.model, noteDateLabel(note)].filter(Boolean).join(" - ")}
+                    {[note.kind, note.sourceSectionTitle, note.model, tokenUsageLabel(note.tokenUsage), noteDateLabel(note)].filter(Boolean).join(" - ")}
                   </Text>
                 </View>
                 <AppButton label="Delete" onPress={() => onRemove(note.id)} theme={theme} variant="ghost" compact />
@@ -832,7 +1292,9 @@ function NotesModal({
               {note.question ? (
                 <Text style={[styles.noteQuestion, { borderLeftColor: theme.border, color: theme.muted }]}>{note.question}</Text>
               ) : null}
-              <Text style={[styles.noteContent, { color: theme.text }]}>{note.content}</Text>
+              <View style={styles.noteContent}>
+                <MarkdownPreview content={note.content} theme={theme} />
+              </View>
             </View>
           )) : (
             <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
@@ -1159,8 +1621,6 @@ const styles = StyleSheet.create({
     paddingLeft: 10,
   },
   noteContent: {
-    fontSize: 14,
-    lineHeight: 21,
     marginTop: 12,
   },
   emptyNotes: {
@@ -1177,6 +1637,33 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     gap: 8,
   },
+  modelPickerActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  modelDropdown: {
+    borderRadius: 8,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  modelOption: {
+    borderBottomWidth: 1,
+    minHeight: 52,
+    justifyContent: "center",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  modelOptionTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    letterSpacing: 0,
+  },
+  modelOptionMeta: {
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 2,
+  },
   assistActions: {
     flexDirection: "row",
     flexWrap: "wrap",
@@ -1187,10 +1674,105 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     padding: 14,
   },
-  assistAnswerText: {
+  previewLabel: {
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 0,
+    marginBottom: 8,
+    textTransform: "uppercase",
+  },
+  markdownEditor: {
+    borderRadius: 8,
+    borderWidth: 1,
     fontFamily: "Menlo",
     fontSize: 13,
     lineHeight: 19,
+    maxHeight: 220,
+    minHeight: 130,
+    padding: 10,
+  },
+  selectionActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 10,
+  },
+  tokenUsageBadge: {
+    alignSelf: "flex-start",
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  tokenUsageText: {
+    fontSize: 12,
+    fontWeight: "700",
+    letterSpacing: 0,
+  },
+  markdownPreview: {
+    gap: 7,
+  },
+  markdownHeadingLarge: {
+    fontSize: 19,
+    fontWeight: "800",
+    letterSpacing: 0,
+    lineHeight: 24,
+    marginTop: 4,
+  },
+  markdownHeadingSmall: {
+    fontSize: 16,
+    fontWeight: "800",
+    letterSpacing: 0,
+    lineHeight: 21,
+    marginTop: 3,
+  },
+  markdownParagraph: {
+    fontSize: 14,
+    lineHeight: 21,
+  },
+  markdownListRow: {
+    alignItems: "flex-start",
+    flexDirection: "row",
+    gap: 8,
+  },
+  markdownListMarker: {
+    fontSize: 14,
+    fontWeight: "800",
+    lineHeight: 21,
+    minWidth: 20,
+  },
+  markdownListText: {
+    flex: 1,
+    fontSize: 14,
+    lineHeight: 21,
+  },
+  markdownQuote: {
+    borderLeftWidth: 3,
+    fontSize: 14,
+    fontStyle: "italic",
+    lineHeight: 21,
+    paddingLeft: 10,
+  },
+  markdownCodeBlock: {
+    borderRadius: 8,
+    borderWidth: 1,
+    fontFamily: "Menlo",
+    fontSize: 12,
+    lineHeight: 18,
+    padding: 10,
+  },
+  markdownStrong: {
+    fontWeight: "800",
+  },
+  markdownEmphasis: {
+    fontStyle: "italic",
+  },
+  markdownInlineCode: {
+    borderRadius: 5,
+    borderWidth: 1,
+    fontFamily: "Menlo",
+    fontSize: 12,
+    paddingHorizontal: 3,
   },
   webShell: {
     flex: 1,

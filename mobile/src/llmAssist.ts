@@ -1,6 +1,18 @@
-import type { Book, Chapter, Section } from "./types";
+import type { Book, Chapter, Section, TokenUsage } from "./types";
 
 export type AssistMode = "paper" | "concept" | "summary" | "augment" | "kids" | "method" | "critique" | "custom";
+
+export type AssistModelOption = {
+  id: string;
+  label: string;
+  provider?: string;
+  upstreamId?: string;
+};
+
+export type AssistRunResult = {
+  content: string;
+  tokenUsage?: TokenUsage;
+};
 
 const modeInstructions: Record<AssistMode, string> = {
   paper: "Explain the whole paper as a patient tutor: problem, motivation, core idea, method, evidence, limitations, and why it matters.",
@@ -65,7 +77,7 @@ export async function runOpenAiCompatibleAssist({
   endpoint: string;
   model: string;
   prompt: string;
-}) {
+}): Promise<AssistRunResult> {
   const cleanEndpoint = endpoint.trim().replace(/\/$/, "");
   const url = cleanEndpoint.endsWith("/chat/completions") ? cleanEndpoint : `${cleanEndpoint}/chat/completions`;
   const response = await fetch(url, {
@@ -96,7 +108,89 @@ export async function runOpenAiCompatibleAssist({
   if (typeof content !== "string" || !content.trim()) {
     throw new Error("LLM response did not include a message.");
   }
-  return content.trim();
+  return {
+    content: content.trim(),
+    tokenUsage: readTokenUsage(payload?.usage),
+  };
+}
+
+function readTokenUsage(value: unknown): TokenUsage | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const usage = value as Record<string, unknown>;
+  const inputTokens = readNumber(usage.prompt_tokens)
+    ?? readNumber(usage.input_tokens)
+    ?? readNumber(usage.inputTokens);
+  const outputTokens = readNumber(usage.completion_tokens)
+    ?? readNumber(usage.output_tokens)
+    ?? readNumber(usage.outputTokens);
+  const totalTokens = readNumber(usage.total_tokens)
+    ?? readNumber(usage.totalTokens)
+    ?? (inputTokens !== undefined || outputTokens !== undefined
+      ? (inputTokens ?? 0) + (outputTokens ?? 0)
+      : undefined);
+
+  return inputTokens !== undefined || outputTokens !== undefined || totalTokens !== undefined
+    ? { inputTokens, outputTokens, totalTokens }
+    : undefined;
+}
+
+function readNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+export async function fetchAssistModels({
+  apiKey,
+  endpoint,
+}: {
+  apiKey: string;
+  endpoint: string;
+}): Promise<AssistModelOption[]> {
+  const cleanEndpoint = endpoint.trim().replace(/\/$/, "");
+  if (!cleanEndpoint) {
+    return [];
+  }
+
+  const url = cleanEndpoint.endsWith("/models") ? cleanEndpoint : `${cleanEndpoint}/models`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Model list request failed: ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const data: unknown[] = Array.isArray(payload?.data) ? payload.data : [];
+  return data
+    .map((entry: unknown): AssistModelOption | null => {
+      if (!entry || typeof entry !== "object") {
+        return null;
+      }
+      const record = entry as Record<string, unknown>;
+      if (typeof record.id !== "string") {
+        return null;
+      }
+      const provider = typeof record.provider === "string"
+        ? record.provider
+        : typeof record.owned_by === "string"
+          ? record.owned_by
+          : undefined;
+      const upstreamId = typeof record.upstreamId === "string" ? record.upstreamId : undefined;
+      return {
+        id: record.id,
+        label: provider ? `${record.id} (${provider})` : record.id,
+        provider,
+        upstreamId,
+      };
+    })
+    .filter((entry): entry is AssistModelOption => Boolean(entry));
 }
 
 export function localAssistFallback(prompt: string) {

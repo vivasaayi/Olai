@@ -10,6 +10,7 @@
     "android": "expo run:android",
     "web": "expo start --web",
     "lmstudio:proxy": "node scripts/lmstudio-proxy.mjs",
+    "llm:router": "node scripts/lmstudio-proxy.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

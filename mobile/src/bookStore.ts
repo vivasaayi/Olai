@@ -1,6 +1,6 @@
 import * as FileSystem from "expo-file-system";
 import { deletePaperAssets } from "./paperAssets";
-import type { AiNote, AiNoteKind, Book, BookSource, Chapter, Resource, ResourceType, Section, SectionPersona } from "./types";
+import type { AiNote, AiNoteKind, Book, BookSource, Chapter, Resource, ResourceType, Section, SectionPersona, TokenUsage } from "./types";
 
 const resourceTypes: ResourceType[] = ["image", "video", "link", "prompt", "download", "pdf"];
 const personas: SectionPersona[] = ["default", "kids", "beginner", "formal", "college"];
@@ -20,6 +20,19 @@ function asStringArray(value: unknown) {
 
 function asOptionalNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizeTokenUsage(value: unknown): TokenUsage | undefined {
+  const raw = asRecord(value);
+  const usage = {
+    inputTokens: asOptionalNumber(raw.inputTokens),
+    outputTokens: asOptionalNumber(raw.outputTokens),
+    totalTokens: asOptionalNumber(raw.totalTokens),
+  };
+
+  return usage.inputTokens !== undefined || usage.outputTokens !== undefined || usage.totalTokens !== undefined
+    ? usage
+    : undefined;
 }
 
 function stableId(prefix: string, fallback: string, value: unknown) {
@@ -108,6 +121,7 @@ function normalizeAiNote(value: unknown, index: number): AiNote {
     sourceSectionTitle: asString(raw.sourceSectionTitle) || undefined,
     question: asString(raw.question) || undefined,
     model: asString(raw.model) || undefined,
+    tokenUsage: normalizeTokenUsage(raw.tokenUsage),
     tags: asStringArray(raw.tags),
   };
 }
