@@ -382,14 +382,88 @@ async function requestOutlineSuggestions({
   }
 }
 
-function buildNotebookContext(book: Book) {
-  return (book.aiNotes ?? [])
-    .slice(0, 8)
+function notesForSection(book: Book, section: Section) {
+  return (book.aiNotes ?? []).filter((note) => note.sourceSectionId === section.id);
+}
+
+function buildNotebookContext(notes: AiNote[]) {
+  return notes
+    .slice(0, 6)
     .map((note, index) => {
-      const source = note.sourceSectionTitle ? ` (${note.sourceSectionTitle})` : "";
-      return `${index + 1}. ${note.title}${source}: ${note.content.slice(0, 900)}`;
+      return `${index + 1}. ${note.title}: ${note.content.slice(0, 900)}`;
     })
     .join("\n\n");
+}
+
+type LocatedOutlineNode = {
+  node: OutlineNode;
+  ancestors: OutlineNode[];
+  siblings: OutlineNode[];
+  siblingIndex: number;
+};
+
+function compactPromptText(value: string | undefined, limit: number) {
+  const clean = (value ?? "").trim().replace(/\s+/g, " ");
+  if (clean.length <= limit) return clean;
+  return `${clean.slice(0, limit - 1).trim()}...`;
+}
+
+function nodeContextLine(node: OutlineNode, prefix = "") {
+  const descriptor = compactPromptText(node.summary || node.intent || node.content, 220);
+  return `${prefix}${node.type}: ${node.title}${descriptor ? ` - ${descriptor}` : ""}`;
+}
+
+function findOutlineNode(
+  nodes: OutlineNode[],
+  targetId: string,
+  ancestors: OutlineNode[] = [],
+): LocatedOutlineNode | undefined {
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (node.id === targetId) {
+      return {
+        node,
+        ancestors,
+        siblings: nodes,
+        siblingIndex: index,
+      };
+    }
+
+    const found = findOutlineNode(node.children, targetId, [...ancestors, node]);
+    if (found) return found;
+  }
+
+  return undefined;
+}
+
+function nearbySiblingNodes(siblings: OutlineNode[], selectedIndex: number, radius = 3) {
+  const start = Math.max(0, selectedIndex - radius);
+  const end = Math.min(siblings.length, selectedIndex + radius + 1);
+  return siblings.slice(start, end);
+}
+
+function buildAssistOutlineContext(book: Book, selectedNodeId: string) {
+  const located = findOutlineNode(book.outline, selectedNodeId);
+  if (!located) return "";
+
+  const path = [...located.ancestors.map((node) => node.title), located.node.title].filter(Boolean).join(" > ");
+  const parentLines = located.ancestors.map((node, index) => `${index + 1}. ${nodeContextLine(node)}`);
+  const siblingLines = nearbySiblingNodes(located.siblings, located.siblingIndex).map((node, index) => {
+    const marker = node.id === located.node.id ? "selected" : "sibling";
+    return `${index + 1}. [${marker}] ${nodeContextLine(node)}`;
+  });
+  const childLines = located.node.children.slice(0, 8).map((node, index) => `${index + 1}. ${nodeContextLine(node)}`);
+
+  return [
+    `Selected path: ${path || located.node.title}`,
+    `Selected node type: ${located.node.type}`,
+    parentLines.length ? "Parents:" : "",
+    ...parentLines,
+    siblingLines.length ? "Sibling context:" : "",
+    ...siblingLines,
+    childLines.length ? "Direct child nodes:" : "",
+    ...childLines,
+  ].filter(Boolean).join("\n");
 }
 
 function noteKindForMode(mode: AssistMode): AiNoteKind {
@@ -505,7 +579,8 @@ export default function App() {
   const progressLabel = `${Math.min(activeFlatIndex + 1, flatSections.length)} / ${flatSections.length}`;
   const contentParagraphs = splitParagraphs(sectionBody(activeSection));
   const readingResources = readingResourcesForBook(activeBook, activeSection);
-  const aiNoteCount = activeBook.aiNotes?.length ?? 0;
+  const activeTopicNotes = useMemo(() => notesForSection(activeBook, activeSection), [activeBook, activeSection]);
+  const aiNoteCount = activeTopicNotes.length;
   const activeAssistModel = normalizeMobileAssistModel(assistModel);
   const cachedAssistNote = useMemo(
     () => findAssistNote(activeBook, activeSection, assistMode, assistQuestion, activeAssistModel),
@@ -725,17 +800,19 @@ export default function App() {
       if (cachedNote) {
         setAssistAnswer(cachedNote.content);
         setAssistUsage(cachedNote.tokenUsage);
-        setStatusText("Loaded saved AI note from local paper cache.");
+        setStatusText("Loaded saved AI note for this topic.");
         return;
       }
-      const savedSourceText = await readBookSourceText(activeBook);
-      const savedNotesContext = buildNotebookContext(activeBook);
+      const savedSourceText = mode === "paper" ? await readBookSourceText(activeBook) : "";
+      const outlineContext = buildAssistOutlineContext(activeBook, activeSection.id);
+      const savedNotesContext = buildNotebookContext(activeTopicNotes);
       const prompt = buildAssistPrompt(
         activeBook,
         activeChapter,
         activeSection,
         mode,
         question,
+        outlineContext,
         savedSourceText,
         savedNotesContext,
       );
@@ -753,7 +830,7 @@ export default function App() {
         setAssistAnswer(answer);
         setAssistUsage(result.tokenUsage);
         await persistAssistAnswer(answer, mode, question, model, result.tokenUsage);
-        setStatusText("Saved AI response locally with this paper.");
+        setStatusText("Saved AI response to this topic.");
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -777,7 +854,7 @@ export default function App() {
         assistUsage,
       );
       setAssistOpen(false);
-      setStatusText("Saved AI note into the paper notebook.");
+      setStatusText("Saved AI note to this topic.");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatusText(`Save note error: ${message}`);
@@ -876,6 +953,16 @@ export default function App() {
             </Text>
           ))}
         </View>
+
+        <TopicNotesAccordion
+          notes={activeTopicNotes}
+          onAskSelection={(action, selectedText) => {
+            setAssistOpen(true);
+            void askAboutSelectedText(action, selectedText);
+          }}
+          onRemove={removeAiNote}
+          theme={theme}
+        />
 
         {readingResources.length || activeBook.source?.localTextPath ? (
           <View style={styles.resourcePanel}>
@@ -1014,7 +1101,7 @@ export default function App() {
       />
 
       <NotesModal
-        book={activeBook}
+        notes={activeTopicNotes}
         onAskSelection={(action, selectedText) => {
           setNotesOpen(false);
           setAssistOpen(true);
@@ -1024,6 +1111,7 @@ export default function App() {
         onRemove={removeAiNote}
         open={notesOpen}
         theme={theme}
+        topicTitle={activeSection.title}
       />
 
       <Modal animationType="slide" visible={Boolean(webUrl)} presentationStyle="fullScreen">
@@ -1986,28 +2074,113 @@ function tokenUsageLabel(usage: TokenUsage | undefined) {
   return parts.length ? parts.join(" / ") : "";
 }
 
+function TopicNotesAccordion({
+  notes,
+  onAskSelection,
+  onRemove,
+  theme,
+}: {
+  notes: AiNote[];
+  onAskSelection: (action: "explain" | "summarize" | "define", selectedText: string) => void;
+  onRemove: (noteId: string) => void;
+  theme: Theme;
+}) {
+  const [expandedNotes, setExpandedNotes] = useState<Record<string, boolean>>({});
+  const noteIds = notes.map((note) => note.id).join("|");
+
+  useEffect(() => {
+    setExpandedNotes((current) => {
+      const next: Record<string, boolean> = {};
+      notes.forEach((note, index) => {
+        next[note.id] = current[note.id] ?? index === 0;
+      });
+      return next;
+    });
+  }, [noteIds]);
+
+  if (!notes.length) return null;
+
+  const toggleNote = (noteId: string) => {
+    setExpandedNotes((current) => ({ ...current, [noteId]: !current[noteId] }));
+  };
+
+  return (
+    <View style={[styles.topicNotesPanel, { borderColor: theme.border }]}>
+      <View style={styles.topicNotesHeader}>
+        <View>
+          <Text style={[styles.resourceTitle, { color: theme.muted }]}>Topic Notes</Text>
+          <Text style={[styles.noteMeta, { color: theme.muted }]}>
+            {notes.length} saved for this node
+          </Text>
+        </View>
+      </View>
+      <View style={styles.topicNotesList}>
+        {notes.map((note) => {
+          const expanded = expandedNotes[note.id] ?? false;
+          return (
+            <View key={note.id} style={[styles.noteCard, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              <View style={styles.noteHeader}>
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => toggleNote(note.id)}
+                  style={styles.noteAccordionToggle}
+                >
+                  <Text style={[styles.noteTitle, { color: theme.text }]}>{note.title}</Text>
+                  <Text style={[styles.noteMeta, { color: theme.muted }]}>
+                    {[note.kind, note.model, tokenUsageLabel(note.tokenUsage), noteDateLabel(note)].filter(Boolean).join(" - ")}
+                  </Text>
+                </Pressable>
+                <View style={styles.noteAccordionActions}>
+                  <AppButton label={expanded ? "Hide" : "Show"} onPress={() => toggleNote(note.id)} theme={theme} variant="ghost" compact />
+                  <AppButton label="Delete" onPress={() => onRemove(note.id)} theme={theme} variant="ghost" compact />
+                </View>
+              </View>
+              {expanded ? (
+                <>
+                  {note.question ? (
+                    <Text style={[styles.noteQuestion, { borderLeftColor: theme.border, color: theme.muted }]}>{note.question}</Text>
+                  ) : null}
+                  <View style={styles.noteContent}>
+                    <MarkdownPreview content={note.content} theme={theme} />
+                  </View>
+                  <SelectableNoteText content={note.content} onAskSelection={onAskSelection} theme={theme} />
+                </>
+              ) : null}
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
 function NotesModal({
-  book,
+  notes,
   onAskSelection,
   onClose,
   onRemove,
   open,
   theme,
+  topicTitle,
 }: {
-  book: Book;
+  notes: AiNote[];
   onAskSelection: (action: "explain" | "summarize" | "define", selectedText: string) => void;
   onClose: () => void;
   onRemove: (noteId: string) => void;
   open: boolean;
   theme: Theme;
+  topicTitle: string;
 }) {
-  const notes = book.aiNotes ?? [];
-
   return (
     <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
       <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
         <View style={styles.modalHeader}>
-          <Text style={[styles.modalTitle, { color: theme.text }]}>Notes</Text>
+          <View style={styles.noteTitleBlock}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Topic Notes</Text>
+            <Text style={[styles.noteMeta, { color: theme.muted }]}>
+              {topicTitle} - {notes.length} saved
+            </Text>
+          </View>
           <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
         </View>
         <ScrollView contentContainerStyle={styles.notesList}>
@@ -2033,7 +2206,7 @@ function NotesModal({
           )) : (
             <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
               <Text style={[styles.helperText, { color: theme.muted }]}>
-                Run Assist with LM Studio, then save explanations, concepts, and references here.
+                Run Assist on this topic, then save explanations, concepts, and references here.
               </Text>
             </View>
           )}
@@ -2271,6 +2444,20 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     gap: 8,
   },
+  topicNotesPanel: {
+    borderTopWidth: 1,
+    marginTop: 18,
+    paddingTop: 14,
+  },
+  topicNotesHeader: {
+    alignItems: "flex-start",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 10,
+  },
+  topicNotesList: {
+    gap: 10,
+  },
   footer: {
     borderTopWidth: 1,
     paddingHorizontal: 16,
@@ -2476,6 +2663,15 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 10,
     justifyContent: "space-between",
+  },
+  noteAccordionToggle: {
+    flex: 1,
+  },
+  noteAccordionActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    justifyContent: "flex-end",
   },
   noteTitleBlock: {
     flex: 1,
