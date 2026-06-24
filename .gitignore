@@ -4,3 +4,4 @@ mobile/.expo
 mobile/logs/
 mobile/config/llm-router.local.json
 .playwright-mcp
+web/dist

@@ -1,6 +1,28 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import './App.css'
+import antiqueFolioUrl from './assets/mock-antique-folio.png'
+import {
+  complexityOptions,
+  createImportedOldBook,
+  createPageSnapshotRecord,
+  createQuestionRecord,
+  createTranslationRecord,
+  getDemoTranslationParagraphs,
+  getOldBookPdfBlob,
+  languageOptions,
+  mergeOldBookRecords,
+  readOldBooks,
+  saveOldBookPdfBlob,
+  saveOldBookRecord,
+  sourcePageLines,
+  type OldBookRecord,
+  type QuestionRecord,
+  type TranslationComplexity,
+  type TranslationLanguage,
+} from './oldBooksStore'
+import { listVisionModels, requestVisionAnswer, requestVisionTranslation, type LocalVisionModel } from './localVision'
+import { renderPdfPageSnapshot, renderPdfPageSnapshots, type RenderedPdfSnapshot } from './pdfPageSnapshot'
 import type { Book, NodePersona, OutlineNode, OutlineNodeType, Resource, ResourceType } from './types'
 
 type LibraryEntry = {
@@ -35,13 +57,25 @@ type BookTab = {
   isCurrentDraft: boolean
 }
 
-type WorkspaceTab = 'books' | 'contents'
+type WorkspaceTab = 'books' | 'contents' | 'preview' | 'translation'
 type BookSettingsMode = 'create' | 'edit'
+type PreviewMode = 'reader' | 'outline' | 'json'
+type DeleteConfirmState = {
+  entry: LibraryEntry
+  step: 1 | 2
+  typedTitle: string
+  busy: boolean
+}
 
 const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'download']
 const personas: NodePersona[] = ['default', 'kids', 'beginner', 'formal', 'college']
-const defaultRouterEndpoint = 'http://localhost:1235'
-const defaultRouterModel = 'gpt-5.4-nano'
+const lmStudioEndpoint = '/api/local-llm/v1'
+const lmStudioModel = 'qwen/qwen3.6-35b-a3b'
+const lmStudioDirectEndpoint = 'http://localhost:1234/v1'
+const legacyRouterEndpoint = 'http://localhost:1235'
+const legacyRouterModel = 'gpt-5.4-nano'
+const defaultRouterEndpoint = lmStudioEndpoint
+const defaultRouterModel = lmStudioModel
 
 const createId = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -443,8 +477,1024 @@ function SuggestionChecklist({
   )
 }
 
+function PreviewOutline({ nodes, depth = 0 }: { nodes: OutlineNode[], depth?: number }) {
+  return (
+    <div className="preview-outline-list">
+      {nodes.map((node) => (
+        <div key={node.id} className="preview-outline-item" style={{ '--depth': depth } as CSSProperties}>
+          <span className="node-type">{node.type}</span>
+          <strong>{node.title || 'Untitled'}</strong>
+          {node.summary ? <p>{node.summary}</p> : null}
+          {node.children.length ? <PreviewOutline nodes={node.children} depth={depth + 1} /> : null}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PreviewReaderNode({ node, index, depth = 0 }: { node: OutlineNode, index: number, depth?: number }) {
+  const content = node.content.trim() || node.summary.trim() || node.intent.trim()
+  const heading = node.type === 'chapter' ? `Chapter ${index + 1}` : 'Section'
+  return (
+    <article className={node.type === 'chapter' ? 'preview-reader-chapter' : 'preview-reader-section'}>
+      <p className="preview-reader-kicker">{heading}</p>
+      <h3>{node.title || 'Untitled'}</h3>
+      {content ? <p>{content}</p> : <p className="muted">No draft content yet.</p>}
+      {node.keywords.length ? (
+        <div className="preview-chip-row">
+          {node.keywords.map((keyword) => <span key={keyword}>{keyword}</span>)}
+        </div>
+      ) : null}
+      {node.children.length ? (
+        <div className="preview-reader-children" style={{ '--depth': depth + 1 } as CSSProperties}>
+          {node.children.map((child, childIndex) => (
+            <PreviewReaderNode key={child.id} node={child} index={childIndex} depth={depth + 1} />
+          ))}
+        </div>
+      ) : null}
+    </article>
+  )
+}
+
+function BookPreviewContent({
+  book,
+  previewMode,
+  onPreviewModeChange,
+}: {
+  book: Book
+  previewMode: PreviewMode
+  onPreviewModeChange: (mode: PreviewMode) => void
+}) {
+  return (
+    <>
+      <div className="preview-mode-tabs" role="tablist" aria-label="Preview mode">
+        <button
+          className={previewMode === 'reader' ? 'preview-mode-tab active' : 'preview-mode-tab'}
+          onClick={() => onPreviewModeChange('reader')}
+          type="button"
+        >
+          Reader
+        </button>
+        <button
+          className={previewMode === 'outline' ? 'preview-mode-tab active' : 'preview-mode-tab'}
+          onClick={() => onPreviewModeChange('outline')}
+          type="button"
+        >
+          Outline
+        </button>
+        <button
+          className={previewMode === 'json' ? 'preview-mode-tab active' : 'preview-mode-tab'}
+          onClick={() => onPreviewModeChange('json')}
+          type="button"
+        >
+          JSON
+        </button>
+      </div>
+
+      <div className="book-preview-body">
+        {previewMode === 'reader' ? (
+          <div className="preview-reader">
+            <header className="preview-reader-cover">
+              <p className="app-overline">{book.audience || 'Book preview'}</p>
+              <h1>{book.title || 'Untitled Book'}</h1>
+              {book.synopsis ? <p>{book.synopsis}</p> : null}
+              <div className="preview-chip-row">
+                <span>{book.tone || 'Neutral'}</span>
+                {book.tags.map((tag) => <span key={tag}>{tag}</span>)}
+              </div>
+            </header>
+            {book.outline.map((node, index) => (
+              <PreviewReaderNode key={node.id} node={node} index={index} />
+            ))}
+          </div>
+        ) : null}
+
+        {previewMode === 'outline' ? (
+          <div className="preview-outline">
+            <PreviewOutline nodes={book.outline} />
+          </div>
+        ) : null}
+
+        {previewMode === 'json' ? (
+          <pre className="preview-json modal-json">{JSON.stringify(book, null, 2)}</pre>
+        ) : null}
+      </div>
+    </>
+  )
+}
+
+function formatFileSize(sizeBytes: number | undefined) {
+  if (!sizeBytes) return ''
+  if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function getStoredTranslation(
+  book: OldBookRecord,
+  complexity: TranslationComplexity,
+  language: TranslationLanguage,
+  sectionTitle: string,
+) {
+  const exactSection = book.translations.find((translation) =>
+    translation.pageNumber === book.pageNumber
+    && translation.sectionTitle === sectionTitle
+    && translation.complexity === complexity
+    && translation.language === language
+  )
+
+  if (exactSection) return exactSection
+
+  return book.translations.find((translation) =>
+    translation.pageNumber === book.pageNumber
+    && translation.complexity === complexity
+    && translation.language === language
+  )
+}
+
+function getTranslatedPageCount(
+  book: OldBookRecord | undefined,
+  complexity: TranslationComplexity,
+  language: TranslationLanguage,
+) {
+  if (!book?.pdfBlobId) return 0
+  return new Set(
+    book.translations
+      .filter((translation) => translation.complexity === complexity && translation.language === language)
+      .map((translation) => translation.pageNumber),
+  ).size
+}
+
+function TranslationWorkspace() {
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [oldBooks, setOldBooks] = useState<OldBookRecord[]>(() => mergeOldBookRecords([]))
+  const [activeBookId, setActiveBookId] = useState('spheres')
+  const [complexity, setComplexity] = useState<TranslationComplexity>('kid-friendly')
+  const [language, setLanguage] = useState<TranslationLanguage>('ml')
+  const [activeSection, setActiveSection] = useState('Opening argument')
+  const [question, setQuestion] = useState('Why does this section compare the sky to circles?')
+  const [oldBookStatus, setOldBookStatus] = useState('')
+  const [oldBookBusy, setOldBookBusy] = useState(false)
+  const [activePdfUrl, setActivePdfUrl] = useState<string | null>(null)
+  const [activePdfBlob, setActivePdfBlob] = useState<Blob | null>(null)
+  const [latestAnswer, setLatestAnswer] = useState<QuestionRecord | null>(null)
+  const [visionEndpoint, setVisionEndpoint] = useState(defaultRouterEndpoint)
+  const [visionModel, setVisionModel] = useState(defaultRouterModel)
+  const [availableVisionModels, setAvailableVisionModels] = useState<LocalVisionModel[]>([])
+  const [visionModelsLoading, setVisionModelsLoading] = useState(false)
+  const [visionModelsStatus, setVisionModelsStatus] = useState('')
+  const [snapshotsOpen, setSnapshotsOpen] = useState(false)
+  const [activeSnapshotPage, setActiveSnapshotPage] = useState<number | null>(null)
+  const [snapshotViewMode, setSnapshotViewMode] = useState<'all' | 'page'>('all')
+
+  const activeBook = oldBooks.find((entry) => entry.id === activeBookId) ?? oldBooks[0]
+  const selectedLanguage = languageOptions.find((entry) => entry.value === language)?.label ?? 'Malayalam'
+  const selectedComplexity = complexityOptions.find((entry) => entry.value === complexity)?.label ?? 'Kid Friendly'
+  const visionModelOptions = availableVisionModels.some((entry) => entry.id === visionModel)
+    ? availableVisionModels
+    : visionModel
+      ? [{ id: visionModel }, ...availableVisionModels]
+      : availableVisionModels
+  const activeTranslation = activeBook ? getStoredTranslation(activeBook, complexity, language, activeSection) : undefined
+  const activePageSnapshot = activeBook?.pageSnapshots.find((snapshot) => snapshot.pageNumber === activeBook.pageNumber)
+  const hasImportedPdf = Boolean(activeBook?.pdfBlobId)
+  const activePageNumber = activeBook?.pageNumber ?? 1
+  const activePageLimit = activeBook?.pages && activeBook.pages > 0 ? activeBook.pages : undefined
+  const activePageCount = activePageLimit ?? Math.max(activePageSnapshot?.pageNumber ?? 0, activePageNumber, 1)
+  const translatedPageCount = getTranslatedPageCount(activeBook, complexity, language)
+  const translatedParagraphs = activeTranslation
+    ? activeTranslation.paragraphs
+    : hasImportedPdf
+      ? [`No stored ${selectedLanguage} translation for page ${activePageNumber} yet. Choose Translate Page to generate and save it.`]
+      : getDemoTranslationParagraphs(complexity, language)
+  const currentProgress = hasImportedPdf && activePageCount
+    ? Math.round((translatedPageCount / activePageCount) * 100)
+    : activeBook?.progress ?? 0
+  const translationHeaderTitle = activeTranslation?.sectionTitle ?? activeSection
+  const activePdfFrameSrc = activePdfUrl ? `${activePdfUrl}#page=${activePageNumber}&toolbar=0&navpanes=0` : null
+  const activeQuestion = latestAnswer
+    ?? activeBook?.questions.find((entry) =>
+      entry.pageNumber === activeBook.pageNumber
+      && entry.sectionTitle === activeSection
+      && entry.complexity === complexity
+      && entry.language === language
+    )
+    ?? activeBook?.questions.find((entry) =>
+      entry.pageNumber === activeBook.pageNumber
+      && entry.complexity === complexity
+      && entry.language === language
+    )
+  const visibleSourceLines = activeTranslation?.sourceLines.length
+    ? activeTranslation.sourceLines
+    : hasImportedPdf
+      ? []
+      : sourcePageLines
+  const sortedSnapshots = useMemo(
+    () => [...(activeBook?.pageSnapshots ?? [])].sort((left, right) => left.pageNumber - right.pageNumber),
+    [activeBook?.pageSnapshots],
+  )
+  const selectedSnapshot = sortedSnapshots.find((snapshot) => snapshot.pageNumber === activeSnapshotPage)
+    ?? sortedSnapshots.find((snapshot) => snapshot.pageNumber === activeBook?.pageNumber)
+    ?? sortedSnapshots[0]
+  const snapshotBrowserItems = snapshotViewMode === 'page' && selectedSnapshot ? [selectedSnapshot] : sortedSnapshots
+
+  async function refreshVisionModels(endpointOverride = visionEndpoint, preferredModel = visionModel) {
+    setVisionModelsLoading(true)
+    setVisionModelsStatus('Loading local models...')
+    try {
+      const models = await listVisionModels(endpointOverride)
+      const modelIds = models.map((entry) => entry.id)
+      setAvailableVisionModels(models)
+      if (modelIds.length && !modelIds.includes(preferredModel)) {
+        setVisionModel(modelIds.includes(lmStudioModel) ? lmStudioModel : modelIds[0])
+      }
+      setVisionModelsStatus(models.length ? `${models.length} local models available.` : 'No local models returned.')
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setAvailableVisionModels([])
+      setVisionModelsStatus(message)
+      setOldBookStatus(message)
+    } finally {
+      setVisionModelsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    const migratedEndpoint = visionEndpoint === legacyRouterEndpoint || visionEndpoint === lmStudioDirectEndpoint
+      ? lmStudioEndpoint
+      : visionEndpoint
+    const migratedModel = visionModel === legacyRouterModel ? lmStudioModel : visionModel
+    if (migratedEndpoint !== visionEndpoint) setVisionEndpoint(migratedEndpoint)
+    if (migratedModel !== visionModel) setVisionModel(migratedModel)
+    void refreshVisionModels(migratedEndpoint, migratedModel)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadOldBookCatalog() {
+      setOldBookBusy(true)
+      try {
+        const storedBooks = await readOldBooks()
+        if (cancelled) return
+        const mergedBooks = mergeOldBookRecords(storedBooks)
+        setOldBooks(mergedBooks)
+        setActiveBookId((current) => (
+          mergedBooks.some((book) => book.id === current) ? current : mergedBooks[0]?.id ?? 'spheres'
+        ))
+      } catch (error) {
+        if (!cancelled) {
+          setOldBookStatus(error instanceof Error ? error.message : String(error))
+        }
+      } finally {
+        if (!cancelled) {
+          setOldBookBusy(false)
+        }
+      }
+    }
+
+    void loadOldBookCatalog()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    let objectUrl: string | null = null
+    setActivePdfUrl(null)
+    setActivePdfBlob(null)
+
+    async function loadPdfBlob(pdfBlobId: string) {
+      try {
+        const blob = await getOldBookPdfBlob(pdfBlobId)
+        if (cancelled || !blob) return
+        objectUrl = URL.createObjectURL(blob)
+        setActivePdfBlob(blob)
+        setActivePdfUrl(objectUrl)
+      } catch (error) {
+        if (!cancelled) {
+          setOldBookStatus(error instanceof Error ? error.message : String(error))
+        }
+      }
+    }
+
+    if (activeBook?.pdfBlobId) {
+      void loadPdfBlob(activeBook.pdfBlobId)
+    }
+
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [activeBook?.pdfBlobId])
+
+  useEffect(() => {
+    setLatestAnswer(null)
+  }, [activeBookId, activeSection, complexity, language])
+
+  async function persistOldBook(updatedBook: OldBookRecord) {
+    const updatedAt = new Date().toISOString()
+    const normalizedBook = { ...updatedBook, updatedAt }
+    await saveOldBookRecord(normalizedBook)
+    setOldBooks((current) => {
+      const withoutBook = current.filter((entry) => entry.id !== normalizedBook.id)
+      return normalizedBook.pdfBlobId ? [normalizedBook, ...withoutBook] : [normalizedBook, ...withoutBook]
+    })
+    return normalizedBook
+  }
+
+  async function handlePdfSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0]
+    event.currentTarget.value = ''
+    if (!file) return
+
+    if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
+      setOldBookStatus('Choose a PDF file to import.')
+      return
+    }
+
+    setOldBookBusy(true)
+    try {
+      const importedBook = createImportedOldBook(file)
+      await saveOldBookPdfBlob(importedBook.pdfBlobId!, file, file.name)
+      await saveOldBookRecord(importedBook)
+      setOldBooks((current) => [importedBook, ...current.filter((entry) => entry.id !== importedBook.id)])
+      setActiveBookId(importedBook.id)
+      setActiveSection('Page 1, OCR pending')
+      setOldBookStatus(`Imported ${file.name} (${formatFileSize(file.size)}).`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setOldBookBusy(false)
+    }
+  }
+
+  async function setReaderPage(pageNumber: number) {
+    if (!activeBook || !Number.isFinite(pageNumber)) return
+
+    const roundedPage = Math.round(pageNumber)
+    const lowerBoundedPage = Math.max(1, roundedPage)
+    const nextPage = activePageLimit ? Math.min(lowerBoundedPage, activePageLimit) : lowerBoundedPage
+    if (nextPage === activeBook.pageNumber) return
+
+    const storedPageTranslation = activeBook.translations.find((translation) =>
+      translation.pageNumber === nextPage
+      && translation.complexity === complexity
+      && translation.language === language
+    )
+    const nextSection = storedPageTranslation?.sectionTitle
+      ?? (activeBook.pdfBlobId ? `Page ${nextPage}, OCR pending` : activeBook.section)
+    const updatedBook = {
+      ...activeBook,
+      pageNumber: nextPage,
+      section: nextSection,
+      updatedAt: new Date().toISOString(),
+    }
+
+    setLatestAnswer(null)
+    setActiveSection(nextSection)
+    setActiveSnapshotPage(nextPage)
+    setOldBooks((current) => current.map((entry) => (entry.id === updatedBook.id ? updatedBook : entry)))
+
+    try {
+      await saveOldBookRecord(updatedBook)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  function openAllSnapshots() {
+    setActiveSnapshotPage(activeBook?.pageNumber ?? sortedSnapshots[0]?.pageNumber ?? null)
+    setSnapshotViewMode('all')
+    setSnapshotsOpen(true)
+  }
+
+  function openActivePageSnapshot() {
+    if (!activePageSnapshot) return
+    setActiveSnapshotPage(activePageSnapshot.pageNumber)
+    setSnapshotViewMode('page')
+    setSnapshotsOpen(true)
+  }
+
+  async function saveRenderedSnapshotToFolder(bookId: string, snapshot: RenderedPdfSnapshot) {
+    if (!bookId) return undefined
+
+    try {
+      return (await invoke('save_old_book_snapshot', {
+        bookId,
+        pageNumber: snapshot.pageNumber,
+        imageDataUrl: snapshot.imageDataUrl,
+      })) as string
+    } catch (error) {
+      if (isTauriUnavailable(error)) return undefined
+      throw error
+    }
+  }
+
+  async function renderAndSaveActivePageSnapshot(bookToSnapshot: OldBookRecord) {
+    if (!activePdfBlob) {
+      throw new Error('Import a PDF before creating a page snapshot.')
+    }
+
+    const renderedSnapshot = await renderPdfPageSnapshot(activePdfBlob, bookToSnapshot.pageNumber)
+    const snapshot = createPageSnapshotRecord(
+      bookToSnapshot.pageNumber,
+      renderedSnapshot.imageDataUrl,
+      renderedSnapshot.width,
+      renderedSnapshot.height,
+      await saveRenderedSnapshotToFolder(bookToSnapshot.id, renderedSnapshot),
+    )
+    const existingSnapshots = bookToSnapshot.pageSnapshots.filter((entry) => entry.pageNumber !== snapshot.pageNumber)
+    const updatedBook = await persistOldBook({
+      ...bookToSnapshot,
+      pages: renderedSnapshot.pageCount || bookToSnapshot.pages,
+      status: 'Page snapshot ready',
+      pageSnapshots: [snapshot, ...existingSnapshots],
+    })
+
+    setOldBookStatus(`Captured page ${snapshot.pageNumber} snapshot for ${updatedBook.title}.`)
+    return { updatedBook, snapshot }
+  }
+
+  async function ensureActivePageSnapshot(bookToSnapshot: OldBookRecord) {
+    const existingSnapshot = bookToSnapshot.pageSnapshots.find((entry) => entry.pageNumber === bookToSnapshot.pageNumber)
+    if (existingSnapshot) return { updatedBook: bookToSnapshot, snapshot: existingSnapshot }
+    return renderAndSaveActivePageSnapshot(bookToSnapshot)
+  }
+
+  async function snapshotActivePage() {
+    if (!activeBook) return
+    setOldBookBusy(true)
+    try {
+      const { snapshot } = await renderAndSaveActivePageSnapshot(activeBook)
+      setActiveSnapshotPage(snapshot.pageNumber)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setOldBookBusy(false)
+    }
+  }
+
+  async function snapshotAllPages() {
+    if (!activeBook || !activePdfBlob) return
+    setOldBookBusy(true)
+    try {
+      setOldBookStatus('Preparing all page snapshots...')
+      const renderedSnapshots = await renderPdfPageSnapshots(activePdfBlob, {
+        maxWidth: 1000,
+        onProgress: (pageNumber, pageCount) => {
+          setOldBookStatus(`Rendering snapshot ${pageNumber} of ${pageCount}...`)
+        },
+      })
+
+      const snapshotRecords = []
+      for (const renderedSnapshot of renderedSnapshots) {
+        setOldBookStatus(`Saving snapshot ${renderedSnapshot.pageNumber} of ${renderedSnapshot.pageCount}...`)
+        snapshotRecords.push(createPageSnapshotRecord(
+          renderedSnapshot.pageNumber,
+          renderedSnapshot.imageDataUrl,
+          renderedSnapshot.width,
+          renderedSnapshot.height,
+          await saveRenderedSnapshotToFolder(activeBook.id, renderedSnapshot),
+        ))
+      }
+
+      const savedBook = await persistOldBook({
+        ...activeBook,
+        pages: renderedSnapshots[0]?.pageCount ?? activeBook.pages,
+        status: 'All snapshots ready',
+        pageSnapshots: snapshotRecords,
+      })
+      setActiveSnapshotPage(snapshotRecords[0]?.pageNumber ?? null)
+      setSnapshotViewMode('all')
+      setOldBookStatus(`Captured ${snapshotRecords.length} snapshots for ${savedBook.title}.`)
+      setSnapshotsOpen(true)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setOldBookBusy(false)
+    }
+  }
+
+  async function translateActivePage() {
+    if (!activeBook) return
+
+    setOldBookBusy(true)
+    try {
+      setOldBookStatus(`Translating page ${activeBook.pageNumber}...`)
+      let bookForTranslation = activeBook
+      let visionTranslation: Awaited<ReturnType<typeof requestVisionTranslation>> | null = null
+
+      if (activeBook.pdfBlobId) {
+        setOldBookStatus(
+          activePageSnapshot
+            ? `Using saved page ${activeBook.pageNumber} snapshot for translation...`
+            : `Creating page ${activeBook.pageNumber} snapshot for translation...`,
+        )
+        const { updatedBook, snapshot } = await ensureActivePageSnapshot(activeBook)
+        bookForTranslation = updatedBook
+        setOldBookStatus(`Translating page ${updatedBook.pageNumber} from snapshot...`)
+        visionTranslation = await requestVisionTranslation({
+          endpoint: visionEndpoint,
+          model: visionModel,
+          imageDataUrl: snapshot.imageDataUrl,
+          bookTitle: updatedBook.title,
+          pageNumber: updatedBook.pageNumber,
+          complexityLabel: selectedComplexity,
+          languageLabel: selectedLanguage,
+          complexity,
+          language,
+        })
+      }
+
+      const sectionTitle = visionTranslation?.sectionTitle || activeSection
+      const translation = createTranslationRecord(
+        bookForTranslation,
+        complexity,
+        language,
+        sectionTitle,
+        visionTranslation ? {
+          paragraphs: visionTranslation.paragraphs,
+          sourceLines: visionTranslation.sourceLines,
+        } : undefined,
+      )
+      const existingTranslations = bookForTranslation.translations.filter((entry) =>
+        !(entry.pageNumber === translation.pageNumber
+          && entry.sectionTitle === translation.sectionTitle
+          && entry.complexity === translation.complexity
+          && entry.language === translation.language)
+      )
+      const translatedPagesAfterSave = getTranslatedPageCount(
+        { ...bookForTranslation, translations: [translation, ...existingTranslations] },
+        complexity,
+        language,
+      )
+      const updatedBook = await persistOldBook({
+        ...bookForTranslation,
+        section: sectionTitle,
+        status: 'Page translation stored',
+        progress: bookForTranslation.pages
+          ? Math.round((translatedPagesAfterSave / bookForTranslation.pages) * 100)
+          : Math.max(bookForTranslation.progress, 1),
+        translations: [translation, ...existingTranslations],
+      })
+      setActiveSection(sectionTitle)
+      setOldBookStatus(`Saved page ${translation.pageNumber} as ${selectedComplexity} ${selectedLanguage} for ${updatedBook.title}.`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setOldBookBusy(false)
+    }
+  }
+
+  async function askActiveSection() {
+    if (!activeBook || !question.trim()) return
+
+    setOldBookBusy(true)
+    try {
+      let bookForQuestion = activeBook
+      let answerText: string | undefined
+
+      if (activeBook.pdfBlobId) {
+        const { updatedBook, snapshot } = await ensureActivePageSnapshot(activeBook)
+        bookForQuestion = updatedBook
+        const visionAnswer = await requestVisionAnswer({
+          endpoint: visionEndpoint,
+          model: visionModel,
+          imageDataUrl: snapshot.imageDataUrl,
+          bookTitle: updatedBook.title,
+          pageNumber: updatedBook.pageNumber,
+          sectionTitle: translationHeaderTitle,
+          question: question.trim(),
+          complexityLabel: selectedComplexity,
+          languageLabel: selectedLanguage,
+          translatedParagraphs,
+        })
+        answerText = visionAnswer.answer
+      }
+
+      const answer = createQuestionRecord(bookForQuestion, complexity, language, translationHeaderTitle, question.trim(), answerText)
+      await persistOldBook({
+        ...bookForQuestion,
+        questions: [answer, ...bookForQuestion.questions],
+      })
+      setLatestAnswer(answer)
+      setOldBookStatus('Saved the section question and answer.')
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setOldBookBusy(false)
+    }
+  }
+
+  return (
+    <main className="translation-view">
+      <section className="translation-toolbar panel">
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/pdf"
+          className="visually-hidden-input"
+          onChange={(event) => void handlePdfSelected(event)}
+        />
+        <div className="translation-toolbar-primary">
+          <div>
+            <p className="app-overline">Translation Lab</p>
+            <h2>Public-domain old book reader</h2>
+          </div>
+          <div className="translation-actions">
+            <button
+              className="button secondary"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={oldBookBusy}
+              type="button"
+            >
+              Import PDF
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void snapshotAllPages()}
+              disabled={oldBookBusy || !activeBook?.pdfBlobId}
+              type="button"
+            >
+              Snapshot All
+            </button>
+            <button
+              className="button secondary"
+              onClick={openAllSnapshots}
+              disabled={!sortedSnapshots.length}
+              type="button"
+            >
+              View Snapshots
+            </button>
+          </div>
+        </div>
+
+        <div className="translation-controls">
+          <label>
+            <span>Language</span>
+            <select value={language} onChange={(event) => setLanguage(event.currentTarget.value as TranslationLanguage)}>
+              {languageOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <div className="translation-control-group">
+            <span>Complexity</span>
+            <div className="translation-segmented" role="tablist" aria-label="Translation complexity">
+              {complexityOptions.map((option) => (
+                <button
+                  key={option.value}
+                  className={complexity === option.value ? 'translation-segment active' : 'translation-segment'}
+                  onClick={() => setComplexity(option.value)}
+                  type="button"
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="translation-endpoint-field">
+            <span>Vision endpoint</span>
+            <div className="translation-inline-field">
+              <input value={visionEndpoint} onChange={(event) => setVisionEndpoint(event.currentTarget.value)} />
+              <button
+                className="mini-button"
+                onClick={() => {
+                  setVisionEndpoint(lmStudioEndpoint)
+                  setVisionModel(lmStudioModel)
+                  setOldBookStatus('Using LM Studio through the app proxy at /api/local-llm/v1.')
+                  void refreshVisionModels(lmStudioEndpoint, lmStudioModel)
+                }}
+                type="button"
+              >
+                LM Studio
+              </button>
+            </div>
+          </label>
+
+          <label className="translation-model-field">
+            <span>Local model</span>
+            <div className="translation-inline-field">
+              <select value={visionModel} onChange={(event) => setVisionModel(event.currentTarget.value)}>
+                {visionModelOptions.length ? (
+                  visionModelOptions.map((option) => (
+                    <option key={option.id} value={option.id}>{option.id}</option>
+                  ))
+                ) : (
+                  <option value={visionModel}>{visionModel || 'No model loaded'}</option>
+                )}
+              </select>
+              <button
+                className="mini-button"
+                onClick={() => void refreshVisionModels()}
+                disabled={visionModelsLoading}
+                type="button"
+              >
+                {visionModelsLoading ? '...' : 'Refresh'}
+              </button>
+            </div>
+          </label>
+        </div>
+        {visionModelsStatus ? <p className="local-model-status">{visionModelsStatus}</p> : null}
+
+        <div className="catalog-strip" aria-label="Old book catalog">
+          {oldBooks.map((entry) => {
+            const isActive = entry.id === activeBook?.id
+            const catalogStatus = entry.pages
+              ? `${entry.status} · ${entry.pages} pages`
+              : entry.pdfSizeBytes
+                ? `${entry.status} · ${formatFileSize(entry.pdfSizeBytes)}`
+                : `${entry.status} · pages pending`
+            return (
+              <button
+                key={entry.id}
+                className={isActive ? 'catalog-book active' : 'catalog-book'}
+                onClick={() => {
+                  setActiveBookId(entry.id)
+                  setActiveSection(entry.pdfBlobId ? entry.section : 'Opening argument')
+                }}
+                type="button"
+              >
+                <span className="catalog-book-title">{entry.title}</span>
+                <span className="catalog-book-meta">{entry.dateLabel} · {entry.originalLanguage}</span>
+                <span className="catalog-book-status">{catalogStatus}</span>
+              </button>
+            )
+          })}
+        </div>
+        {oldBookStatus ? <p className="status">{oldBookStatus}</p> : null}
+      </section>
+
+      <section className="translation-reader-grid" aria-label="Side by side reader">
+        <article className="translation-pane pdf-pane">
+          <header className="translation-pane-header">
+            <div>
+              <p className="app-overline">Original PDF</p>
+              <h2>{activeBook?.title ?? 'Old book'}</h2>
+              <p>
+                {activeBook?.author ?? 'Unknown'} · {activeBook?.section ?? `Page ${activePageNumber}`}
+                {activeBook?.pdfBlobId ? ` · ${activePageSnapshot ? 'Snapshot ready' : 'Snapshot needed'}` : ''}
+              </p>
+            </div>
+            <div className="reader-page-controls" aria-label="Current PDF page">
+              <button
+                className="mini-button"
+                onClick={() => void setReaderPage(activePageNumber - 1)}
+                disabled={oldBookBusy || activePageNumber <= 1}
+                type="button"
+              >
+                -
+              </button>
+              <label>
+                <span>Page</span>
+                <input
+                  type="number"
+                  min="1"
+                  max={activePageLimit}
+                  value={activePageNumber}
+                  onChange={(event) => void setReaderPage(Number(event.currentTarget.value))}
+                  disabled={oldBookBusy || !activeBook}
+                />
+              </label>
+              <span>{activePageLimit ? `of ${activePageLimit}` : ''}</span>
+              <button
+                className="mini-button"
+                onClick={() => void setReaderPage(activePageNumber + 1)}
+                disabled={oldBookBusy || Boolean(activePageLimit && activePageNumber >= activePageLimit)}
+                type="button"
+              >
+                +
+              </button>
+            </div>
+          </header>
+
+          <div className="pdf-viewer-shell">
+            {activePdfFrameSrc ? (
+              <iframe
+                className="pdf-frame"
+                src={activePdfFrameSrc}
+                title={`${activeBook?.title ?? 'Imported PDF'} preview`}
+              />
+            ) : (
+              <div className="pdf-page-stage">
+                <img src={antiqueFolioUrl} alt="Mock scanned page from an old public-domain book" />
+                <button className="source-hotspot" onClick={() => setActiveSection('Opening argument')} type="button">
+                  Opening argument
+                </button>
+              </div>
+            )}
+          </div>
+
+          {visibleSourceLines.length ? (
+            <div className="ocr-strip">
+              {visibleSourceLines.map((line) => (
+                <button key={line} onClick={() => setActiveSection(line.slice(0, 28))} type="button">
+                  {line}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </article>
+
+        <article className="translation-pane translated-pane">
+          <header className="translation-pane-header">
+            <div>
+              <p className="app-overline">{selectedComplexity} {selectedLanguage}</p>
+              <h2>{translationHeaderTitle}</h2>
+              <p>{activeTranslation ? 'Stored page translation' : 'Page translation pending'} · Page {activePageNumber}</p>
+            </div>
+            <div className="progress-summary">
+              <span>{currentProgress}%</span>
+              <div aria-hidden="true"><i style={{ width: `${currentProgress}%` }} /></div>
+            </div>
+          </header>
+
+          <div className="page-action-bar">
+            <div className="page-action-status">
+              <strong>Page {activePageNumber}</strong>
+              <span>
+                {activeTranslation
+                  ? `${selectedLanguage} saved · Snapshot ready`
+                  : activePageSnapshot
+                    ? 'Snapshot ready · Translate Page will reuse it'
+                    : 'Snapshot needed'}
+              </span>
+              {hasImportedPdf ? <small>{translatedPageCount} of {activePageCount} pages translated</small> : null}
+            </div>
+            <div className="page-action-buttons">
+              <button
+                className="button secondary"
+                onClick={openActivePageSnapshot}
+                disabled={!activePageSnapshot}
+                type="button"
+              >
+                View Snapshot
+              </button>
+              <button
+                className="button secondary"
+                onClick={() => void snapshotActivePage()}
+                disabled={oldBookBusy || !activeBook?.pdfBlobId}
+                type="button"
+              >
+                {activePageSnapshot ? 'Re-snapshot Page' : 'Snapshot Page'}
+              </button>
+              <button
+                className="button"
+                onClick={() => void translateActivePage()}
+                disabled={oldBookBusy || !activeBook}
+                type="button"
+              >
+                {oldBookBusy ? 'Working...' : 'Translate Page'}
+              </button>
+            </div>
+          </div>
+
+          <aside className="question-panel">
+            <div className="question-panel-header">
+              <div>
+                <h3>{hasImportedPdf ? 'Ask this page' : 'Ask this section'}</h3>
+              </div>
+              <span>Local notes</span>
+            </div>
+            <div className="question-input-row">
+              <input value={question} onChange={(event) => setQuestion(event.currentTarget.value)} />
+              <button className="button" onClick={() => void askActiveSection()} disabled={oldBookBusy || !question.trim()} type="button">
+                Ask
+              </button>
+            </div>
+            {activeQuestion ? <div className="answer-preview">{activeQuestion.answer}</div> : null}
+          </aside>
+
+          {hasImportedPdf ? (
+            activeTranslation?.sourceLines.length ? (
+              <div className="section-tools">
+                {activeTranslation.sourceLines.slice(0, 6).map((line, index) => (
+                  <button
+                    key={`${line}-${index}`}
+                    className="section-chip"
+                    onClick={() => setActiveSection(line.slice(0, 42))}
+                    type="button"
+                  >
+                    {line}
+                  </button>
+                ))}
+              </div>
+            ) : null
+          ) : (
+            <div className="section-tools">
+              <button
+                className={activeSection === 'Opening argument' ? 'section-chip active' : 'section-chip'}
+                onClick={() => setActiveSection('Opening argument')}
+                type="button"
+              >
+                Opening argument
+              </button>
+              <button
+                className={activeSection === 'Historical note' ? 'section-chip active' : 'section-chip'}
+                onClick={() => setActiveSection('Historical note')}
+                type="button"
+              >
+                Historical note
+              </button>
+              <button
+                className={activeSection === 'Vocabulary' ? 'section-chip active' : 'section-chip'}
+                onClick={() => setActiveSection('Vocabulary')}
+                type="button"
+              >
+                Vocabulary
+              </button>
+            </div>
+          )}
+
+          <div className="translated-reading-surface">
+            {translatedParagraphs.map((paragraph) => (
+              <p key={paragraph}>{paragraph}</p>
+            ))}
+          </div>
+        </article>
+      </section>
+
+      {snapshotsOpen ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel snapshot-modal">
+            <header className="modal-header">
+              <div>
+                <h2>{snapshotViewMode === 'page' ? 'Page Snapshot' : 'Page Snapshots'}</h2>
+                <p>
+                  {activeBook?.title ?? 'Imported book'} · {
+                    snapshotViewMode === 'page' && selectedSnapshot
+                      ? `Page ${selectedSnapshot.pageNumber}`
+                      : `${sortedSnapshots.length} page snapshots`
+                  }
+                </p>
+              </div>
+              <button className="icon-button" onClick={() => setSnapshotsOpen(false)} type="button">x</button>
+            </header>
+
+            <div className={snapshotViewMode === 'page' ? 'snapshot-browser single' : 'snapshot-browser'}>
+              {snapshotViewMode === 'all' ? (
+                <aside className="snapshot-page-list" aria-label="Snapshot pages">
+                  {snapshotBrowserItems.map((snapshot) => (
+                    <button
+                      key={snapshot.id}
+                      className={selectedSnapshot?.id === snapshot.id ? 'snapshot-page-button active' : 'snapshot-page-button'}
+                      onClick={() => setActiveSnapshotPage(snapshot.pageNumber)}
+                      type="button"
+                    >
+                      <img src={snapshot.imageDataUrl} alt="" />
+                      <span>Page {snapshot.pageNumber}</span>
+                    </button>
+                  ))}
+                </aside>
+              ) : null}
+
+              <main className="snapshot-preview">
+                {selectedSnapshot ? (
+                  <>
+                    <div className="snapshot-preview-toolbar">
+                      <div>
+                        <strong>Page {selectedSnapshot.pageNumber}</strong>
+                        <span>{selectedSnapshot.width} x {selectedSnapshot.height}</span>
+                      </div>
+                      <a className="mini-button" href={selectedSnapshot.imageDataUrl} target="_blank" rel="noreferrer">
+                        Open Image
+                      </a>
+                    </div>
+                    <div className="snapshot-preview-stage">
+                      <img src={selectedSnapshot.imageDataUrl} alt={`Snapshot of page ${selectedSnapshot.pageNumber}`} />
+                    </div>
+                    <p className="snapshot-path">
+                      {selectedSnapshot.filePath ?? 'Stored in local app database'}
+                    </p>
+                  </>
+                ) : (
+                  <p className="muted">No snapshots saved yet.</p>
+                )}
+              </main>
+            </div>
+          </section>
+        </div>
+      ) : null}
+    </main>
+  )
+}
+
+function getInitialWorkspaceTab(): WorkspaceTab {
+  if (typeof window === 'undefined') return 'books'
+  const requestedTab = new URLSearchParams(window.location.search).get('tab') as WorkspaceTab | null
+  return requestedTab === 'books'
+    || requestedTab === 'contents'
+    || requestedTab === 'preview'
+    || requestedTab === 'translation'
+    ? requestedTab
+    : 'books'
+}
+
 function App() {
-  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>('books')
+  const [activeWorkspaceTab, setActiveWorkspaceTab] = useState<WorkspaceTab>(() => getInitialWorkspaceTab())
   const [book, setBook] = useState<Book>(() => createInitialBook())
   const [activeNodeId, setActiveNodeId] = useState(() => findFirstNodeId(book.outline))
   const [activeFileName, setActiveFileName] = useState<string | null>(null)
@@ -453,6 +1503,8 @@ function App() {
   const [statusText, setStatusText] = useState('')
   const [bookSettingsDraft, setBookSettingsDraft] = useState<Book | null>(null)
   const [bookSettingsMode, setBookSettingsMode] = useState<BookSettingsMode>('edit')
+  const [previewMode, setPreviewMode] = useState<PreviewMode>('reader')
+  const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState | null>(null)
   const [routerEndpoint, setRouterEndpoint] = useState(defaultRouterEndpoint)
   const [routerModel, setRouterModel] = useState(defaultRouterModel)
   const [suggestOpen, setSuggestOpen] = useState(false)
@@ -469,6 +1521,9 @@ function App() {
   const itemCount = countNodes(book.outline)
   const bookSettingsOpen = bookSettingsDraft !== null
   const bookSettingsTagsValue = bookSettingsDraft?.tags.join(', ') ?? ''
+  const deleteConfirmTitleMatches = deleteConfirm
+    ? deleteConfirm.typedTitle.trim() === deleteConfirm.entry.book.title.trim()
+    : false
   const keywordsValue = activeNode?.keywords.join(', ') ?? ''
   const activeLibraryEntry = library.find((entry) => entry.fileName === activeFileName)
   const bookTabs = useMemo<BookTab[]>(() => {
@@ -533,7 +1588,7 @@ function App() {
         fileNames
           .filter((fileName) => fileName.endsWith('.json'))
           .map(async (fileName) => {
-            const content = (await invoke('load_book', { file_name: fileName })) as string
+            const content = (await invoke('load_book', { fileName })) as string
             const parsed = normalizeBook(JSON.parse(content))
             return {
               fileName,
@@ -567,7 +1622,7 @@ function App() {
   async function persistBook(bookToPersist: Book) {
     const updated = { ...bookToPersist, updatedAt: new Date().toISOString() }
     const payload = JSON.stringify(updated, null, 2)
-    const fileName = (await invoke('save_book', { book_id: updated.id, payload })) as string
+    const fileName = (await invoke('save_book', { bookId: updated.id, payload })) as string
     setBook(updated)
     setActiveFileName(fileName)
     await refreshLibrary()
@@ -584,7 +1639,18 @@ function App() {
     setStatusText('Preparing a new book.')
   }
 
-  function openEditBookModal() {
+  function openEditBookModal(entry?: LibraryEntry) {
+    if (entry) {
+      const opened = normalizeBook(entry.book)
+      setBook(opened)
+      setActiveFileName(entry.fileName)
+      setActiveNodeId(findFirstNodeId(opened.outline))
+      setBookSettingsMode('edit')
+      setBookSettingsDraft(opened)
+      setStatusText(`Editing ${opened.title}.`)
+      return
+    }
+
     setBookSettingsMode('edit')
     setBookSettingsDraft(book)
   }
@@ -644,25 +1710,50 @@ function App() {
     }
   }
 
-  async function deleteBook(entry: LibraryEntry) {
-    const confirmed = window.confirm(`Delete "${entry.book.title}" from local storage?`)
-    if (!confirmed) return
+  function openDeleteBookDialog(entry: LibraryEntry) {
+    setDeleteConfirm({
+      entry,
+      step: 1,
+      typedTitle: '',
+      busy: false,
+    })
+  }
+
+  function closeDeleteBookDialog() {
+    if (!deleteConfirm?.busy) {
+      setDeleteConfirm(null)
+    }
+  }
+
+  async function confirmDeleteBook() {
+    if (!deleteConfirm) return
+
+    if (deleteConfirm.step === 1) {
+      setDeleteConfirm((current) => current ? { ...current, step: 2, typedTitle: '' } : current)
+      return
+    }
+
+    if (!deleteConfirmTitleMatches) return
 
     try {
-      await invoke('delete_book', { file_name: entry.fileName })
+      const entry = deleteConfirm.entry
+      setDeleteConfirm((current) => current ? { ...current, busy: true } : current)
+      await invoke('delete_book', { fileName: entry.fileName })
       if (entry.fileName === activeFileName) {
         newBook()
       }
       await refreshLibrary()
       setStatusText(`Deleted ${entry.book.title}.`)
+      setDeleteConfirm(null)
     } catch (error) {
+      setDeleteConfirm((current) => current ? { ...current, busy: false } : current)
       setStatusText(error instanceof Error ? error.message : String(error))
     }
   }
 
-  async function removeCurrentBook() {
+  function removeCurrentBook() {
     if (activeLibraryEntry) {
-      await deleteBook(activeLibraryEntry)
+      openDeleteBookDialog(activeLibraryEntry)
       return
     }
 
@@ -679,6 +1770,11 @@ function App() {
     link.download = `${book.title || 'bookforge'}.json`
     link.click()
     URL.revokeObjectURL(link.href)
+  }
+
+  function openPreview(mode: PreviewMode = 'reader') {
+    setPreviewMode(mode)
+    setActiveWorkspaceTab('preview')
   }
 
   function addChapter() {
@@ -877,6 +1973,20 @@ function App() {
         >
           Contents
         </button>
+        <button
+          className={activeWorkspaceTab === 'preview' ? 'workspace-tab active' : 'workspace-tab'}
+          onClick={() => setActiveWorkspaceTab('preview')}
+          type="button"
+        >
+          Preview
+        </button>
+        <button
+          className={activeWorkspaceTab === 'translation' ? 'workspace-tab active' : 'workspace-tab'}
+          onClick={() => setActiveWorkspaceTab('translation')}
+          type="button"
+        >
+          Translation Lab
+        </button>
       </nav>
 
       {activeWorkspaceTab === 'books' ? (
@@ -891,13 +2001,13 @@ function App() {
               </div>
               <div className="book-actions">
                 <button className="button secondary" onClick={() => openCreateBookModal()} type="button">
-                  Add
+                  Add Book
                 </button>
-                <button className="button secondary" onClick={openEditBookModal} type="button">
-                  Edit
+                <button className="button secondary" onClick={() => openEditBookModal()} type="button">
+                  Edit Selected
                 </button>
-                <button className="button danger" onClick={() => void removeCurrentBook()} type="button">
-                  Remove
+                <button className="button danger" onClick={removeCurrentBook} type="button">
+                  Delete Selected
                 </button>
                 <button className="button secondary" onClick={() => void refreshLibrary()} type="button" disabled={libraryBusy}>
                   {libraryBusy ? 'Refreshing...' : 'Refresh'}
@@ -908,34 +2018,78 @@ function App() {
               </div>
             </div>
 
-            <div className="book-tabs book-tabs-large" role="tablist" aria-label="Books">
-              {bookTabs.map((tab) => {
-                const isActive = tab.fileName === activeFileName || (!tab.fileName && !activeFileName)
-                return (
-                  <button
-                    key={tab.key}
-                    className={isActive ? 'book-tab active' : 'book-tab'}
-                    onClick={() => openBookTab(tab)}
-                    type="button"
-                    role="tab"
-                    aria-selected={isActive}
-                    title={`${tab.label || 'Untitled Book'}${tab.updatedAt ? ` - updated ${formatDate(tab.updatedAt)}` : ''}`}
-                  >
-                    <span className="book-tab-title">{tab.label || 'Untitled Book'}</span>
-                    <span className="book-tab-meta">
-                      {tab.isCurrentDraft ? 'Draft' : `${tab.chapterCount} ch / ${tab.itemCount} items`}
-                      {tab.audience ? ` · ${tab.audience}` : ''}
-                    </span>
-                  </button>
-                )
-              })}
-              {!bookTabs.length ? <p className="muted">No books available.</p> : null}
+            <div className="books-table-wrap">
+              <table className="books-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Title</th>
+                    <th scope="col">Audience</th>
+                    <th scope="col">Chapters</th>
+                    <th scope="col">Items</th>
+                    <th scope="col">Updated</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bookTabs.map((tab) => {
+                    const entry = tab.fileName ? library.find((item) => item.fileName === tab.fileName) : undefined
+                    const isActive = tab.fileName === activeFileName || (!tab.fileName && !activeFileName)
+                    return (
+                      <tr key={tab.key} className={isActive ? 'active' : undefined}>
+                        <td>
+                          <button
+                            className="table-title-button"
+                            onClick={() => openBookTab(tab)}
+                            type="button"
+                            title={`${tab.label || 'Untitled Book'}${tab.updatedAt ? ` - updated ${formatDate(tab.updatedAt)}` : ''}`}
+                          >
+                            {tab.label || 'Untitled Book'}
+                          </button>
+                          <span className="table-file-name">{tab.fileName ?? 'Unsaved draft'}</span>
+                        </td>
+                        <td>{tab.audience || '-'}</td>
+                        <td>{tab.chapterCount}</td>
+                        <td>{tab.itemCount}</td>
+                        <td>{formatDate(tab.updatedAt)}</td>
+                        <td>
+                          <span className={tab.fileName ? 'book-status saved' : 'book-status draft'}>
+                            {tab.fileName ? 'Saved' : 'Draft'}
+                          </span>
+                        </td>
+                        <td>
+                          <div className="table-actions">
+                            <button className="mini-button" onClick={() => openBookTab(tab)} type="button">
+                              Open
+                            </button>
+                            <button className="mini-button" onClick={() => entry ? openEditBookModal(entry) : openEditBookModal()} type="button">
+                              Edit
+                            </button>
+                            {entry ? (
+                              <button className="mini-button danger-text" onClick={() => openDeleteBookDialog(entry)} type="button">
+                                Delete
+                              </button>
+                            ) : (
+                              <button className="mini-button danger-text" onClick={removeCurrentBook} type="button">
+                                Discard
+                              </button>
+                            )}
+                            <button className="mini-button" onClick={() => openBookTab(tab, 'contents')} type="button">
+                              Contents
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
             </div>
 
             {statusText ? <p className="status">{statusText}</p> : null}
           </section>
         </main>
-      ) : (
+      ) : activeWorkspaceTab === 'contents' ? (
         <div className="contents-grid">
           <section className="panel content-book-panel">
             <div className="content-book-header">
@@ -946,7 +2100,10 @@ function App() {
                 </p>
               </div>
               <div className="book-actions">
-                <button className="button secondary" onClick={openEditBookModal} type="button">
+                <button className="button secondary" onClick={() => openPreview('reader')} type="button">
+                  Preview Book
+                </button>
+                <button className="button secondary" onClick={() => openEditBookModal()} type="button">
                   Edit Book
                 </button>
                 <button className="button secondary" onClick={() => void openSuggestModal(null)} type="button">
@@ -1029,9 +2186,10 @@ function App() {
                     <span>Type</span>
                     <select
                       value={activeNode.type}
-                      onChange={(event) =>
-                        updateActiveNode((node) => ({ ...node, type: event.currentTarget.value as OutlineNodeType }))
-                      }
+                      onChange={(event) => {
+                        const type = event.currentTarget.value as OutlineNodeType
+                        updateActiveNode((node) => ({ ...node, type }))
+                      }}
                     >
                       <option value="chapter">Chapter</option>
                       <option value="section">Section</option>
@@ -1039,15 +2197,22 @@ function App() {
                   </label>
                   <label>
                     <span>Title</span>
-                    <input value={activeNode.title} onChange={(event) => updateActiveNode((node) => ({ ...node, title: event.currentTarget.value }))} />
+                    <input
+                      value={activeNode.title}
+                      onChange={(event) => {
+                        const title = event.currentTarget.value
+                        updateActiveNode((node) => ({ ...node, title }))
+                      }}
+                    />
                   </label>
                   <label>
                     <span>Persona</span>
                     <select
                       value={activeNode.persona}
-                      onChange={(event) =>
-                        updateActiveNode((node) => ({ ...node, persona: event.currentTarget.value as NodePersona }))
-                      }
+                      onChange={(event) => {
+                        const persona = event.currentTarget.value as NodePersona
+                        updateActiveNode((node) => ({ ...node, persona }))
+                      }}
                     >
                       {personas.map((persona) => (
                         <option key={persona} value={persona}>{persona}</option>
@@ -1068,26 +2233,48 @@ function App() {
                   </label>
                   <label className="full-width">
                     <span>Intent / goals</span>
-                    <textarea value={activeNode.intent} onChange={(event) => updateActiveNode((node) => ({ ...node, intent: event.currentTarget.value }))} rows={3} />
+                    <textarea
+                      value={activeNode.intent}
+                      onChange={(event) => {
+                        const intent = event.currentTarget.value
+                        updateActiveNode((node) => ({ ...node, intent }))
+                      }}
+                      rows={3}
+                    />
                   </label>
                   <label className="full-width">
                     <span>Summary</span>
-                    <textarea value={activeNode.summary} onChange={(event) => updateActiveNode((node) => ({ ...node, summary: event.currentTarget.value }))} rows={3} />
+                    <textarea
+                      value={activeNode.summary}
+                      onChange={(event) => {
+                        const summary = event.currentTarget.value
+                        updateActiveNode((node) => ({ ...node, summary }))
+                      }}
+                      rows={3}
+                    />
                   </label>
                   <label className="full-width">
                     <span>Content draft</span>
-                    <textarea value={activeNode.content} onChange={(event) => updateActiveNode((node) => ({ ...node, content: event.currentTarget.value }))} rows={7} />
+                    <textarea
+                      value={activeNode.content}
+                      onChange={(event) => {
+                        const content = event.currentTarget.value
+                        updateActiveNode((node) => ({ ...node, content }))
+                      }}
+                      rows={7}
+                    />
                   </label>
                   <label className="full-width">
                     <span>Keywords</span>
                     <input
                       value={keywordsValue}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        const keywords = event.currentTarget.value.split(',').map((keyword) => keyword.trim()).filter(Boolean)
                         updateActiveNode((node) => ({
                           ...node,
-                          keywords: event.currentTarget.value.split(',').map((keyword) => keyword.trim()).filter(Boolean),
+                          keywords,
                         }))
-                      }
+                      }}
                     />
                   </label>
                 </div>
@@ -1102,12 +2289,36 @@ function App() {
                   {!activeNode.resources.length ? <p className="muted">No resources attached.</p> : null}
                   {activeNode.resources.map((resource) => (
                     <div key={resource.id} className="resource-row">
-                      <select value={resource.type} onChange={(event) => updateResource(resource.id, (entry) => ({ ...entry, type: event.currentTarget.value as ResourceType }))}>
+                      <select
+                        value={resource.type}
+                        onChange={(event) => {
+                          const type = event.currentTarget.value as ResourceType
+                          updateResource(resource.id, (entry) => ({ ...entry, type }))
+                        }}
+                      >
                         {resourceTypes.map((type) => <option key={type} value={type}>{type}</option>)}
                       </select>
-                      <input value={resource.label} onChange={(event) => updateResource(resource.id, (entry) => ({ ...entry, label: event.currentTarget.value }))} />
-                      <input value={resource.value} onChange={(event) => updateResource(resource.id, (entry) => ({ ...entry, value: event.currentTarget.value }))} />
-                      <input value={resource.description ?? ''} onChange={(event) => updateResource(resource.id, (entry) => ({ ...entry, description: event.currentTarget.value }))} />
+                      <input
+                        value={resource.label}
+                        onChange={(event) => {
+                          const label = event.currentTarget.value
+                          updateResource(resource.id, (entry) => ({ ...entry, label }))
+                        }}
+                      />
+                      <input
+                        value={resource.value}
+                        onChange={(event) => {
+                          const value = event.currentTarget.value
+                          updateResource(resource.id, (entry) => ({ ...entry, value }))
+                        }}
+                      />
+                      <input
+                        value={resource.description ?? ''}
+                        onChange={(event) => {
+                          const description = event.currentTarget.value
+                          updateResource(resource.id, (entry) => ({ ...entry, description }))
+                        }}
+                      />
                       <button className="icon-button" onClick={() => removeResource(resource.id)} type="button">x</button>
                     </div>
                   ))}
@@ -1144,6 +2355,35 @@ function App() {
             </section>
           </aside>
         </div>
+      ) : activeWorkspaceTab === 'translation' ? (
+        <TranslationWorkspace />
+      ) : (
+        <main className="preview-view">
+          <section className="panel preview-workspace-panel">
+            <div className="content-book-header">
+              <div>
+                <h2>{book.title || 'Untitled Book'}</h2>
+                <p className="panel-subtitle">
+                  {activeFileName ? `Saved as ${activeFileName}` : 'Unsaved draft'} · {chapterCount} chapters, {itemCount} items
+                </p>
+              </div>
+              <div className="book-actions">
+                <button className="button secondary" onClick={() => setActiveWorkspaceTab('contents')} type="button">
+                  Edit Contents
+                </button>
+                <button className="button secondary" onClick={exportStructure} type="button">
+                  Export JSON
+                </button>
+              </div>
+            </div>
+
+            <BookPreviewContent
+              book={book}
+              previewMode={previewMode}
+              onPreviewModeChange={setPreviewMode}
+            />
+          </section>
+        </main>
       )}
 
       {bookSettingsOpen ? (
@@ -1221,6 +2461,68 @@ function App() {
                 type="button"
               >
                 {bookSettingsMode === 'create' ? 'Create Book' : 'Save Book'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+
+      {deleteConfirm ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel delete-modal">
+            <header className="modal-header">
+              <div>
+                <h2>Delete Book</h2>
+                <p>{deleteConfirm.entry.book.title}</p>
+              </div>
+              <button className="icon-button" onClick={closeDeleteBookDialog} disabled={deleteConfirm.busy} type="button">x</button>
+            </header>
+
+            {deleteConfirm.step === 1 ? (
+              <div className="delete-confirm-body">
+                <p>
+                  This removes the local JSON file for this book. Export it first if you need a separate copy.
+                </p>
+                <dl className="delete-book-summary">
+                  <div>
+                    <dt>File</dt>
+                    <dd>{deleteConfirm.entry.fileName}</dd>
+                  </div>
+                  <div>
+                    <dt>Contents</dt>
+                    <dd>{deleteConfirm.entry.chapterCount} chapters, {deleteConfirm.entry.itemCount} items</dd>
+                  </div>
+                </dl>
+              </div>
+            ) : (
+              <div className="delete-confirm-body">
+                <p>Type the book title to confirm deletion.</p>
+                <label>
+                  <span>Book title</span>
+                  <input
+                    value={deleteConfirm.typedTitle}
+                    onChange={(event) => {
+                      const typedTitle = event.currentTarget.value
+                      setDeleteConfirm((current) => current ? { ...current, typedTitle } : current)
+                    }}
+                    disabled={deleteConfirm.busy}
+                    autoFocus
+                  />
+                </label>
+              </div>
+            )}
+
+            <footer className="modal-footer">
+              <button className="button secondary" onClick={closeDeleteBookDialog} disabled={deleteConfirm.busy} type="button">
+                Cancel
+              </button>
+              <button
+                className="button danger"
+                onClick={() => void confirmDeleteBook()}
+                disabled={deleteConfirm.busy || (deleteConfirm.step === 2 && !deleteConfirmTitleMatches)}
+                type="button"
+              >
+                {deleteConfirm.step === 1 ? 'Continue' : deleteConfirm.busy ? 'Deleting...' : 'Delete Book'}
               </button>
             </footer>
           </section>

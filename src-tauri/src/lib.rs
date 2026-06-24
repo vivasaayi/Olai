@@ -12,6 +12,8 @@ pub fn run() {
       download_model,
       list_local_models,
       chat_with_model,
+      save_old_book_snapshot,
+      old_book_snapshot_dir,
     ])
     .setup(|app| {
       if cfg!(debug_assertions) {
@@ -37,6 +39,7 @@ use std::io::{Read, Write};
 use tauri::Emitter;
 use reqwest::blocking::Client;
 use std::process::Command;
+use base64::{engine::general_purpose, Engine as _};
 
 #[tauri::command]
 fn app_data_dir() -> Result<String, String> {
@@ -50,6 +53,62 @@ fn books_dir() -> Result<PathBuf, String> {
   p.push("bookforge");
   p.push("books");
   Ok(p)
+}
+
+fn safe_path_segment(value: &str) -> String {
+  let sanitized: String = value
+    .chars()
+    .map(|ch| {
+      if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+        ch
+      } else {
+        '-'
+      }
+    })
+    .collect();
+
+  let trimmed = sanitized.trim_matches('-');
+  if trimmed.is_empty() {
+    "old-book".into()
+  } else {
+    trimmed.into()
+  }
+}
+
+fn old_book_snapshots_dir(book_id: &str) -> Result<PathBuf, String> {
+  let mut p = data_local_dir().ok_or("app_data_dir not found".to_string())?;
+  p.push("bookforge");
+  p.push("old-book-snapshots");
+  p.push(safe_path_segment(book_id));
+  Ok(p)
+}
+
+#[tauri::command]
+fn old_book_snapshot_dir(book_id: String) -> Result<String, String> {
+  let dir = old_book_snapshots_dir(&book_id)?;
+  fs::create_dir_all(&dir).map_err(|e| format!("create snapshot dir: {}", e))?;
+  Ok(dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn save_old_book_snapshot(book_id: String, page_number: u32, image_data_url: String) -> Result<String, String> {
+  let (header, base64_data) = image_data_url
+    .split_once(',')
+    .ok_or_else(|| "snapshot image must be a data URL".to_string())?;
+
+  let extension = if header.contains("image/png") { "png" } else { "jpg" };
+  let bytes = general_purpose::STANDARD
+    .decode(base64_data)
+    .map_err(|e| format!("decode snapshot image: {}", e))?;
+
+  let dir = old_book_snapshots_dir(&book_id)?;
+  fs::create_dir_all(&dir).map_err(|e| format!("create snapshot dir: {}", e))?;
+
+  let mut file_path = dir;
+  file_path.push(format!("page-{:04}.{}", page_number, extension));
+  fs::write(&file_path, bytes).map_err(|e| format!("write snapshot file: {}", e))?;
+
+  Ok(file_path.to_string_lossy().into_owned())
 }
 
 #[derive(Serialize, Deserialize)]

@@ -25,7 +25,7 @@ export default function ModelsPage() {
   async function onDownload(id: string) {
     setDownloading(id)
     try {
-      await invoke('download_model', { model_id: id })
+      await invoke('download_model', { modelId: id })
       await refresh()
     } catch (err) {
       console.error('download failed', err)

@@ -26,7 +26,7 @@ export default function ChatPage() {
     const modelName = selected
     setMessages((m) => [...m, { role: 'user', text: prompt }])
     try {
-      const reply = (await invoke('chat_with_model', { model_name: modelName, prompt })) as string
+      const reply = (await invoke('chat_with_model', { modelName, prompt })) as string
       setMessages((m) => [...m, { role: 'assistant', text: reply }])
       setPrompt('')
     } catch (err) {
