@@ -304,6 +304,65 @@ function requestToPromise<T>(request: IDBRequest<T>) {
   })
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function asStringArray(value: unknown) {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
+}
+
+function normalizeGlossaryEntries(value: unknown): TranslationGlossaryEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const entries = value
+    .map((entry) => asRecord(entry))
+    .map((entry) => ({
+      sourceTerm: typeof entry.sourceTerm === 'string' ? entry.sourceTerm : '',
+      translatedTerm: typeof entry.translatedTerm === 'string' ? entry.translatedTerm : '',
+      explanation: typeof entry.explanation === 'string' ? entry.explanation : '',
+    }))
+    .filter((entry) => entry.sourceTerm || entry.translatedTerm || entry.explanation)
+  return entries.length ? entries : undefined
+}
+
+function parseStoredJsonTranslation(text: string): Record<string, unknown> | null {
+  const trimmed = text.trim()
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('"')) return null
+
+  try {
+    const parsed = JSON.parse(trimmed)
+    if (typeof parsed === 'string') return parseStoredJsonTranslation(parsed)
+    return asRecord(parsed)
+  } catch {
+    return null
+  }
+}
+
+function normalizeTranslationRecord(translation: TranslationRecord): TranslationRecord {
+  if (translation.paragraphs.length !== 1) return translation
+  const payload = parseStoredJsonTranslation(translation.paragraphs[0])
+  if (!payload) return translation
+
+  const paragraphs = asStringArray(payload.paragraphs)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+  const sourceLines = asStringArray(payload.sourceLines)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  const sectionTitle = typeof payload.sectionTitle === 'string' && payload.sectionTitle.trim()
+    ? payload.sectionTitle.trim()
+    : translation.sectionTitle
+
+  return {
+    ...translation,
+    sectionTitle,
+    paragraphs: paragraphs.length ? paragraphs : translation.paragraphs,
+    sourceLines,
+    glossary: normalizeGlossaryEntries(payload.glossary) ?? translation.glossary,
+    notes: asStringArray(payload.notes).length ? asStringArray(payload.notes) : translation.notes,
+  }
+}
+
 function normalizeOldBookRecord(value: OldBookRecord): OldBookRecord {
   return {
     ...value,
@@ -311,7 +370,7 @@ function normalizeOldBookRecord(value: OldBookRecord): OldBookRecord {
     pageNumber: value.pageNumber || 1,
     pageSnapshots: Array.isArray(value.pageSnapshots) ? value.pageSnapshots : [],
     snapshotJobs: Array.isArray(value.snapshotJobs) ? value.snapshotJobs : [],
-    translations: Array.isArray(value.translations) ? value.translations : [],
+    translations: Array.isArray(value.translations) ? value.translations.map(normalizeTranslationRecord) : [],
     translationMemory: Array.isArray(value.translationMemory) ? value.translationMemory : [],
     translationJobs: Array.isArray(value.translationJobs) ? value.translationJobs : [],
     questions: Array.isArray(value.questions) ? value.questions : [],
@@ -734,7 +793,7 @@ export function createTranslationRecord(
     complexity,
     language,
     paragraphs: content?.paragraphs?.length ? content.paragraphs : getDemoTranslationParagraphs(complexity, language),
-    sourceLines: content?.sourceLines?.length ? content.sourceLines : sourcePageLines,
+    sourceLines: content ? content.sourceLines ?? [] : sourcePageLines,
     glossary: content?.glossary?.length ? content.glossary : undefined,
     notes: content?.notes?.length ? content.notes : undefined,
     createdAt: new Date().toISOString(),

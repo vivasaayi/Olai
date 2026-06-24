@@ -143,12 +143,20 @@ function parseJsonish(text: string): unknown {
     .trim()
 
   try {
-    return JSON.parse(withoutFence)
+    const parsed = JSON.parse(withoutFence)
+    if (typeof parsed === 'string' && /^[\s`]*[{[]/.test(parsed)) {
+      return parseJsonish(parsed)
+    }
+    return parsed
   } catch {
     const start = withoutFence.indexOf('{')
     const end = withoutFence.lastIndexOf('}')
     if (start >= 0 && end > start) {
-      return JSON.parse(withoutFence.slice(start, end + 1))
+      const parsed = JSON.parse(withoutFence.slice(start, end + 1))
+      if (typeof parsed === 'string' && /^[\s`]*[{[]/.test(parsed)) {
+        return parseJsonish(parsed)
+      }
+      return parsed
     }
     throw new Error('Response was not JSON.')
   }
@@ -302,6 +310,7 @@ export async function requestVisionTranslation({
           ? [
             'You are a historical scientific translator and academic editor specializing in older technical texts.',
             'First create a corrected source-language transcription from the page image. Then create a dense, source-faithful Original English pass.',
+            'For German pages, sourceLines must be German OCR/transcription only. The English translation must appear only in paragraphs.',
             'Preserve sentence order, technical meaning, historical nuance, and continuity with the previous page.',
             'Fully translate source-language terms in the translation body. Keep original terms only in the glossary.',
             'Return a page-local glossary of important vocabulary and concepts. These entries explain this page to the reader; they are not global memory instructions.',
@@ -338,7 +347,7 @@ export async function requestVisionTranslation({
                 : '',
               'Respect damaged, archaic, or unclear text. Mark uncertain OCR with [?] instead of inventing missing words.',
               isOriginalPass
-                ? 'Return sourceLines as corrected source-language transcription lines, not English. Extract important old terms, technical concepts, and recurring phrases into glossary. Use translated terms consistently with prior glossary.'
+                ? 'Return sourceLines as corrected source-language transcription lines, not English. If the source is German, sourceLines must be German. Put the faithful English translation only in paragraphs. Extract important old terms, technical concepts, and recurring phrases into glossary. Use translated terms consistently with prior glossary.'
                 : 'For the translation, preserve the author’s meaning but rewrite into natural modern sentences for the chosen complexity.',
               'Glossary requirements: include 5-12 page-local vocabulary entries when available. For Kid Friendly, explain terms simply. For Simplified English, use plain explanations. For High School, include key technical terms. For College, include precise historical or technical nuance. Put explanations in the requested output language where possible.',
               'Notes requirements: include short page-specific translator notes for ambiguity, historical context, OCR uncertainty, or important conceptual framing.',
