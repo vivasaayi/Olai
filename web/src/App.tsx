@@ -17,6 +17,7 @@ import {
   sourcePageLines,
   type OldBookRecord,
   type QuestionRecord,
+  type SnapshotJobState,
   type TranslationComplexity,
   type TranslationGlossaryEntry,
   type TranslationJobState,
@@ -31,7 +32,7 @@ import {
   type LocalVisionModel,
   type VisionTranslationResult,
 } from './localVision'
-import { renderPdfPageSnapshot, renderPdfPageSnapshots, type RenderedPdfSnapshot } from './pdfPageSnapshot'
+import { getPdfPageCount, renderPdfPageSnapshot, renderPdfPageSnapshotsStream, type RenderedPdfSnapshot } from './pdfPageSnapshot'
 import type { Book, NodePersona, OutlineNode, OutlineNodeType, Resource, ResourceType } from './types'
 
 type LibraryEntry = {
@@ -77,7 +78,7 @@ type DeleteConfirmState = {
 }
 
 type SnapshotProgressState = {
-  phase: 'preparing' | 'rendering' | 'saving'
+  phase: 'preparing' | 'rendering' | 'saving' | 'persist' | 'complete'
   current: number
   total: number
   message: string
@@ -793,7 +794,9 @@ function TranslationWorkspace() {
   const [snapshotViewMode, setSnapshotViewMode] = useState<'all' | 'page'>('all')
   const [memoryOpen, setMemoryOpen] = useState(false)
   const [sourceInspectorOpen, setSourceInspectorOpen] = useState(false)
+  const [forceRetranslate, setForceRetranslate] = useState(false)
   const [activeTranslationJob, setActiveTranslationJob] = useState<TranslationJobState | null>(null)
+  const [activeSnapshotJob, setActiveSnapshotJob] = useState<SnapshotJobState | null>(null)
   const [snapshotProgress, setSnapshotProgress] = useState<SnapshotProgressState | null>(null)
 
   const activeBook = oldBooks.find((entry) => entry.id === activeBookId) ?? oldBooks[0]
@@ -862,6 +865,17 @@ function TranslationWorkspace() {
   const displayedTranslationJob = activeTranslationJob
     ?? activeBook?.translationJobs?.find((entry) => entry.status === 'running')
     ?? activeBook?.translationJobs?.[0]
+  const resumableTranslationJob = activeBook?.translationJobs?.find((entry) =>
+    entry.kind === 'translate-all'
+    && entry.complexity === complexity
+    && entry.language === translationLanguage
+    && entry.status !== 'complete'
+  )
+  const hasResumableTranslationJob = Boolean(resumableTranslationJob && !forceRetranslate)
+  const displayedSnapshotJob = activeSnapshotJob
+    ?? activeBook?.snapshotJobs?.find((entry) => entry.status === 'running')
+    ?? activeBook?.snapshotJobs?.[0]
+  const hasRunningSnapshotJob = displayedSnapshotJob?.status === 'running'
   const snapshotProgressPercent = snapshotProgress?.total
     ? Math.min(100, Math.max(0, Math.round((snapshotProgress.current / snapshotProgress.total) * 100)))
     : 0
@@ -982,6 +996,28 @@ function TranslationWorkspace() {
       translationJobs: [
         updatedJob,
         ...(book.translationJobs ?? []).filter((entry) => entry.id !== updatedJob.id),
+      ],
+    })
+    await yieldToBrowser()
+    return { updatedBook, updatedJob }
+  }
+
+  async function persistSnapshotJob(book: OldBookRecord, job: SnapshotJobState) {
+    const updatedJob = { ...job, updatedAt: new Date().toISOString() }
+    setActiveSnapshotJob(updatedJob)
+    setSnapshotProgress({
+      phase: updatedJob.phase === 'complete' ? 'complete' : updatedJob.phase,
+      current: updatedJob.completedPages + updatedJob.skippedPages,
+      total: updatedJob.totalPages,
+      message: updatedJob.message,
+    })
+    setOldBookStatus(updatedJob.message)
+    const updatedBook = await persistOldBook({
+      ...book,
+      status: updatedJob.message,
+      snapshotJobs: [
+        updatedJob,
+        ...(book.snapshotJobs ?? []).filter((entry) => entry.id !== updatedJob.id),
       ],
     })
     await yieldToBrowser()
@@ -1172,6 +1208,21 @@ function TranslationWorkspace() {
 
   async function snapshotAllPages() {
     if (!activeBook || !activePdfBlob) return
+    const startedAt = new Date().toISOString()
+    let job: SnapshotJobState = {
+      id: createId(),
+      kind: 'snapshot-all',
+      status: 'running',
+      currentPage: activeBook.pageNumber,
+      totalPages: activeBook.pages || 0,
+      phase: 'preparing',
+      completedPages: 0,
+      skippedPages: 0,
+      message: 'Preparing all page snapshots...',
+      startedAt,
+      updatedAt: startedAt,
+    }
+
     setOldBookBusy(true)
     setSnapshotProgress({
       phase: 'preparing',
@@ -1180,52 +1231,158 @@ function TranslationWorkspace() {
       message: 'Preparing all page snapshots...',
     })
     try {
-      setOldBookStatus('Preparing all page snapshots...')
-      const renderedSnapshots = await renderPdfPageSnapshots(activePdfBlob, {
+      let { updatedBook: workingBook, updatedJob } = await persistSnapshotJob(activeBook, job)
+      job = updatedJob
+      const totalPages = workingBook.pages || await getPdfPageCount(activePdfBlob)
+      const existingByPage = new Map(workingBook.pageSnapshots.map((snapshot) => [snapshot.pageNumber, snapshot]))
+      const missingPages = Array.from({ length: totalPages }, (_, index) => index + 1)
+        .filter((pageNumber) => !existingByPage.has(pageNumber))
+      const skippedPages = totalPages - missingPages.length
+
+      if (!missingPages.length) {
+        const completeJob: SnapshotJobState = {
+          ...job,
+          status: 'complete',
+          phase: 'complete',
+          currentPage: totalPages,
+          totalPages,
+          completedPages: 0,
+          skippedPages,
+          message: `All ${totalPages} page snapshots are already saved.`,
+          updatedAt: new Date().toISOString(),
+        }
+        workingBook = await persistOldBook({
+          ...workingBook,
+          pages: totalPages,
+          status: completeJob.message,
+          snapshotJobs: [
+            completeJob,
+            ...(workingBook.snapshotJobs ?? []).filter((entry) => entry.id !== completeJob.id),
+          ],
+        })
+        setActiveSnapshotJob(completeJob)
+        setSnapshotProgress({
+          phase: 'complete',
+          current: totalPages,
+          total: totalPages,
+          message: completeJob.message,
+        })
+        setOldBookStatus(completeJob.message)
+        setActiveBookId(workingBook.id)
+        setSnapshotsOpen(true)
+        return
+      }
+
+      ;({ updatedBook: workingBook, updatedJob } = await persistSnapshotJob(workingBook, {
+        ...job,
+        totalPages,
+        skippedPages,
+        message: `Rendering ${missingPages.length} missing snapshots; ${skippedPages} already saved.`,
+      }))
+      job = updatedJob
+
+      const snapshotRecords = []
+      await renderPdfPageSnapshotsStream(activePdfBlob, {
         maxWidth: 1000,
-        onProgress: (pageNumber, pageCount) => {
+        pages: missingPages,
+        onProgress: async (pageNumber, pageCount, current) => {
           setSnapshotProgress({
             phase: 'rendering',
-            current: pageNumber,
-            total: pageCount,
+            current: skippedPages + current,
+            total: totalPages,
             message: `Rendering page ${pageNumber} of ${pageCount}`,
           })
-          setOldBookStatus(`Rendering snapshot ${pageNumber} of ${pageCount}...`)
+          ;({ updatedBook: workingBook, updatedJob } = await persistSnapshotJob(workingBook, {
+            ...job,
+            currentPage: pageNumber,
+            totalPages,
+            phase: 'rendering',
+            completedPages: snapshotRecords.length,
+            skippedPages,
+            message: `Rendering snapshot ${pageNumber} of ${pageCount}...`,
+          }))
+          job = updatedJob
+        },
+        onSnapshot: async (renderedSnapshot, current) => {
+          setSnapshotProgress({
+            phase: 'saving',
+            current: skippedPages + current,
+            total: totalPages,
+            message: `Saving page ${renderedSnapshot.pageNumber} of ${totalPages}`,
+          })
+          setOldBookStatus(`Saving snapshot ${renderedSnapshot.pageNumber} of ${renderedSnapshot.pageCount}...`)
+          const snapshotRecord = createPageSnapshotRecord(
+            renderedSnapshot.pageNumber,
+            renderedSnapshot.imageDataUrl,
+            renderedSnapshot.width,
+            renderedSnapshot.height,
+            await saveRenderedSnapshotToFolder(activeBook.id, renderedSnapshot),
+          )
+          snapshotRecords.push(snapshotRecord)
+          workingBook = {
+            ...workingBook,
+            pages: totalPages,
+            pageSnapshots: [
+              snapshotRecord,
+              ...workingBook.pageSnapshots.filter((entry) => entry.pageNumber !== snapshotRecord.pageNumber),
+            ],
+          }
+          ;({ updatedBook: workingBook, updatedJob } = await persistSnapshotJob(workingBook, {
+            ...job,
+            currentPage: renderedSnapshot.pageNumber,
+            totalPages,
+            phase: 'saving',
+            completedPages: current,
+            skippedPages,
+            message: `Saved ${current} of ${missingPages.length} missing snapshots. Last saved page ${renderedSnapshot.pageNumber}.`,
+          }))
+          job = updatedJob
+          await yieldToBrowser()
         },
       })
 
-      const snapshotRecords = []
-      for (const [index, renderedSnapshot] of renderedSnapshots.entries()) {
-        const current = index + 1
-        setSnapshotProgress({
-          phase: 'saving',
-          current,
-          total: renderedSnapshots.length,
-          message: `Saving page ${renderedSnapshot.pageNumber} of ${renderedSnapshots.length}`,
-        })
-        setOldBookStatus(`Saving snapshot ${renderedSnapshot.pageNumber} of ${renderedSnapshot.pageCount}...`)
-        snapshotRecords.push(createPageSnapshotRecord(
-          renderedSnapshot.pageNumber,
-          renderedSnapshot.imageDataUrl,
-          renderedSnapshot.width,
-          renderedSnapshot.height,
-          await saveRenderedSnapshotToFolder(activeBook.id, renderedSnapshot),
-        ))
-        await yieldToBrowser()
+      const mergedSnapshotRecords = [
+        ...snapshotRecords,
+        ...workingBook.pageSnapshots.filter((snapshot) =>
+          !snapshotRecords.some((entry) => entry.pageNumber === snapshot.pageNumber)
+        ),
+      ]
+      const completeJob: SnapshotJobState = {
+        ...job,
+        status: 'complete',
+        phase: 'complete',
+        currentPage: totalPages,
+        totalPages,
+        completedPages: snapshotRecords.length,
+        skippedPages,
+        message: `Snapshot All complete. Saved ${snapshotRecords.length}, skipped ${skippedPages}.`,
+        updatedAt: new Date().toISOString(),
       }
-
       const savedBook = await persistOldBook({
-        ...activeBook,
-        pages: renderedSnapshots[0]?.pageCount ?? activeBook.pages,
-        status: 'All snapshots ready',
-        pageSnapshots: snapshotRecords,
+        ...workingBook,
+        pages: totalPages,
+        status: completeJob.message,
+        pageSnapshots: mergedSnapshotRecords,
+        snapshotJobs: [
+          completeJob,
+          ...(workingBook.snapshotJobs ?? []).filter((entry) => entry.id !== completeJob.id),
+        ],
       })
+      setActiveSnapshotJob(completeJob)
       setActiveSnapshotPage(snapshotRecords[0]?.pageNumber ?? null)
       setSnapshotViewMode('all')
       setOldBookStatus(`Captured ${snapshotRecords.length} snapshots for ${savedBook.title}.`)
       setSnapshotsOpen(true)
     } catch (error) {
-      setOldBookStatus(error instanceof Error ? error.message : String(error))
+      const message = error instanceof Error ? error.message : String(error)
+      setOldBookStatus(message)
+      setActiveSnapshotJob((current) => current ? {
+        ...current,
+        status: 'failed',
+        error: message,
+        message,
+        updatedAt: new Date().toISOString(),
+      } : current)
     } finally {
       setSnapshotProgress(null)
       setOldBookBusy(false)
@@ -1393,23 +1550,41 @@ function TranslationWorkspace() {
     translationAbortRef.current = abortController
     setOldBookBusy(true)
     const now = new Date().toISOString()
-    let job: TranslationJobState = {
-      id: createId(),
-      kind: 'translate-all',
-      status: 'running',
-      complexity,
-      language: translationLanguage,
-      currentPage: activeBook.pageNumber,
-      totalPages: activeBook.pages || 0,
-      phase: 'snapshot',
-      completedPages: 0,
-      skippedPages: 0,
-      message: 'Starting Translate All...',
-      startedAt: now,
-      updatedAt: now,
-    }
+    const reusableJob = !forceRetranslate
+      ? activeBook.translationJobs.find((entry) =>
+        entry.kind === 'translate-all'
+        && entry.complexity === complexity
+        && entry.language === translationLanguage
+        && entry.status !== 'complete'
+      )
+      : undefined
+    let job: TranslationJobState = reusableJob
+      ? {
+        ...reusableJob,
+        status: 'running',
+        phase: reusableJob.phase === 'complete' ? 'snapshot' : reusableJob.phase,
+        message: `Resuming Translate All from page ${Math.max(1, reusableJob.currentPage || 1)}...`,
+        updatedAt: now,
+      }
+      : {
+        id: createId(),
+        kind: 'translate-all',
+        status: 'running',
+        complexity,
+        language: translationLanguage,
+        currentPage: activeBook.pageNumber,
+        totalPages: activeBook.pages || 0,
+        phase: 'snapshot',
+        completedPages: 0,
+        skippedPages: 0,
+        message: forceRetranslate ? 'Starting forced Translate All...' : 'Starting Translate All...',
+        startedAt: now,
+        updatedAt: now,
+      }
+    let workingBook: OldBookRecord = activeBook
+    let updatedJob: TranslationJobState = job
     try {
-      let { updatedBook: workingBook, updatedJob } = await persistTranslationJob(activeBook, job)
+      ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(activeBook, job))
       job = updatedJob
       let totalPages = workingBook.pages
 
@@ -1427,10 +1602,14 @@ function TranslationWorkspace() {
         totalPages = firstPage.pageCount || firstPage.updatedBook.pages || 1
       }
 
-      let translatedCount = 0
-      let skippedCount = 0
+      let translatedCount = forceRetranslate ? 0 : job.completedPages
+      let skippedCount = forceRetranslate ? 0 : job.skippedPages
+      const resumePage = job.phase === 'persist'
+        ? (job.currentPage || 1) + 1
+        : job.currentPage || 1
+      const startPage = forceRetranslate ? 1 : Math.min(Math.max(1, resumePage), totalPages)
 
-      for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+      for (let pageNumber = startPage; pageNumber <= totalPages; pageNumber += 1) {
         let pageBook: OldBookRecord = {
           ...workingBook,
           pageNumber,
@@ -1445,7 +1624,7 @@ function TranslationWorkspace() {
           && entry.language === translationLanguage
         ))
 
-        if (originalExists && targetExists) {
+        if (!forceRetranslate && originalExists && targetExists) {
           skippedCount += 1
           ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
             ...job,
@@ -1482,7 +1661,7 @@ function TranslationWorkspace() {
         let memoryForSave = pageBook.translationMemory
         let originalTranslation = getCanonicalOriginalTranslation(pageBook, pageNumber)
 
-        if (!originalTranslation) {
+        if (!originalTranslation || (forceRetranslate && complexity === 'original')) {
           ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
             ...job,
             currentPage: pageNumber,
@@ -1504,7 +1683,7 @@ function TranslationWorkspace() {
           }
         }
 
-        if (complexity !== 'original' && !targetExists) {
+        if (complexity !== 'original' && (forceRetranslate || !targetExists)) {
           ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
             ...job,
             currentPage: pageNumber,
@@ -1603,14 +1782,27 @@ function TranslationWorkspace() {
       setOldBookStatus(completeJob.message)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      setOldBookStatus(message)
-      setActiveTranslationJob((current) => current ? {
-        ...current,
+      const failedJob: TranslationJobState = {
+        ...job,
         status: 'failed',
         error: message,
         message,
         updatedAt: new Date().toISOString(),
-      } : current)
+      }
+      setOldBookStatus(message)
+      setActiveTranslationJob(failedJob)
+      try {
+        await persistOldBook({
+          ...workingBook,
+          status: message,
+          translationJobs: [
+            failedJob,
+            ...(workingBook.translationJobs ?? []).filter((entry) => entry.id !== failedJob.id),
+          ],
+        })
+      } catch {
+        // Keep the visible failure even if the follow-up status write also fails.
+      }
     } finally {
       if (translationAbortRef.current === abortController) {
         translationAbortRef.current = null
@@ -1831,15 +2023,24 @@ function TranslationWorkspace() {
               disabled={oldBookBusy || !activeBook?.pdfBlobId}
               type="button"
             >
-              Snapshot All
+              {hasRunningSnapshotJob ? 'Resume Snapshots' : 'Snapshot All'}
             </button>
+            <label className="force-retranslate-toggle">
+              <input
+                type="checkbox"
+                checked={forceRetranslate}
+                onChange={(event) => setForceRetranslate(event.currentTarget.checked)}
+                disabled={oldBookBusy}
+              />
+              <span>Force</span>
+            </label>
             <button
               className="button secondary"
               onClick={() => void translateAllPages()}
               disabled={oldBookBusy || !activeBook?.pdfBlobId}
               type="button"
             >
-              Translate All
+              {forceRetranslate ? 'Force Retranslate' : hasResumableTranslationJob ? 'Resume Translate' : 'Translate All'}
             </button>
             <button
               className="button secondary"
@@ -1869,13 +2070,22 @@ function TranslationWorkspace() {
         {snapshotProgress ? (
           <div className="snapshot-progress-strip">
             <div className="snapshot-progress-copy">
-              <strong>{snapshotProgress.phase === 'saving' ? 'Saving snapshots' : snapshotProgress.phase === 'rendering' ? 'Rendering snapshots' : 'Preparing snapshots'}</strong>
+              <strong>{snapshotProgress.phase === 'complete' ? 'Snapshots complete' : snapshotProgress.phase === 'saving' ? 'Saving snapshots' : snapshotProgress.phase === 'rendering' ? 'Rendering snapshots' : 'Preparing snapshots'}</strong>
               <span>{snapshotProgress.message}</span>
               <span>{snapshotProgress.current} of {snapshotProgress.total || '?'}</span>
             </div>
             <div className="snapshot-progress-track" aria-label="Snapshot progress">
               <span style={{ width: `${snapshotProgressPercent}%` }} />
             </div>
+          </div>
+        ) : null}
+        {displayedSnapshotJob ? (
+          <div className="translation-job-strip">
+            <strong>{displayedSnapshotJob.status === 'running' ? 'Snapshot All resumable' : `Snapshot All ${displayedSnapshotJob.status}`}</strong>
+            <span>Page {displayedSnapshotJob.currentPage || 1} of {displayedSnapshotJob.totalPages || activePageCount}</span>
+            <span>{displayedSnapshotJob.phase}</span>
+            <span>{displayedSnapshotJob.completedPages} saved · {displayedSnapshotJob.skippedPages} skipped</span>
+            <span>{displayedSnapshotJob.message}</span>
           </div>
         ) : null}
         {displayedTranslationJob ? (

@@ -1,6 +1,6 @@
-import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist'
-import type { PDFDocumentProxy } from 'pdfjs-dist'
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import type { PDFDocumentProxy } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import pdfWorkerUrl from 'pdfjs-dist/legacy/build/pdf.worker.mjs?url'
 
 GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
@@ -38,6 +38,21 @@ export async function renderPdfPageSnapshot(
       ...snapshot,
       pageCount,
     }
+  } finally {
+    await documentTask.destroy()
+  }
+}
+
+export async function getPdfPageCount(pdfBlob: Blob) {
+  const data = await pdfBlob.arrayBuffer()
+  const documentTask = getDocument({
+    data,
+    wasmUrl: pdfJsWasmUrl(),
+  })
+
+  try {
+    const pdf = await documentTask.promise
+    return pdf.numPages
   } finally {
     await documentTask.destroy()
   }
@@ -85,7 +100,8 @@ export async function renderPdfPageSnapshots(
   pdfBlob: Blob,
   options: {
     maxWidth?: number
-    onProgress?: (pageNumber: number, pageCount: number) => void
+    pages?: number[]
+    onProgress?: (pageNumber: number, pageCount: number, current: number, total: number) => Promise<void> | void
   } = {},
 ): Promise<RenderedPdfSnapshot[]> {
   const maxWidth = options.maxWidth ?? 1400
@@ -99,13 +115,52 @@ export async function renderPdfPageSnapshots(
     const pdf = await documentTask.promise
     const pageCount = pdf.numPages
     const snapshots: RenderedPdfSnapshot[] = []
+    const pageNumbers = options.pages?.length
+      ? options.pages.filter((pageNumber) => pageNumber >= 1 && pageNumber <= pageCount)
+      : Array.from({ length: pageCount }, (_, index) => index + 1)
 
-    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
-      options.onProgress?.(pageNumber, pageCount)
+    for (const [index, pageNumber] of pageNumbers.entries()) {
+      options.onProgress?.(pageNumber, pageCount, index + 1, pageNumbers.length)
       snapshots.push(await renderPageFromDocument(pdf, pageNumber, pageCount, maxWidth))
     }
 
     return snapshots
+  } finally {
+    await documentTask.destroy()
+  }
+}
+
+export async function renderPdfPageSnapshotsStream(
+  pdfBlob: Blob,
+  options: {
+    maxWidth?: number
+    pages?: number[]
+    onProgress?: (pageNumber: number, pageCount: number, current: number, total: number) => void
+    onSnapshot: (snapshot: RenderedPdfSnapshot, current: number, total: number) => Promise<void> | void
+  },
+): Promise<{ pageCount: number, renderedCount: number }> {
+  const maxWidth = options.maxWidth ?? 1400
+  const data = await pdfBlob.arrayBuffer()
+  const documentTask = getDocument({
+    data,
+    wasmUrl: pdfJsWasmUrl(),
+  })
+
+  try {
+    const pdf = await documentTask.promise
+    const pageCount = pdf.numPages
+    const pageNumbers = options.pages?.length
+      ? options.pages.filter((pageNumber) => pageNumber >= 1 && pageNumber <= pageCount)
+      : Array.from({ length: pageCount }, (_, index) => index + 1)
+
+    for (const [index, pageNumber] of pageNumbers.entries()) {
+      const current = index + 1
+      await options.onProgress?.(pageNumber, pageCount, current, pageNumbers.length)
+      const snapshot = await renderPageFromDocument(pdf, pageNumber, pageCount, maxWidth)
+      await options.onSnapshot(snapshot, current, pageNumbers.length)
+    }
+
+    return { pageCount, renderedCount: pageNumbers.length }
   } finally {
     await documentTask.destroy()
   }

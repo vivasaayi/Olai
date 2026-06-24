@@ -991,6 +991,28 @@ select:focus,
   gap: 0.35rem;
 }
 
+.force-retranslate-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 2rem;
+  border: 1px solid #d8dee6;
+  border-radius: 8px;
+  padding: 0 0.55rem;
+  background: #ffffff;
+  color: #475467;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.force-retranslate-toggle input {
+  width: 0.9rem;
+  height: 0.9rem;
+  margin: 0;
+  accent-color: #16816f;
+}
+
 .translation-toolbar h2,
 .translation-pane-header h2,
 .question-panel h3 {

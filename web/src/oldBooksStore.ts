@@ -33,6 +33,21 @@ export type TranslationJobState = {
   error?: string
 }
 
+export type SnapshotJobState = {
+  id: string
+  kind: 'snapshot-all'
+  status: 'running' | 'complete' | 'failed'
+  currentPage: number
+  totalPages: number
+  phase: 'preparing' | 'rendering' | 'saving' | 'persist' | 'complete'
+  completedPages: number
+  skippedPages: number
+  message: string
+  updatedAt: string
+  startedAt: string
+  error?: string
+}
+
 export type PageSnapshotRecord = {
   id: string
   pageNumber: number
@@ -85,6 +100,7 @@ export type OldBookRecord = {
   pdfSizeBytes?: number
   importedAt?: string
   pageSnapshots: PageSnapshotRecord[]
+  snapshotJobs: SnapshotJobState[]
   translations: TranslationRecord[]
   translationMemory: TranslationMemoryEntry[]
   translationJobs: TranslationJobState[]
@@ -106,6 +122,10 @@ type StoredPdfAsset = {
   mimeType: string
   sizeBytes: number
   filePath: string
+}
+
+type StoredFileAsset = {
+  dataUrl: string
 }
 
 const dbName = 'bookforge-old-books'
@@ -290,6 +310,7 @@ function normalizeOldBookRecord(value: OldBookRecord): OldBookRecord {
     tags: Array.isArray(value.tags) ? value.tags : [],
     pageNumber: value.pageNumber || 1,
     pageSnapshots: Array.isArray(value.pageSnapshots) ? value.pageSnapshots : [],
+    snapshotJobs: Array.isArray(value.snapshotJobs) ? value.snapshotJobs : [],
     translations: Array.isArray(value.translations) ? value.translations : [],
     translationMemory: Array.isArray(value.translationMemory) ? value.translationMemory : [],
     translationJobs: Array.isArray(value.translationJobs) ? value.translationJobs : [],
@@ -308,6 +329,7 @@ export interface OldBookRepository {
   getPdfAsset(pdfBlobId: string): Promise<Blob | null>
   savePdfAsset(pdfBlobId: string, blob: Blob, fileName: string, bookId?: string): Promise<string | undefined>
   savePageSnapshot(book: OldBookRecord, snapshot: PageSnapshotRecord): Promise<OldBookRecord>
+  saveSnapshotJob(book: OldBookRecord, job: SnapshotJobState): Promise<OldBookRecord>
   getPageSnapshot(bookId: string, pageNumber: number): Promise<PageSnapshotRecord | null>
   saveTranslation(book: OldBookRecord, translation: TranslationRecord): Promise<OldBookRecord>
   getTranslation(
@@ -385,6 +407,12 @@ abstract class BaseOldBookRepository implements OldBookRepository {
   async getPageSnapshot(bookId: string, pageNumber: number) {
     const book = await this.getBook(bookId)
     return book?.pageSnapshots.find((snapshot) => snapshot.pageNumber === pageNumber) ?? null
+  }
+
+  async saveSnapshotJob(book: OldBookRecord, job: SnapshotJobState) {
+    const updatedBook = { ...book, snapshotJobs: upsertById(book.snapshotJobs, job) }
+    await this.saveBookRecord(updatedBook)
+    return updatedBook
   }
 
   async saveTranslation(book: OldBookRecord, translation: TranslationRecord) {
@@ -517,11 +545,12 @@ class TauriSqliteOldBookRepository extends BaseOldBookRepository {
 
   async listBooks() {
     const records = (await invoke('old_book_sqlite_list_records')) as string[]
-    return records.map((record) => normalizeOldBookRecord(JSON.parse(record) as OldBookRecord))
+    const books = records.map((record) => normalizeOldBookRecord(JSON.parse(record) as OldBookRecord))
+    return Promise.all(books.map((book) => this.hydrateSnapshotImages(book)))
   }
 
   async saveBookRecord(book: OldBookRecord) {
-    await invoke('old_book_sqlite_save_record', { payload: JSON.stringify(normalizeOldBookRecord(book)) })
+    await invoke('old_book_sqlite_save_record', { payload: JSON.stringify(prepareBookForTauriSqliteStorage(book)) })
   }
 
   async importPdf(file: File) {
@@ -545,6 +574,38 @@ class TauriSqliteOldBookRepository extends BaseOldBookRepository {
   async getPdfAsset(pdfBlobId: string) {
     const asset = (await invoke('old_book_sqlite_get_pdf_asset', { pdfBlobId })) as StoredPdfAsset | null
     return asset ? base64ToBlob(asset.base64, asset.mimeType) : null
+  }
+
+  private async hydrateSnapshotImages(book: OldBookRecord): Promise<OldBookRecord> {
+    const pageSnapshots = []
+    for (const snapshot of book.pageSnapshots) {
+      if (snapshot.imageDataUrl || !snapshot.filePath) {
+        pageSnapshots.push(snapshot)
+        continue
+      }
+
+      try {
+        const asset = (await invoke('old_book_sqlite_get_file_data_url', {
+          filePath: snapshot.filePath,
+        })) as StoredFileAsset
+        pageSnapshots.push({ ...snapshot, imageDataUrl: asset.dataUrl })
+      } catch {
+        pageSnapshots.push(snapshot)
+      }
+    }
+
+    return { ...book, pageSnapshots }
+  }
+}
+
+function prepareBookForTauriSqliteStorage(book: OldBookRecord): OldBookRecord {
+  const normalizedBook = normalizeOldBookRecord(book)
+  return {
+    ...normalizedBook,
+    pageSnapshots: normalizedBook.pageSnapshots.map((snapshot) => ({
+      ...snapshot,
+      imageDataUrl: snapshot.filePath ? '' : snapshot.imageDataUrl,
+    })),
   }
 }
 
@@ -661,6 +722,7 @@ export function createImportedOldBook(file: File): OldBookRecord {
     pdfSizeBytes: file.size,
     importedAt: createdAt,
     pageSnapshots: [],
+    snapshotJobs: [],
     translations: [],
     translationMemory: [],
     translationJobs: [],

@@ -17,6 +17,7 @@ pub fn run() {
             old_book_sqlite_save_record,
             old_book_sqlite_save_pdf_asset,
             old_book_sqlite_get_pdf_asset,
+            old_book_sqlite_get_file_data_url,
             save_old_book_snapshot,
             old_book_snapshot_dir,
         ])
@@ -129,6 +130,20 @@ fn migrate_library_db(conn: &Connection) -> Result<(), String> {
       created_at TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       UNIQUE(book_id, page_number),
+      FOREIGN KEY(book_id) REFERENCES old_book_records(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS old_book_snapshot_jobs (
+      id TEXT PRIMARY KEY,
+      book_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      current_page INTEGER NOT NULL,
+      total_pages INTEGER NOT NULL,
+      phase TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
       FOREIGN KEY(book_id) REFERENCES old_book_records(id) ON DELETE CASCADE
     );
 
@@ -259,6 +274,12 @@ struct StoredPdfAsset {
     file_path: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredFileAsset {
+    data_url: String,
+}
+
 fn json_string_field(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -305,6 +326,7 @@ fn sync_old_book_detail_tables(
 ) -> Result<(), String> {
     for table in [
         "old_book_page_snapshots",
+        "old_book_snapshot_jobs",
         "old_book_translations",
         "old_book_translation_memory",
         "old_book_translation_jobs",
@@ -376,6 +398,38 @@ fn sync_old_book_detail_tables(
             ],
         )
         .map_err(|e| format!("insert translation: {}", e))?;
+    }
+
+    for (index, job) in json_array_field(payload, "snapshotJobs")
+        .into_iter()
+        .enumerate()
+    {
+        let id = json_string_field(job, "id");
+        let id = if id.is_empty() {
+            format!("{}-snapshot-job-{}", book_id, index + 1)
+        } else {
+            id
+        };
+        let payload_json =
+            serde_json::to_string(job).map_err(|e| format!("snapshot job json: {}", e))?;
+        tx.execute(
+      "INSERT INTO old_book_snapshot_jobs
+        (id, book_id, kind, status, current_page, total_pages, phase, started_at, updated_at, payload_json)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+      params![
+        id,
+        book_id,
+        json_string_field(job, "kind"),
+        json_string_field(job, "status"),
+        json_i64_field(job, "currentPage"),
+        json_i64_field(job, "totalPages"),
+        json_string_field(job, "phase"),
+        json_string_field(job, "startedAt"),
+        json_string_field(job, "updatedAt"),
+        payload_json,
+      ],
+    )
+    .map_err(|e| format!("insert snapshot job: {}", e))?;
     }
 
     for (index, entry) in json_array_field(payload, "translationMemory")
@@ -601,6 +655,30 @@ fn old_book_sqlite_get_pdf_asset(pdf_blob_id: String) -> Result<Option<StoredPdf
         size_bytes: size_bytes.max(0) as u64,
         file_path,
     }))
+}
+
+#[tauri::command]
+fn old_book_sqlite_get_file_data_url(file_path: String) -> Result<StoredFileAsset, String> {
+    let path = PathBuf::from(&file_path);
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    };
+    let bytes = fs::read(&path).map_err(|e| format!("read asset file: {}", e))?;
+
+    Ok(StoredFileAsset {
+        data_url: format!(
+            "data:{};base64,{}",
+            mime_type,
+            general_purpose::STANDARD.encode(bytes)
+        ),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
