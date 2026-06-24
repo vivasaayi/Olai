@@ -864,6 +864,234 @@ function replaceTranslationRecord(translations: OldBookRecord['translations'], t
   ]
 }
 
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+function slugifyFileName(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    || 'bookforge-export'
+}
+
+function getPageTranslation(
+  book: OldBookRecord,
+  pageNumber: number,
+  complexity: TranslationComplexity,
+  language: TranslationLanguage,
+) {
+  return book.translations.find((translation) =>
+    translation.pageNumber === pageNumber
+    && translation.complexity === complexity
+    && translation.language === language
+  )
+}
+
+function renderExportParagraphs(paragraphs: string[] | undefined) {
+  if (!paragraphs?.length) return '<p class="missing">Not exported yet.</p>'
+  return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('\n')
+}
+
+function renderExportSourceLines(sourceLines: string[] | undefined) {
+  if (!sourceLines?.length) return '<p class="missing">No German extraction stored.</p>'
+  return `<ol>${sourceLines.map((line) => `<li>${escapeHtml(line)}</li>`).join('\n')}</ol>`
+}
+
+function renderExportVocabulary(glossary: TranslationGlossaryEntry[] | undefined) {
+  if (!glossary?.length) return ''
+  return `
+    <section class="vocabulary">
+      <h4>Vocabulary</h4>
+      <dl>
+        ${glossary.map((entry) => `
+          <div>
+            <dt>${escapeHtml(entry.sourceTerm)}${entry.translatedTerm ? ` <span>${escapeHtml(entry.translatedTerm)}</span>` : ''}</dt>
+            ${entry.explanation ? `<dd>${escapeHtml(entry.explanation)}</dd>` : ''}
+          </div>
+        `).join('\n')}
+      </dl>
+    </section>
+  `
+}
+
+function renderExportSnapshotImage(pageNumber: number, snapshotImages: Map<number, string>) {
+  const imageDataUrl = snapshotImages.get(pageNumber)
+  if (!imageDataUrl) return '<p class="missing">No page image snapshot stored.</p>'
+  return `
+    <figure class="page-image">
+      <img src="${escapeHtml(imageDataUrl)}" alt="Snapshot of page ${pageNumber}" />
+      <figcaption>Page ${pageNumber} image</figcaption>
+    </figure>
+  `
+}
+
+function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Map<number, string>()) {
+  const versionTabs: { id: string, label: string, complexity?: TranslationComplexity }[] = [
+    { id: 'german', label: 'German' },
+    { id: 'faithful', label: 'Good Faith English', complexity: 'original' },
+    { id: 'simplified', label: 'Simplified English', complexity: 'simplified' },
+    { id: 'kid', label: 'Kid-Friendly English', complexity: 'kid-friendly' },
+    { id: 'school', label: 'School-Friendly English', complexity: 'high-school' },
+    { id: 'college', label: 'College English', complexity: 'college' },
+  ]
+  const exportTabs = [{ id: 'all', label: 'All Versions' }, ...versionTabs]
+  const pageNumbers = Array.from(
+    new Set(book.translations.map((translation) => translation.pageNumber)),
+  ).sort((left, right) => left - right)
+  const exportedAt = new Date().toLocaleString()
+  const renderGermanPage = (pageNumber: number) => {
+    const original = getPageTranslation(book, pageNumber, 'original', 'en')
+    return `
+      <article class="book-page" id="german-page-${pageNumber}">
+        <h2>Page ${pageNumber}</h2>
+        <div class="german-spotcheck-grid">
+          <section>
+            <h3>Page Image</h3>
+            ${renderExportSnapshotImage(pageNumber, snapshotImages)}
+          </section>
+          <section>
+            <h3>German Extraction</h3>
+            ${renderExportSourceLines(original?.sourceLines)}
+          </section>
+        </div>
+        ${renderExportVocabulary(original?.glossary)}
+      </article>
+    `
+  }
+  const renderVersionPage = (pageNumber: number, tab: typeof versionTabs[number]) => {
+    const translation = tab.complexity ? getPageTranslation(book, pageNumber, tab.complexity, 'en') : undefined
+    return `
+      <article class="book-page" id="${tab.id}-page-${pageNumber}">
+        <h2>Page ${pageNumber}</h2>
+        <h3>${escapeHtml(tab.label)}</h3>
+        ${renderExportParagraphs(translation?.paragraphs)}
+        ${renderExportVocabulary(translation?.glossary)}
+      </article>
+    `
+  }
+  const renderAllPage = (pageNumber: number) => `
+    <article class="book-page all-page" id="page-${pageNumber}">
+      <h2>Page ${pageNumber}</h2>
+      <div class="german-spotcheck-grid">
+        <section>
+          <h3>Page Image</h3>
+          ${renderExportSnapshotImage(pageNumber, snapshotImages)}
+        </section>
+        <section>
+          <h3>German Extraction</h3>
+          ${renderExportSourceLines(getPageTranslation(book, pageNumber, 'original', 'en')?.sourceLines)}
+        </section>
+      </div>
+      ${versionTabs.filter((tab) => tab.id !== 'german').map((tab) => `
+        <section class="all-version-block">
+          <h3>${escapeHtml(tab.label)}</h3>
+          ${renderExportParagraphs(tab.complexity ? getPageTranslation(book, pageNumber, tab.complexity, 'en')?.paragraphs : undefined)}
+        </section>
+      `).join('\n')}
+    </article>
+  `
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(book.title)} - BookForge Export</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f6f7f9; }
+    body { margin: 0; }
+    main { max-width: 980px; margin: 0 auto; padding: 32px 24px 72px; background: #fff; min-height: 100vh; }
+    header.book-header { border-bottom: 2px solid #172033; padding-bottom: 20px; margin-bottom: 24px; }
+    h1 { margin: 0 0 8px; font-size: 2rem; line-height: 1.15; }
+    .meta { color: #667085; margin: 0; }
+    .tabs { position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; overflow-x: auto; border-bottom: 1px solid #d8dee6; padding: 12px 0; background: #fff; }
+    .tab-button { flex: 0 0 auto; border: 1px solid #d8dee6; border-radius: 8px; padding: 10px 14px; background: #f8fafc; color: #344054; cursor: pointer; font: inherit; font-weight: 750; }
+    .tab-button.active { border-color: #16816f; background: #eef6f4; color: #145d52; }
+    .tab-panel { display: none; padding-top: 24px; }
+    .tab-panel.active { display: block; }
+    .book-page { border-top: 1px solid #d8dee6; padding-top: 28px; margin-top: 32px; }
+    .book-page:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+    .all-version-block { margin-top: 22px; }
+    .german-spotcheck-grid { display: grid; grid-template-columns: minmax(280px, 0.95fr) minmax(280px, 1.05fr); gap: 24px; align-items: start; }
+    h2 { margin: 0 0 16px; font-size: 1.45rem; }
+    h3 { margin: 22px 0 10px; font-size: 1.05rem; color: #145d52; }
+    h4 { margin: 16px 0 8px; font-size: 0.9rem; color: #475467; }
+    p, li, dd { font-size: 0.98rem; line-height: 1.65; }
+    ol { padding-left: 1.35rem; }
+    .missing { color: #98a2b3; font-style: italic; }
+    .page-image { margin: 0 0 22px; border: 1px solid #d8dee6; border-radius: 8px; overflow: hidden; background: #f8fafc; }
+    .page-image img { display: block; width: 100%; max-height: 82vh; object-fit: contain; background: #26323d; }
+    .page-image figcaption { padding: 8px 10px; color: #667085; font-size: 0.82rem; }
+    .vocabulary { border-left: 3px solid #16816f; margin-top: 12px; padding-left: 12px; }
+    dl { margin: 0; }
+    dt { font-weight: 750; }
+    dt span { color: #145d52; margin-left: 8px; }
+    dd { margin: 2px 0 10px; color: #475467; }
+    @media print {
+      body { background: #fff; }
+      main { max-width: none; padding: 0; }
+      .tabs { display: none; }
+      .tab-panel { display: none; }
+      .tab-panel.active { display: block; }
+      .german-spotcheck-grid { grid-template-columns: 1fr 1fr; gap: 18px; }
+      .book-page { break-before: page; }
+    }
+    @media (max-width: 820px) { .german-spotcheck-grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="book-header">
+      <h1>${escapeHtml(book.title)}</h1>
+      <p class="meta">${escapeHtml(book.author || 'Unknown author')} · ${escapeHtml(book.dateLabel || 'Unknown date')} · Exported ${escapeHtml(exportedAt)}</p>
+    </header>
+    <nav class="tabs" aria-label="Book versions">
+      ${exportTabs.map((tab, index) => `<button class="tab-button${index === 0 ? ' active' : ''}" data-tab-target="${tab.id}" type="button">${escapeHtml(tab.label)}</button>`).join('\n')}
+    </nav>
+    <section class="tab-panel active" data-tab="all">
+      ${pageNumbers.length ? pageNumbers.map(renderAllPage).join('\n') : '<p class="missing">No translated pages stored yet.</p>'}
+    </section>
+    <section class="tab-panel" data-tab="german">
+      ${pageNumbers.length ? pageNumbers.map(renderGermanPage).join('\n') : '<p class="missing">No German extraction stored yet.</p>'}
+    </section>
+    ${versionTabs.filter((tab) => tab.id !== 'german').map((tab) => `
+      <section class="tab-panel" data-tab="${tab.id}">
+        ${pageNumbers.length ? pageNumbers.map((pageNumber) => renderVersionPage(pageNumber, tab)).join('\n') : '<p class="missing">No translated pages stored yet.</p>'}
+      </section>
+    `).join('\n')}
+  </main>
+  <script>
+    (() => {
+      let activeTab = 'all'
+      const update = () => {
+        document.querySelectorAll('.tab-button').forEach((button) => {
+          button.classList.toggle('active', button.dataset.tabTarget === activeTab)
+        })
+        document.querySelectorAll('.tab-panel').forEach((panel) => {
+          panel.classList.toggle('active', panel.dataset.tab === activeTab)
+        })
+      }
+      document.querySelectorAll('.tab-button').forEach((button) => {
+        button.addEventListener('click', () => {
+          activeTab = button.dataset.tabTarget || activeTab
+          update()
+          window.scrollTo({ top: 0, behavior: 'smooth' })
+        })
+      })
+      update()
+    })()
+  </script>
+</body>
+</html>`
+}
+
 function yieldToBrowser() {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, 0)
@@ -2171,6 +2399,59 @@ function TranslationWorkspace() {
     setOldBookStatus(`${approved ? 'Approved' : 'Unapproved'} term: ${nextEntry.translatedTerm || nextEntry.sourceTerm}.`)
   }
 
+  async function buildExportSnapshotImages(bookForExport: OldBookRecord) {
+    const snapshotImages = new Map<number, string>()
+
+    await Promise.all(bookForExport.pageSnapshots.map(async (snapshot) => {
+      if (snapshot.imageDataUrl) {
+        snapshotImages.set(snapshot.pageNumber, snapshot.imageDataUrl)
+        return
+      }
+
+      if (!snapshot.filePath) return
+
+      try {
+        snapshotImages.set(snapshot.pageNumber, await getOldBookFileDataUrl(snapshot.filePath))
+      } catch {
+        // Keep the export usable even if a stale snapshot record points to a missing file.
+      }
+    }))
+
+    return snapshotImages
+  }
+
+  async function exportActiveBookAsHtml() {
+    if (!activeBook) return
+    setOldBookStatus('Preparing HTML export...')
+    const snapshotImages = await buildExportSnapshotImages(activeBook)
+    const html = buildEnglishBookExportHtml(activeBook, snapshotImages)
+    const fileName = `${slugifyFileName(activeBook.title)}-english-book.html`
+
+    invoke('export_old_book_html', {
+      bookId: activeBook.id,
+      fileName,
+      html,
+      reveal: true,
+    })
+      .then((filePath) => {
+        setOldBookStatus(`Exported and revealed: ${filePath}`)
+      })
+      .catch((error) => {
+        if (!isTauriUnavailable(error)) {
+          setOldBookStatus(error instanceof Error ? error.message : String(error))
+          return
+        }
+
+        const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
+        const link = document.createElement('a')
+        link.href = URL.createObjectURL(blob)
+        link.download = fileName
+        link.click()
+        URL.revokeObjectURL(link.href)
+        setOldBookStatus('Exported through the browser download folder.')
+      })
+  }
+
   function selectOldBook(bookId: string) {
     const selectedBook = oldBooks.find((entry) => entry.id === bookId)
     if (!selectedBook) return
@@ -2358,6 +2639,14 @@ function TranslationWorkspace() {
               type="button"
             >
               Memory
+            </button>
+            <button
+              className="button secondary"
+              onClick={exportActiveBookAsHtml}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              Export
             </button>
             <button
               className="button secondary"

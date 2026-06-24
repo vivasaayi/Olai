@@ -20,6 +20,7 @@ pub fn run() {
             old_book_sqlite_get_file_data_url,
             save_old_book_snapshot,
             old_book_snapshot_dir,
+            export_old_book_html,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -260,6 +261,59 @@ fn save_old_book_snapshot(
     let mut file_path = dir;
     file_path.push(format!("page-{:04}.{}", page_number, extension));
     fs::write(&file_path, bytes).map_err(|e| format!("write snapshot file: {}", e))?;
+
+    Ok(file_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn export_old_book_html(
+    book_id: String,
+    file_name: String,
+    html: String,
+    reveal: bool,
+) -> Result<String, String> {
+    let mut dir = old_book_book_dir(&book_id)?;
+    dir.push("exports");
+    fs::create_dir_all(&dir).map_err(|e| format!("create export dir: {}", e))?;
+
+    let safe_name = safe_path_segment(&file_name);
+    let mut file_path = dir;
+    file_path.push(if safe_name.ends_with(".html") {
+        safe_name
+    } else {
+        format!("{}.html", safe_name)
+    });
+    fs::write(&file_path, html).map_err(|e| format!("write export file: {}", e))?;
+
+    if reveal {
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open")
+                .arg("-R")
+                .arg(&file_path)
+                .spawn()
+                .map_err(|e| format!("reveal export in Finder: {}", e))?;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            Command::new("explorer")
+                .arg("/select,")
+                .arg(&file_path)
+                .spawn()
+                .map_err(|e| format!("reveal export in Explorer: {}", e))?;
+        }
+
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            if let Some(parent) = file_path.parent() {
+                Command::new("xdg-open")
+                    .arg(parent)
+                    .spawn()
+                    .map_err(|e| format!("open export folder: {}", e))?;
+            }
+        }
+    }
 
     Ok(file_path.to_string_lossy().into_owned())
 }
