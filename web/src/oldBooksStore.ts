@@ -545,8 +545,7 @@ class TauriSqliteOldBookRepository extends BaseOldBookRepository {
 
   async listBooks() {
     const records = (await invoke('old_book_sqlite_list_records')) as string[]
-    const books = records.map((record) => normalizeOldBookRecord(JSON.parse(record) as OldBookRecord))
-    return Promise.all(books.map((book) => this.hydrateSnapshotImages(book)))
+    return records.map((record) => normalizeOldBookRecord(JSON.parse(record) as OldBookRecord))
   }
 
   async saveBookRecord(book: OldBookRecord) {
@@ -576,26 +575,6 @@ class TauriSqliteOldBookRepository extends BaseOldBookRepository {
     return asset ? base64ToBlob(asset.base64, asset.mimeType) : null
   }
 
-  private async hydrateSnapshotImages(book: OldBookRecord): Promise<OldBookRecord> {
-    const pageSnapshots = []
-    for (const snapshot of book.pageSnapshots) {
-      if (snapshot.imageDataUrl || !snapshot.filePath) {
-        pageSnapshots.push(snapshot)
-        continue
-      }
-
-      try {
-        const asset = (await invoke('old_book_sqlite_get_file_data_url', {
-          filePath: snapshot.filePath,
-        })) as StoredFileAsset
-        pageSnapshots.push({ ...snapshot, imageDataUrl: asset.dataUrl })
-      } catch {
-        pageSnapshots.push(snapshot)
-      }
-    }
-
-    return { ...book, pageSnapshots }
-  }
 }
 
 function prepareBookForTauriSqliteStorage(book: OldBookRecord): OldBookRecord {
@@ -693,6 +672,11 @@ export async function saveOldBookPdfBlob(pdfBlobId: string, blob: Blob, fileName
 
 export async function getOldBookPdfBlob(pdfBlobId: string) {
   return (await getOldBookRepository()).getPdfAsset(pdfBlobId)
+}
+
+export async function getOldBookFileDataUrl(filePath: string) {
+  const asset = (await invoke('old_book_sqlite_get_file_data_url', { filePath })) as StoredFileAsset
+  return asset.dataUrl
 }
 
 export function createImportedOldBook(file: File): OldBookRecord {

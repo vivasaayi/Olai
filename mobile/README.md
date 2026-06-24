@@ -161,6 +161,7 @@ The mobile Assist screen calls `http://100.66.32.111:1235/v1/models`, but only e
 - `google/gemma-4-12b-qat` through local LM Studio
 - `deepseek-v4-flash` through DeepSeek
 - `gpt-5.4-nano` through OpenAI
+- `gpt-5.4-mini` through OpenAI
 
 The selected model is sent in each `/chat/completions` request. The router then forwards to the right upstream provider. The router also registers `deepseek-v4-pro` for non-mobile callers.
 

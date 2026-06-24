@@ -47,6 +47,15 @@ type VisionAnswerRequest = {
   signal?: AbortSignal
 }
 
+type TranslationMemoryReviewRequest = {
+  endpoint: string
+  model: string
+  bookTitle: string
+  newTerms: TranslationGlossaryEntry[]
+  existingTerms?: TranslationGlossaryEntry[]
+  signal?: AbortSignal
+}
+
 export type VisionTranslationResult = {
   sectionTitle: string
   sourceLines: string[]
@@ -59,6 +68,10 @@ export type VisionTranslationResult = {
 export type VisionAnswerResult = {
   answer: string
   citedSourceLines: string[]
+}
+
+export type TranslationMemoryReviewResult = {
+  glossary: TranslationGlossaryEntry[]
 }
 
 export type LocalVisionModel = {
@@ -291,12 +304,14 @@ export async function requestVisionTranslation({
             'First create a corrected source-language transcription from the page image. Then create a dense, source-faithful Original English pass.',
             'Preserve sentence order, technical meaning, historical nuance, and continuity with the previous page.',
             'Fully translate source-language terms in the translation body. Keep original terms only in the glossary.',
+            'Return a page-local glossary of important vocabulary and concepts. These entries explain this page to the reader; they are not global memory instructions.',
             'Break long nested sentences into clearer English only when needed, without dropping meaning.',
             'Return compact JSON only. Do not include markdown.',
           ].join(' ')
           : [
             'You are a careful translator of public-domain historical book page images.',
             'First OCR the visible source text. Then translate meaning into natural, readable language for the requested audience.',
+            'Return a page-local glossary of important vocabulary and concepts. Tune explanations to the requested complexity and output language.',
             'Do not preserve broken OCR word order. Do not summarize unless the text is unreadable. Return compact JSON only. Do not include markdown.',
           ].join(' '),
       },
@@ -325,10 +340,12 @@ export async function requestVisionTranslation({
               isOriginalPass
                 ? 'Return sourceLines as corrected source-language transcription lines, not English. Extract important old terms, technical concepts, and recurring phrases into glossary. Use translated terms consistently with prior glossary.'
                 : 'For the translation, preserve the author’s meaning but rewrite into natural modern sentences for the chosen complexity.',
+              'Glossary requirements: include 5-12 page-local vocabulary entries when available. For Kid Friendly, explain terms simply. For Simplified English, use plain explanations. For High School, include key technical terms. For College, include precise historical or technical nuance. Put explanations in the requested output language where possible.',
+              'Notes requirements: include short page-specific translator notes for ambiguity, historical context, OCR uncertainty, or important conceptual framing.',
               !isOriginalPass && language === 'en'
                 ? 'If the requested language is English, produce polished English rather than a word-by-word gloss.'
                 : '',
-              'Return JSON only with this shape: {"sectionTitle":"Short section title","sourceLines":["OCR line"],"paragraphs":["Translated paragraph"],"glossary":[{"sourceTerm":"term","translatedTerm":"translation","explanation":"meaning"}],"notes":["translator note"],"ocrConfidence":0.0}.',
+              'Return JSON only with this shape: {"sectionTitle":"Short section title","sourceLines":["OCR line"],"paragraphs":["Translated paragraph"],"glossary":[{"sourceTerm":"term or phrase from the page","translatedTerm":"reader-facing translation or label","explanation":"complexity-appropriate explanation"}],"notes":["page-specific translator note"],"ocrConfidence":0.0}.',
             ].filter(Boolean).join('\n'),
           },
           {
@@ -370,6 +387,7 @@ export async function requestTextTranslation({
           'You rewrite canonical historical translations for a chosen audience and language.',
           'Use the provided Original English as the source of truth. Do not reinterpret from OCR unless source lines clarify a term.',
           'Preserve technical meaning, continuity, and glossary term choices across pages.',
+          'Return a page-local glossary of important vocabulary and concepts. Tune explanations to the requested complexity and output language.',
           'Return compact JSON only. Do not include markdown.',
         ].join(' '),
       },
@@ -392,7 +410,9 @@ export async function requestTextTranslation({
             : '',
           `Original English source:\n${originalParagraphs.join('\n\n')}`,
           'For Kid Friendly: explain clearly without childish tone. For Simplified English: use plain modern prose. For High School: preserve more terminology. For College: preserve technical density and historical nuance.',
-          'Return JSON only with this shape: {"sectionTitle":"Short section title","sourceLines":["source line"],"paragraphs":["Translated paragraph"],"glossary":[{"sourceTerm":"term","translatedTerm":"translation","explanation":"meaning"}],"notes":["translator note"],"ocrConfidence":1.0}.',
+          'Glossary requirements: include 5-12 page-local vocabulary entries when available. For Kid Friendly, explain terms simply. For Simplified English, use plain explanations. For High School, include key technical terms. For College, include precise historical or technical nuance. Put explanations in the requested output language where possible.',
+          'Notes requirements: include short page-specific translator notes for ambiguity, historical context, OCR uncertainty, or important conceptual framing.',
+          'Return JSON only with this shape: {"sectionTitle":"Short section title","sourceLines":["source line"],"paragraphs":["Translated paragraph"],"glossary":[{"sourceTerm":"term or phrase from the page","translatedTerm":"reader-facing translation or label","explanation":"complexity-appropriate explanation"}],"notes":["page-specific translator note"],"ocrConfidence":1.0}.',
         ].filter(Boolean).join('\n'),
       },
     ],
@@ -449,4 +469,50 @@ export async function requestVisionAnswer({
   }, signal)
 
   return normalizeVisionAnswer(content)
+}
+
+export async function requestTranslationMemoryReview({
+  endpoint,
+  model,
+  bookTitle,
+  newTerms,
+  existingTerms = [],
+  signal,
+}: TranslationMemoryReviewRequest): Promise<TranslationMemoryReviewResult> {
+  if (!newTerms.length) return { glossary: [] }
+
+  const content = await sendVisionChat(endpoint, {
+    model: model.trim() || 'default',
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'You are maintaining a concise book-level translation glossary for a historical text.',
+          'Review new page-local glossary entries and return only terms that should be reused across pages.',
+          'Prefer stable names, places, repeated technical terms, archaic words, and special phrases.',
+          'Merge duplicates, resolve near-duplicates, and keep preferred translations consistent with existing approved memory.',
+          'Do not include generic one-off words. Return compact JSON only. Do not include markdown.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `Book: ${bookTitle}`,
+          existingTerms.length
+            ? `Existing approved book glossary:\n${existingTerms.map((entry) => `${entry.sourceTerm} => ${entry.translatedTerm}: ${entry.explanation}`).join('\n')}`
+            : '',
+          `New page glossary candidates:\n${newTerms.map((entry) => `${entry.sourceTerm} => ${entry.translatedTerm}: ${entry.explanation}`).join('\n')}`,
+          'Return JSON only with this shape: {"glossary":[{"sourceTerm":"canonical source term","translatedTerm":"preferred translation","explanation":"short reusable explanation"}]}.',
+        ].filter(Boolean).join('\n\n'),
+      },
+    ],
+    temperature: 0.05,
+  }, signal)
+
+  try {
+    const payload = asRecord(parseJsonish(content))
+    return { glossary: normalizeGlossary(payload.glossary) }
+  } catch {
+    return { glossary: normalizeGlossary(newTerms) }
+  }
 }

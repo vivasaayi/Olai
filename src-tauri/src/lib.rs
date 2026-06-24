@@ -635,7 +635,40 @@ fn old_book_sqlite_get_pdf_asset(pdf_blob_id: String) -> Result<Option<StoredPdf
         .next()
         .map_err(|e| format!("read PDF asset row: {}", e))?
     else {
-        return Ok(None);
+        let mut fallback_stmt = conn
+            .prepare("SELECT payload_json FROM old_book_records WHERE json_extract(payload_json, '$.pdfBlobId') = ?1 LIMIT 1")
+            .map_err(|e| format!("prepare PDF payload fallback: {}", e))?;
+        let mut fallback_rows = fallback_stmt
+            .query(params![pdf_blob_id])
+            .map_err(|e| format!("query PDF payload fallback: {}", e))?;
+        let Some(fallback_row) = fallback_rows
+            .next()
+            .map_err(|e| format!("read PDF payload fallback row: {}", e))?
+        else {
+            return Ok(None);
+        };
+        let payload_json: String = fallback_row
+            .get(0)
+            .map_err(|e| format!("read PDF payload json: {}", e))?;
+        let payload: Value = serde_json::from_str(&payload_json)
+            .map_err(|e| format!("parse PDF payload json: {}", e))?;
+        let file_path = json_string_field(&payload, "pdfFilePath");
+        if file_path.is_empty() {
+            return Ok(None);
+        }
+        let file_name = json_string_field(&payload, "pdfFileName");
+        let bytes = fs::read(&file_path).map_err(|e| format!("read PDF file: {}", e))?;
+        return Ok(Some(StoredPdfAsset {
+            base64: general_purpose::STANDARD.encode(&bytes),
+            file_name: if file_name.is_empty() {
+                "original.pdf".into()
+            } else {
+                file_name
+            },
+            mime_type: "application/pdf".into(),
+            size_bytes: bytes.len() as u64,
+            file_path,
+        }));
     };
 
     let file_name: String = row

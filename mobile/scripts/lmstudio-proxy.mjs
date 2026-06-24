@@ -161,6 +161,11 @@ function builtInModels() {
       label: "GPT 5.4 Nano",
     },
     {
+      id: "gpt-5.4-mini",
+      provider: "openai",
+      label: "GPT 5.4 Mini",
+    },
+    {
       id: "deepseek-v4-pro",
       provider: "deepseek",
       label: "DeepSeek V4 Pro",

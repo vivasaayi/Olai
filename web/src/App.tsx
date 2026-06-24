@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent } from 'react'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import './App.css'
 import antiqueFolioUrl from './assets/mock-antique-folio.png'
 import {
@@ -8,6 +8,7 @@ import {
   createQuestionRecord,
   createTranslationRecord,
   getDemoTranslationParagraphs,
+  getOldBookFileDataUrl,
   getOldBookPdfBlob,
   importOldBookPdf,
   languageOptions,
@@ -18,6 +19,7 @@ import {
   type OldBookRecord,
   type QuestionRecord,
   type SnapshotJobState,
+  type PageSnapshotRecord,
   type TranslationComplexity,
   type TranslationGlossaryEntry,
   type TranslationJobState,
@@ -27,12 +29,13 @@ import {
 import {
   listVisionModels,
   requestTextTranslation,
+  requestTranslationMemoryReview,
   requestVisionAnswer,
   requestVisionTranslation,
   type LocalVisionModel,
   type VisionTranslationResult,
 } from './localVision'
-import { getPdfPageCount, renderPdfPageSnapshot, renderPdfPageSnapshotsStream, type RenderedPdfSnapshot } from './pdfPageSnapshot'
+import { getPdfPageCount, renderPdfPageSnapshot, renderPdfPageSnapshotsParallelStream, type RenderedPdfSnapshot } from './pdfPageSnapshot'
 import type { Book, NodePersona, OutlineNode, OutlineNodeType, Resource, ResourceType } from './types'
 
 type LibraryEntry = {
@@ -88,10 +91,12 @@ const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'down
 const personas: NodePersona[] = ['default', 'kids', 'beginner', 'formal', 'college']
 const llmRouterEndpoint = '/api/llm-router/v1'
 const llmRouterModel = 'gpt-5.4-nano'
+const llmRouterSourceModel = 'gpt-5.4-mini'
 const legacyRouterEndpoint = 'http://localhost:1235'
 const legacyRouterModel = 'gpt-5.4-nano'
 const defaultRouterEndpoint = llmRouterEndpoint
 const defaultRouterModel = llmRouterModel
+const defaultSourceExtractionModel = llmRouterSourceModel
 
 const createId = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -293,6 +298,17 @@ function formatDate(value: string | undefined) {
 function isTauriUnavailable(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
   return message.includes('reading \'invoke\'') || message.includes('__TAURI__') || message.includes('not a function')
+}
+
+function getSnapshotImageSrc(snapshot: PageSnapshotRecord | undefined) {
+  if (!snapshot) return ''
+  if (snapshot.imageDataUrl) return snapshot.imageDataUrl
+  if (!snapshot.filePath) return ''
+  try {
+    return convertFileSrc(snapshot.filePath)
+  } catch {
+    return ''
+  }
 }
 
 function routerCompletionsUrl(endpoint: string) {
@@ -640,6 +656,44 @@ function getTranslatedPageCount(
   ).size
 }
 
+function parsePageSelection(selection: string, totalPages: number) {
+  const normalizedSelection = selection.trim().toLowerCase()
+  if (!normalizedSelection || normalizedSelection === 'all') {
+    return Array.from({ length: totalPages }, (_, index) => index + 1)
+  }
+
+  const pages = new Set<number>()
+  const tokens = normalizedSelection.split(/[\s,]+/).filter(Boolean)
+
+  for (const token of tokens) {
+    const rangeMatch = token.match(/^(\d+)-(\d+)$/)
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1])
+      const end = Number(rangeMatch[2])
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > totalPages) {
+        throw new Error(`Invalid page range "${token}".`)
+      }
+      for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+        pages.add(pageNumber)
+      }
+      continue
+    }
+
+    const pageNumber = Number(token)
+    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > totalPages) {
+      throw new Error(`Invalid page "${token}".`)
+    }
+    pages.add(pageNumber)
+  }
+
+  return [...pages].sort((left, right) => left - right)
+}
+
+function isAllPagesSelection(selection: string) {
+  const normalizedSelection = selection.trim().toLowerCase()
+  return !normalizedSelection || normalizedSelection === 'all'
+}
+
 function getCanonicalOriginalTranslation(book: OldBookRecord | undefined, pageNumber = book?.pageNumber) {
   if (!book || !pageNumber) return undefined
   return book.translations.find((translation) =>
@@ -743,6 +797,52 @@ function mergeTranslationMemorySuggestions(
   return additions.length ? [...memory, ...additions] : memory
 }
 
+function mergeApprovedTranslationMemory(
+  memory: TranslationMemoryEntry[] = [],
+  glossary: TranslationGlossaryEntry[] = [],
+) {
+  const now = new Date().toISOString()
+  const existingByKey = new Map(memory.map((entry) => [glossaryKey(entry.sourceTerm, entry.translatedTerm), entry]))
+  const nextMemory = [...memory]
+
+  for (const entry of glossary) {
+    const sourceTerm = entry.sourceTerm.trim()
+    const translatedTerm = entry.translatedTerm.trim()
+    if (!sourceTerm && !translatedTerm) continue
+
+    const key = glossaryKey(sourceTerm, translatedTerm)
+    const existing = existingByKey.get(key)
+    const reviewedEntry: TranslationMemoryEntry = existing
+      ? {
+        ...existing,
+        sourceTerm,
+        translatedTerm,
+        explanation: entry.explanation.trim() || existing.explanation,
+        approved: true,
+        updatedAt: now,
+      }
+      : {
+        id: createId(),
+        sourceTerm,
+        translatedTerm,
+        explanation: entry.explanation.trim(),
+        approved: true,
+        createdAt: now,
+        updatedAt: now,
+      }
+
+    if (existing) {
+      const index = nextMemory.findIndex((memoryEntry) => memoryEntry.id === existing.id)
+      if (index >= 0) nextMemory[index] = reviewedEntry
+    } else {
+      nextMemory.push(reviewedEntry)
+    }
+    existingByKey.set(key, reviewedEntry)
+  }
+
+  return nextMemory
+}
+
 function getTranslationMemoryRows(book: OldBookRecord | undefined): TranslationMemoryEntry[] {
   if (!book) return []
   return mergeTranslationMemorySuggestions(
@@ -773,6 +873,7 @@ function yieldToBrowser() {
 function TranslationWorkspace() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const translationAbortRef = useRef<AbortController | null>(null)
+  const pagePersistTimerRef = useRef<number | null>(null)
   const [oldBooks, setOldBooks] = useState<OldBookRecord[]>(() => mergeOldBookRecords([]))
   const [activeBookId, setActiveBookId] = useState('')
   const [complexity, setComplexity] = useState<TranslationComplexity>('kid-friendly')
@@ -786,6 +887,7 @@ function TranslationWorkspace() {
   const [latestAnswer, setLatestAnswer] = useState<QuestionRecord | null>(null)
   const [visionEndpoint, setVisionEndpoint] = useState(defaultRouterEndpoint)
   const [visionModel, setVisionModel] = useState(defaultRouterModel)
+  const [sourceExtractionModel, setSourceExtractionModel] = useState(defaultSourceExtractionModel)
   const [availableVisionModels, setAvailableVisionModels] = useState<LocalVisionModel[]>([])
   const [visionModelsLoading, setVisionModelsLoading] = useState(false)
   const [visionModelsStatus, setVisionModelsStatus] = useState('')
@@ -795,6 +897,7 @@ function TranslationWorkspace() {
   const [memoryOpen, setMemoryOpen] = useState(false)
   const [sourceInspectorOpen, setSourceInspectorOpen] = useState(false)
   const [forceRetranslate, setForceRetranslate] = useState(false)
+  const [translationPageSelection, setTranslationPageSelection] = useState('all')
   const [activeTranslationJob, setActiveTranslationJob] = useState<TranslationJobState | null>(null)
   const [activeSnapshotJob, setActiveSnapshotJob] = useState<SnapshotJobState | null>(null)
   const [snapshotProgress, setSnapshotProgress] = useState<SnapshotProgressState | null>(null)
@@ -807,6 +910,11 @@ function TranslationWorkspace() {
     ? availableVisionModels
     : visionModel
       ? [{ id: visionModel }, ...availableVisionModels]
+      : availableVisionModels
+  const sourceExtractionModelOptions = availableVisionModels.some((entry) => entry.id === sourceExtractionModel)
+    ? availableVisionModels
+    : sourceExtractionModel
+      ? [{ id: sourceExtractionModel }, ...availableVisionModels]
       : availableVisionModels
   const activeTranslation = activeBook ? getStoredTranslation(activeBook, complexity, translationLanguage, activeSection) : undefined
   const canonicalOriginalTranslation = getCanonicalOriginalTranslation(activeBook)
@@ -880,7 +988,11 @@ function TranslationWorkspace() {
     ? Math.min(100, Math.max(0, Math.round((snapshotProgress.current / snapshotProgress.total) * 100)))
     : 0
 
-  async function refreshVisionModels(endpointOverride = visionEndpoint, preferredModel = visionModel) {
+  async function refreshVisionModels(
+    endpointOverride = visionEndpoint,
+    preferredModel = visionModel,
+    preferredSourceModel = sourceExtractionModel,
+  ) {
     setVisionModelsLoading(true)
     setVisionModelsStatus('Loading router models...')
     try {
@@ -889,6 +1001,9 @@ function TranslationWorkspace() {
       setAvailableVisionModels(models)
       if (modelIds.length && !modelIds.includes(preferredModel)) {
         setVisionModel(modelIds.includes(llmRouterModel) ? llmRouterModel : modelIds[0])
+      }
+      if (modelIds.length && !modelIds.includes(preferredSourceModel)) {
+        setSourceExtractionModel(modelIds.includes(llmRouterSourceModel) ? llmRouterSourceModel : modelIds[0])
       }
       setVisionModelsStatus(models.length ? `${models.length} router models available.` : 'No models returned by this endpoint.')
     } catch (error) {
@@ -906,9 +1021,11 @@ function TranslationWorkspace() {
       ? llmRouterEndpoint
       : visionEndpoint
     const migratedModel = visionModel === legacyRouterModel ? llmRouterModel : visionModel
+    const migratedSourceModel = sourceExtractionModel === legacyRouterModel ? llmRouterSourceModel : sourceExtractionModel
     if (migratedEndpoint !== visionEndpoint) setVisionEndpoint(migratedEndpoint)
     if (migratedModel !== visionModel) setVisionModel(migratedModel)
-    void refreshVisionModels(migratedEndpoint, migratedModel)
+    if (migratedSourceModel !== sourceExtractionModel) setSourceExtractionModel(migratedSourceModel)
+    void refreshVisionModels(migratedEndpoint, migratedModel, migratedSourceModel)
   }, [])
 
   useEffect(() => {
@@ -975,6 +1092,12 @@ function TranslationWorkspace() {
     setLatestAnswer(null)
   }, [activeBookId, activeSection, complexity, language])
 
+  useEffect(() => () => {
+    if (pagePersistTimerRef.current) {
+      window.clearTimeout(pagePersistTimerRef.current)
+    }
+  }, [])
+
   async function persistOldBook(updatedBook: OldBookRecord) {
     const updatedAt = new Date().toISOString()
     const normalizedBook = { ...updatedBook, updatedAt }
@@ -984,6 +1107,19 @@ function TranslationWorkspace() {
       return normalizedBook.pdfBlobId ? [normalizedBook, ...withoutBook] : [normalizedBook, ...withoutBook]
     })
     return normalizedBook
+  }
+
+  function schedulePagePositionPersist(updatedBook: OldBookRecord) {
+    if (pagePersistTimerRef.current) {
+      window.clearTimeout(pagePersistTimerRef.current)
+    }
+
+    pagePersistTimerRef.current = window.setTimeout(() => {
+      pagePersistTimerRef.current = null
+      void saveOldBookRecord(updatedBook).catch((error) => {
+        setOldBookStatus(error instanceof Error ? error.message : String(error))
+      })
+    }, 600)
   }
 
   async function persistTranslationJob(book: OldBookRecord, job: TranslationJobState) {
@@ -1068,7 +1204,7 @@ function TranslationWorkspace() {
     }
   }
 
-  async function setReaderPage(pageNumber: number) {
+  function setReaderPage(pageNumber: number) {
     if (!activeBook || !Number.isFinite(pageNumber)) return
 
     const roundedPage = Math.round(pageNumber)
@@ -1094,12 +1230,7 @@ function TranslationWorkspace() {
     setActiveSection(nextSection)
     setActiveSnapshotPage(nextPage)
     setOldBooks((current) => current.map((entry) => (entry.id === updatedBook.id ? updatedBook : entry)))
-
-    try {
-      await saveOldBookRecord(updatedBook)
-    } catch (error) {
-      setOldBookStatus(error instanceof Error ? error.message : String(error))
-    }
+    schedulePagePositionPersist(updatedBook)
   }
 
   function openAllSnapshots() {
@@ -1128,6 +1259,14 @@ function TranslationWorkspace() {
       if (isTauriUnavailable(error)) return undefined
       throw error
     }
+  }
+
+  async function getSnapshotImageDataUrl(snapshot: PageSnapshotRecord) {
+    if (snapshot.imageDataUrl) return snapshot.imageDataUrl
+    if (!snapshot.filePath) {
+      throw new Error(`Snapshot page ${snapshot.pageNumber} has no image data or file path.`)
+    }
+    return getOldBookFileDataUrl(snapshot.filePath)
   }
 
   async function renderAndSaveActivePageSnapshot(bookToSnapshot: OldBookRecord) {
@@ -1281,27 +1420,64 @@ function TranslationWorkspace() {
       }))
       job = updatedJob
 
-      const snapshotRecords = []
-      await renderPdfPageSnapshotsStream(activePdfBlob, {
+      const snapshotRecords: PageSnapshotRecord[] = []
+      const snapshotRecordPages = new Set<number>()
+      let lastPersistedSnapshotCount = 0
+      let flushSnapshotsPromise = Promise.resolve()
+
+      async function flushSnapshotBatch(reason: 'batch' | 'final') {
+        if (reason === 'batch' && snapshotRecords.length === lastPersistedSnapshotCount) return
+        const recordsToPersist = [...snapshotRecords]
+        const latestSnapshot = recordsToPersist[recordsToPersist.length - 1]
+        const nextJob: SnapshotJobState = {
+          ...job,
+          currentPage: latestSnapshot?.pageNumber ?? job.currentPage,
+          totalPages,
+          phase: reason === 'final' ? 'persist' : 'saving',
+          completedPages: recordsToPersist.length,
+          skippedPages,
+          message: reason === 'final'
+            ? `Persisting ${recordsToPersist.length} rendered snapshots...`
+            : `Saved ${recordsToPersist.length} of ${missingPages.length} missing snapshots.`,
+          updatedAt: new Date().toISOString(),
+        }
+
+        flushSnapshotsPromise = flushSnapshotsPromise.then(async () => {
+          const persistedPageNumbers = new Set(recordsToPersist.map((entry) => entry.pageNumber))
+          const mergedSnapshots = [
+            ...recordsToPersist,
+            ...workingBook.pageSnapshots.filter((snapshot) => !persistedPageNumbers.has(snapshot.pageNumber)),
+          ]
+          workingBook = await persistOldBook({
+            ...workingBook,
+            pages: totalPages,
+            status: nextJob.message,
+            pageSnapshots: mergedSnapshots,
+            snapshotJobs: [
+              nextJob,
+              ...(workingBook.snapshotJobs ?? []).filter((entry) => entry.id !== nextJob.id),
+            ],
+          })
+          job = nextJob
+          updatedJob = nextJob
+          lastPersistedSnapshotCount = recordsToPersist.length
+          setActiveSnapshotJob(nextJob)
+        })
+
+        await flushSnapshotsPromise
+      }
+
+      await renderPdfPageSnapshotsParallelStream(activePdfBlob, {
         maxWidth: 1000,
         pages: missingPages,
-        onProgress: async (pageNumber, pageCount, current) => {
+        concurrency: 2,
+        onProgress: (pageNumber, pageCount, started) => {
           setSnapshotProgress({
             phase: 'rendering',
-            current: skippedPages + current,
+            current: skippedPages + snapshotRecords.length,
             total: totalPages,
-            message: `Rendering page ${pageNumber} of ${pageCount}`,
+            message: `Rendering page ${pageNumber} of ${pageCount} (${started} queued)`,
           })
-          ;({ updatedBook: workingBook, updatedJob } = await persistSnapshotJob(workingBook, {
-            ...job,
-            currentPage: pageNumber,
-            totalPages,
-            phase: 'rendering',
-            completedPages: snapshotRecords.length,
-            skippedPages,
-            message: `Rendering snapshot ${pageNumber} of ${pageCount}...`,
-          }))
-          job = updatedJob
         },
         onSnapshot: async (renderedSnapshot, current) => {
           setSnapshotProgress({
@@ -1318,28 +1494,29 @@ function TranslationWorkspace() {
             renderedSnapshot.height,
             await saveRenderedSnapshotToFolder(activeBook.id, renderedSnapshot),
           )
-          snapshotRecords.push(snapshotRecord)
-          workingBook = {
-            ...workingBook,
-            pages: totalPages,
-            pageSnapshots: [
-              snapshotRecord,
-              ...workingBook.pageSnapshots.filter((entry) => entry.pageNumber !== snapshotRecord.pageNumber),
-            ],
+          if (!snapshotRecordPages.has(snapshotRecord.pageNumber)) {
+            snapshotRecordPages.add(snapshotRecord.pageNumber)
+            snapshotRecords.push(snapshotRecord)
+            snapshotRecords.sort((left, right) => left.pageNumber - right.pageNumber)
           }
-          ;({ updatedBook: workingBook, updatedJob } = await persistSnapshotJob(workingBook, {
-            ...job,
-            currentPage: renderedSnapshot.pageNumber,
-            totalPages,
-            phase: 'saving',
-            completedPages: current,
-            skippedPages,
-            message: `Saved ${current} of ${missingPages.length} missing snapshots. Last saved page ${renderedSnapshot.pageNumber}.`,
+          setOldBooks((currentBooks) => currentBooks.map((entry) => {
+            if (entry.id !== activeBook.id) return entry
+            return {
+              ...entry,
+              pages: totalPages,
+              pageSnapshots: [
+                snapshotRecord,
+                ...entry.pageSnapshots.filter((snapshot) => snapshot.pageNumber !== snapshotRecord.pageNumber),
+              ],
+            }
           }))
-          job = updatedJob
+          if (snapshotRecords.length % 5 === 0 || current === missingPages.length) {
+            await flushSnapshotBatch('batch')
+          }
           await yieldToBrowser()
         },
       })
+      await flushSnapshotBatch('final')
 
       const mergedSnapshotRecords = [
         ...snapshotRecords,
@@ -1396,7 +1573,7 @@ function TranslationWorkspace() {
   ) {
     const result = await requestVisionTranslation({
       endpoint: visionEndpoint,
-      model: visionModel,
+      model: sourceExtractionModel,
       imageDataUrl: snapshotImageDataUrl,
       bookTitle: bookForTranslation.title,
       pageNumber: bookForTranslation.pageNumber,
@@ -1422,6 +1599,30 @@ function TranslationWorkspace() {
         notes: result.notes,
       },
     )
+  }
+
+  async function reviewGlossaryIntoBookMemory(
+    bookForReview: OldBookRecord,
+    memory: TranslationMemoryEntry[],
+    glossary: TranslationGlossaryEntry[] | undefined,
+    signal?: AbortSignal,
+  ) {
+    if (!glossary?.length) return memory
+
+    try {
+      const reviewed = await requestTranslationMemoryReview({
+        endpoint: visionEndpoint,
+        model: llmRouterModel,
+        bookTitle: bookForReview.title,
+        newTerms: glossary,
+        existingTerms: getApprovedTranslationMemory({ ...bookForReview, translationMemory: memory }),
+        signal,
+      })
+      return mergeApprovedTranslationMemory(memory, reviewed.glossary)
+    } catch (error) {
+      setOldBookStatus(`Glossary review skipped: ${error instanceof Error ? error.message : String(error)}`)
+      return mergeTranslationMemorySuggestions(memory, glossary)
+    }
   }
 
   function createPageTranslationFromResult(
@@ -1472,9 +1673,19 @@ function TranslationWorkspace() {
         let originalTranslation = getCanonicalOriginalTranslation(updatedBook)
         if (!originalTranslation) {
           setOldBookStatus(`Transcribing source text and creating Original English for page ${updatedBook.pageNumber}...`)
-          originalTranslation = await createOriginalTranslationFromSnapshot(updatedBook, snapshot.imageDataUrl, abortController.signal)
+          originalTranslation = await createOriginalTranslationFromSnapshot(
+            updatedBook,
+            await getSnapshotImageDataUrl(snapshot),
+            abortController.signal,
+          )
           translationsForSave = replaceTranslationRecord(translationsForSave, originalTranslation)
-          translationMemoryForSave = mergeTranslationMemorySuggestions(translationMemoryForSave, originalTranslation.glossary)
+          setOldBookStatus(`Reviewing page ${updatedBook.pageNumber} glossary with ${llmRouterModel}...`)
+          translationMemoryForSave = await reviewGlossaryIntoBookMemory(
+            updatedBook,
+            translationMemoryForSave,
+            originalTranslation.glossary,
+            abortController.signal,
+          )
           bookForTranslation = {
             ...updatedBook,
             section: originalTranslation.sectionTitle,
@@ -1550,7 +1761,8 @@ function TranslationWorkspace() {
     translationAbortRef.current = abortController
     setOldBookBusy(true)
     const now = new Date().toISOString()
-    const reusableJob = !forceRetranslate
+    const canResumePreviousJob = !forceRetranslate && isAllPagesSelection(translationPageSelection)
+    const reusableJob = canResumePreviousJob
       ? activeBook.translationJobs.find((entry) =>
         entry.kind === 'translate-all'
         && entry.complexity === complexity
@@ -1577,7 +1789,7 @@ function TranslationWorkspace() {
         phase: 'snapshot',
         completedPages: 0,
         skippedPages: 0,
-        message: forceRetranslate ? 'Starting forced Translate All...' : 'Starting Translate All...',
+        message: forceRetranslate ? 'Starting forced translation...' : 'Starting bulk translation...',
         startedAt: now,
         updatedAt: now,
       }
@@ -1602,14 +1814,34 @@ function TranslationWorkspace() {
         totalPages = firstPage.pageCount || firstPage.updatedBook.pages || 1
       }
 
-      let translatedCount = forceRetranslate ? 0 : job.completedPages
-      let skippedCount = forceRetranslate ? 0 : job.skippedPages
+      const selectedPages = parsePageSelection(translationPageSelection, totalPages)
+      if (!selectedPages.length) {
+        throw new Error('Choose at least one page to translate.')
+      }
+
       const resumePage = job.phase === 'persist'
         ? (job.currentPage || 1) + 1
         : job.currentPage || 1
-      const startPage = forceRetranslate ? 1 : Math.min(Math.max(1, resumePage), totalPages)
+      const pagesToVisit = reusableJob && !forceRetranslate
+        ? selectedPages.filter((pageNumber) => pageNumber >= Math.min(Math.max(1, resumePage), totalPages))
+        : selectedPages
+      let translatedCount = reusableJob && !forceRetranslate ? job.completedPages : 0
+      let skippedCount = reusableJob && !forceRetranslate ? job.skippedPages : 0
 
-      for (let pageNumber = startPage; pageNumber <= totalPages; pageNumber += 1) {
+      ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+        ...job,
+        totalPages,
+        completedPages: translatedCount,
+        skippedPages: skippedCount,
+        message: forceRetranslate
+          ? `Force translating ${pagesToVisit.length} selected pages.`
+          : `Translating ${pagesToVisit.length} selected pages; completed pages will be skipped.`,
+      }))
+      job = updatedJob
+
+      for (let selectedIndex = 0; selectedIndex < pagesToVisit.length; selectedIndex += 1) {
+        const pageNumber = pagesToVisit[selectedIndex]
+        const selectedPosition = selectedIndex + 1
         let pageBook: OldBookRecord = {
           ...workingBook,
           pageNumber,
@@ -1632,7 +1864,7 @@ function TranslationWorkspace() {
             totalPages,
             skippedPages: skippedCount,
             phase: 'persist',
-            message: `Skipping page ${pageNumber} of ${totalPages}; already translated.`,
+            message: `Skipping page ${pageNumber}; already translated (${selectedPosition} of ${pagesToVisit.length} selected).`,
           }))
           job = updatedJob
           continue
@@ -1645,7 +1877,7 @@ function TranslationWorkspace() {
           phase: 'snapshot',
           completedPages: translatedCount,
           skippedPages: skippedCount,
-          message: `Preparing page ${pageNumber} of ${totalPages}...`,
+          message: `Preparing page ${pageNumber} (${selectedPosition} of ${pagesToVisit.length} selected)...`,
         }))
         job = updatedJob
         const { updatedBook, snapshot } = await ensurePageSnapshot(pageBook, pageNumber)
@@ -1669,12 +1901,31 @@ function TranslationWorkspace() {
             phase: 'source',
             completedPages: translatedCount,
             skippedPages: skippedCount,
-            message: `Transcribing source text and creating Original English for page ${pageNumber} of ${totalPages}...`,
+            message: `Transcribing source text for page ${pageNumber} (${selectedPosition} of ${pagesToVisit.length} selected)...`,
           }))
           job = updatedJob
-          originalTranslation = await createOriginalTranslationFromSnapshot(pageBook, snapshot.imageDataUrl, abortController.signal)
+          originalTranslation = await createOriginalTranslationFromSnapshot(
+            pageBook,
+            await getSnapshotImageDataUrl(snapshot),
+            abortController.signal,
+          )
           translationsForSave = replaceTranslationRecord(translationsForSave, originalTranslation)
-          memoryForSave = mergeTranslationMemorySuggestions(memoryForSave, originalTranslation.glossary)
+          ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+            ...job,
+            currentPage: pageNumber,
+            totalPages,
+            phase: 'source',
+            completedPages: translatedCount,
+            skippedPages: skippedCount,
+            message: `Reviewing glossary for page ${pageNumber} with ${llmRouterModel}...`,
+          }))
+          job = updatedJob
+          memoryForSave = await reviewGlossaryIntoBookMemory(
+            pageBook,
+            memoryForSave,
+            originalTranslation.glossary,
+            abortController.signal,
+          )
           pageBook = {
             ...pageBook,
             section: originalTranslation.sectionTitle,
@@ -1691,7 +1942,7 @@ function TranslationWorkspace() {
             phase: 'rewrite',
             completedPages: translatedCount,
             skippedPages: skippedCount,
-            message: `Rewriting page ${pageNumber} of ${totalPages} into ${selectedComplexity} ${selectedLanguage}...`,
+            message: `Rewriting page ${pageNumber} (${selectedPosition} of ${pagesToVisit.length} selected) into ${selectedComplexity} ${selectedLanguage}...`,
           }))
           job = updatedJob
           const rewrittenTranslation = await requestTextTranslation({
@@ -1731,7 +1982,7 @@ function TranslationWorkspace() {
           phase: 'persist',
           completedPages: translatedCount,
           skippedPages: skippedCount,
-          message: `Saving page ${pageNumber} of ${totalPages}...`,
+          message: `Saving page ${pageNumber} (${selectedPosition} of ${pagesToVisit.length} selected)...`,
         }))
         job = updatedJob
         workingBook = await persistOldBook({
@@ -1746,7 +1997,7 @@ function TranslationWorkspace() {
               ...job,
               completedPages: translatedCount + 1,
               skippedPages: skippedCount,
-              message: `Saved page ${pageNumber} of ${totalPages}.`,
+              message: `Saved page ${pageNumber} (${selectedPosition} of ${pagesToVisit.length} selected).`,
               updatedAt: new Date().toISOString(),
             },
             ...(pageBook.translationJobs ?? []).filter((entry) => entry.id !== job.id),
@@ -1761,11 +2012,11 @@ function TranslationWorkspace() {
         ...job,
         status: 'complete',
         phase: 'complete',
-        currentPage: totalPages,
+        currentPage: selectedPages[selectedPages.length - 1] ?? totalPages,
         totalPages,
         completedPages: translatedCount,
         skippedPages: skippedCount,
-        message: `Translate All complete. Updated ${translatedCount} pages, skipped ${skippedCount}.`,
+        message: `Bulk translation complete. Updated ${translatedCount} pages, skipped ${skippedCount}.`,
         updatedAt: new Date().toISOString(),
       }
       workingBook = await persistOldBook({
@@ -1828,7 +2079,7 @@ function TranslationWorkspace() {
         const visionAnswer = await requestVisionAnswer({
           endpoint: visionEndpoint,
           model: visionModel,
-          imageDataUrl: snapshot.imageDataUrl,
+          imageDataUrl: await getSnapshotImageDataUrl(snapshot),
           bookTitle: updatedBook.title,
           pageNumber: updatedBook.pageNumber,
           sectionTitle: translationHeaderTitle,
@@ -1854,6 +2105,40 @@ function TranslationWorkspace() {
       if (translationAbortRef.current === abortController) {
         translationAbortRef.current = null
       }
+      setOldBookBusy(false)
+    }
+  }
+
+  async function autoReviewBookGlossary() {
+    if (!activeBook) return
+
+    const candidates = activeBook.translations
+      .flatMap((translation) => translation.glossary ?? [])
+      .filter((entry) => entry.sourceTerm.trim() || entry.translatedTerm.trim())
+
+    if (!candidates.length) {
+      setOldBookStatus('No page vocabulary is available to review yet.')
+      return
+    }
+
+    setOldBookBusy(true)
+    try {
+      setOldBookStatus(`Reviewing ${candidates.length} glossary candidates with ${llmRouterModel}...`)
+      const reviewedMemory = await reviewGlossaryIntoBookMemory(
+        activeBook,
+        activeBook.translationMemory,
+        candidates,
+      )
+      const reviewedBook = await persistOldBook({
+        ...activeBook,
+        translationMemory: reviewedMemory,
+        status: 'Book glossary reviewed',
+      })
+      const approvedCount = reviewedBook.translationMemory.filter((entry) => entry.approved).length
+      setOldBookStatus(`Book glossary reviewed. ${approvedCount} approved terms are available for future pages.`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
       setOldBookBusy(false)
     }
   }
@@ -1964,8 +2249,9 @@ function TranslationWorkspace() {
                 onClick={() => {
                   setVisionEndpoint(llmRouterEndpoint)
                   setVisionModel(llmRouterModel)
+                  setSourceExtractionModel(llmRouterSourceModel)
                   setOldBookStatus('Using the BookForge LLM router at /api/llm-router/v1.')
-                  void refreshVisionModels(llmRouterEndpoint, llmRouterModel)
+                  void refreshVisionModels(llmRouterEndpoint, llmRouterModel, llmRouterSourceModel)
                 }}
                 type="button"
               >
@@ -1995,6 +2281,29 @@ function TranslationWorkspace() {
                 {visionModelsLoading ? '...' : 'Refresh'}
               </button>
             </div>
+          </label>
+
+          <label className="translation-source-model-field">
+            <span>Source Model</span>
+            <select value={sourceExtractionModel} onChange={(event) => setSourceExtractionModel(event.currentTarget.value)}>
+              {sourceExtractionModelOptions.length ? (
+                sourceExtractionModelOptions.map((option) => (
+                  <option key={option.id} value={option.id}>{option.id}</option>
+                ))
+              ) : (
+                <option value={sourceExtractionModel}>{sourceExtractionModel || 'No model loaded'}</option>
+              )}
+            </select>
+          </label>
+
+          <label className="translation-page-field">
+            <span>Pages</span>
+            <input
+              value={translationPageSelection}
+              onChange={(event) => setTranslationPageSelection(event.currentTarget.value)}
+              placeholder="all or 1-20, 42"
+              disabled={oldBookBusy}
+            />
           </label>
 
           <div className="translation-actions compact-actions">
@@ -2040,7 +2349,7 @@ function TranslationWorkspace() {
               disabled={oldBookBusy || !activeBook?.pdfBlobId}
               type="button"
             >
-              {forceRetranslate ? 'Force Retranslate' : hasResumableTranslationJob ? 'Resume Translate' : 'Translate All'}
+              {forceRetranslate ? 'Force Retranslate' : hasResumableTranslationJob && isAllPagesSelection(translationPageSelection) ? 'Resume Translate' : 'Translate Pages'}
             </button>
             <button
               className="button secondary"
@@ -2145,7 +2454,7 @@ function TranslationWorkspace() {
           <div className="pdf-viewer-shell">
             {activePageSnapshot ? (
               <div className="pdf-page-stage active-snapshot">
-                <img src={activePageSnapshot.imageDataUrl} alt={`Snapshot of page ${activePageNumber}`} />
+                <img src={getSnapshotImageSrc(activePageSnapshot)} alt={`Snapshot of page ${activePageNumber}`} />
               </div>
             ) : activePdfFrameSrc ? (
               <iframe
@@ -2302,6 +2611,39 @@ function TranslationWorkspace() {
             {translatedParagraphs.map((paragraph) => (
               <p key={paragraph}>{paragraph}</p>
             ))}
+
+            {activeTranslation?.glossary?.length ? (
+              <section className="page-vocabulary-panel" aria-label="Page vocabulary">
+                <header>
+                  <h3>Page Vocabulary</h3>
+                  <span>{activeTranslation.glossary.length} terms</span>
+                </header>
+                <dl>
+                  {activeTranslation.glossary.map((entry, index) => (
+                    <div key={`${entry.sourceTerm}-${entry.translatedTerm}-${index}`}>
+                      <dt>
+                        {entry.sourceTerm}
+                        {entry.translatedTerm && entry.translatedTerm !== entry.sourceTerm ? (
+                          <span>{entry.translatedTerm}</span>
+                        ) : null}
+                      </dt>
+                      {entry.explanation ? <dd>{entry.explanation}</dd> : null}
+                    </div>
+                  ))}
+                </dl>
+              </section>
+            ) : null}
+
+            {activeTranslation?.notes?.length ? (
+              <section className="page-notes-panel" aria-label="Translator notes">
+                <h3>Translator Notes</h3>
+                <ul>
+                  {activeTranslation.notes.map((note, index) => (
+                    <li key={`${note}-${index}`}>{note}</li>
+                  ))}
+                </ul>
+              </section>
+            ) : null}
           </div>
         </article>
       </section>
@@ -2366,7 +2708,17 @@ function TranslationWorkspace() {
                 <h2>Translation Memory</h2>
                 <p>{activeBook?.title ?? 'Imported book'} · {approvedMemoryCount} approved of {translationMemoryRows.length} terms</p>
               </div>
-              <button className="icon-button" onClick={() => setMemoryOpen(false)} type="button">x</button>
+              <div className="modal-header-actions">
+                <button
+                  className="mini-button"
+                  onClick={() => void autoReviewBookGlossary()}
+                  disabled={oldBookBusy || !translationMemoryRows.length}
+                  type="button"
+                >
+                  Auto Review
+                </button>
+                <button className="icon-button" onClick={() => setMemoryOpen(false)} type="button">x</button>
+              </div>
             </header>
 
             {translationMemoryRows.length ? (
@@ -2442,7 +2794,7 @@ function TranslationWorkspace() {
                       onClick={() => setActiveSnapshotPage(snapshot.pageNumber)}
                       type="button"
                     >
-                      <img src={snapshot.imageDataUrl} alt="" />
+                      <img src={getSnapshotImageSrc(snapshot)} alt="" />
                       <span>Page {snapshot.pageNumber}</span>
                     </button>
                   ))}
@@ -2457,12 +2809,12 @@ function TranslationWorkspace() {
                         <strong>Page {selectedSnapshot.pageNumber}</strong>
                         <span>{selectedSnapshot.width} x {selectedSnapshot.height}</span>
                       </div>
-                      <a className="mini-button" href={selectedSnapshot.imageDataUrl} target="_blank" rel="noreferrer">
+                      <a className="mini-button" href={getSnapshotImageSrc(selectedSnapshot)} target="_blank" rel="noreferrer">
                         Open Image
                       </a>
                     </div>
                     <div className="snapshot-preview-stage">
-                      <img src={selectedSnapshot.imageDataUrl} alt={`Snapshot of page ${selectedSnapshot.pageNumber}`} />
+                      <img src={getSnapshotImageSrc(selectedSnapshot)} alt={`Snapshot of page ${selectedSnapshot.pageNumber}`} />
                     </div>
                     <p className="snapshot-path">
                       {selectedSnapshot.filePath ?? 'Stored in local app database'}

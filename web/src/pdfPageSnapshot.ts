@@ -165,3 +165,53 @@ export async function renderPdfPageSnapshotsStream(
     await documentTask.destroy()
   }
 }
+
+export async function renderPdfPageSnapshotsParallelStream(
+  pdfBlob: Blob,
+  options: {
+    maxWidth?: number
+    pages?: number[]
+    concurrency?: number
+    onProgress?: (pageNumber: number, pageCount: number, started: number, total: number) => void
+    onSnapshot: (snapshot: RenderedPdfSnapshot, completed: number, total: number) => Promise<void> | void
+  },
+): Promise<{ pageCount: number, renderedCount: number }> {
+  const maxWidth = options.maxWidth ?? 1400
+  const concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency ?? 2)))
+  const data = await pdfBlob.arrayBuffer()
+  const documentTask = getDocument({
+    data,
+    wasmUrl: pdfJsWasmUrl(),
+  })
+
+  try {
+    const pdf = await documentTask.promise
+    const pageCount = pdf.numPages
+    const pageNumbers = options.pages?.length
+      ? options.pages.filter((pageNumber) => pageNumber >= 1 && pageNumber <= pageCount)
+      : Array.from({ length: pageCount }, (_, index) => index + 1)
+    let nextIndex = 0
+    let startedCount = 0
+    let completedCount = 0
+
+    async function worker() {
+      while (nextIndex < pageNumbers.length) {
+        const pageNumber = pageNumbers[nextIndex]
+        nextIndex += 1
+        startedCount += 1
+        options.onProgress?.(pageNumber, pageCount, startedCount, pageNumbers.length)
+        const snapshot = await renderPageFromDocument(pdf, pageNumber, pageCount, maxWidth)
+        completedCount += 1
+        await options.onSnapshot(snapshot, completedCount, pageNumbers.length)
+      }
+    }
+
+    await Promise.all(
+      Array.from({ length: Math.min(concurrency, pageNumbers.length) }, () => worker()),
+    )
+
+    return { pageCount, renderedCount: pageNumbers.length }
+  } finally {
+    await documentTask.destroy()
+  }
+}
