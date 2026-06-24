@@ -6,10 +6,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api/local-llm': {
-        target: 'http://localhost:1234',
+      '/api/llm-router': {
+        target: 'http://localhost:1235',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/local-llm/, ''),
+        rewrite: (path) => path.replace(/^\/api\/llm-router/, ''),
       },
     },
   },

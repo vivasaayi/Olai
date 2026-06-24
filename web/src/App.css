@@ -801,6 +801,179 @@ select:focus,
   gap: 0.9rem;
 }
 
+.translation-toolbar.compact {
+  gap: 0.45rem;
+  padding: 0.7rem 0.8rem;
+}
+
+.translation-compact-bar {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.translation-compact-row {
+  min-width: 0;
+  display: grid;
+  align-items: end;
+  gap: 0.45rem;
+}
+
+.translation-compact-row-primary {
+  grid-template-columns: 165px minmax(240px, 1fr) minmax(130px, 0.42fr) minmax(170px, 0.55fr);
+}
+
+.translation-compact-row-secondary {
+  grid-template-columns: minmax(360px, 0.9fr) minmax(280px, 0.7fr) minmax(420px, max-content);
+}
+
+.translation-title-block {
+  align-self: center;
+  min-width: 0;
+}
+
+.translation-toolbar .translation-title-block h2 {
+  overflow: hidden;
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.translation-toolbar .translation-title-block p {
+  margin: 0 0 0.12rem;
+}
+
+.translation-compact-bar label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+}
+
+.translation-compact-bar label > span {
+  color: #475467;
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
+.translation-compact-bar input,
+.translation-compact-bar select {
+  height: 2.1rem;
+  min-height: 2.1rem;
+}
+
+.compact-actions {
+  align-self: end;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 0;
+  justify-content: flex-end;
+}
+
+.compact-actions .button {
+  min-height: 2.1rem;
+  padding: 0.42rem 0.65rem;
+}
+
+.import-file-button {
+  user-select: none;
+}
+
+.translation-toolbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  min-height: 1.1rem;
+  overflow: hidden;
+  color: #667085;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.translation-toolbar-meta span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.translation-current-status {
+  color: #145d52;
+  font-weight: 650;
+}
+
+.snapshot-progress-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.35rem;
+  border: 1px solid #c9ded8;
+  border-radius: 8px;
+  padding: 0.45rem 0.55rem;
+  background: #f4fbf8;
+  color: #475467;
+  font-size: 0.78rem;
+}
+
+.snapshot-progress-copy {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.snapshot-progress-copy strong {
+  color: #145d52;
+}
+
+.snapshot-progress-copy span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.snapshot-progress-track {
+  overflow: hidden;
+  height: 0.42rem;
+  border-radius: 999px;
+  background: #dcebe7;
+}
+
+.snapshot-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #16816f;
+  transition: width 160ms ease;
+}
+
+.translation-job-strip {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  overflow: hidden;
+  border: 1px solid #d8dee6;
+  border-radius: 8px;
+  padding: 0.4rem 0.55rem;
+  background: #f8fafc;
+  color: #475467;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.translation-job-strip strong {
+  color: #145d52;
+}
+
+.translation-job-strip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .translation-toolbar-primary,
 .translation-controls,
 .translation-pane-header,
@@ -810,6 +983,12 @@ select:focus,
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
+}
+
+.translation-actions.compact-actions {
+  align-items: end;
+  justify-content: flex-end;
+  gap: 0.35rem;
 }
 
 .translation-toolbar h2,
@@ -847,8 +1026,12 @@ select:focus,
 
 .translation-inline-field {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) repeat(2, auto);
   gap: 0.4rem;
+}
+
+.translation-model-field .translation-inline-field {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .local-model-status {
@@ -1034,6 +1217,10 @@ select:focus,
   position: relative;
   width: min(100%, 520px);
   margin: 0 auto;
+}
+
+.pdf-page-stage.active-snapshot {
+  width: min(100%, 620px);
 }
 
 .pdf-page-stage img {
@@ -1245,6 +1432,135 @@ select:focus,
 .snapshot-modal {
   width: min(1120px, 100%);
   max-height: min(820px, 92vh);
+}
+
+.memory-modal {
+  width: min(1040px, 100%);
+  max-height: min(760px, 92vh);
+}
+
+.source-modal {
+  width: min(1040px, 100%);
+  max-height: min(760px, 92vh);
+}
+
+.source-inspector-grid {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.85rem;
+  overflow: hidden;
+}
+
+.source-lines-panel {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #dfe5ec;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.source-lines-panel header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0.65rem 0.75rem;
+  background: #f8fafc;
+}
+
+.source-lines-panel strong {
+  color: #111827;
+  font-size: 0.9rem;
+}
+
+.source-lines-panel span {
+  color: #667085;
+  font-size: 0.76rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.source-lines-panel ol {
+  margin: 0;
+  padding: 0.7rem 0.8rem 0.8rem 2rem;
+  color: #1f2937;
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.source-lines-panel li + li {
+  margin-top: 0.42rem;
+}
+
+.source-lines-panel .muted {
+  margin: 0;
+  padding: 0.85rem;
+}
+
+.memory-table-wrap {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #dfe5ec;
+  border-radius: 8px;
+}
+
+.memory-table {
+  width: 100%;
+  min-width: 840px;
+  border-collapse: collapse;
+  background: #ffffff;
+}
+
+.memory-table th,
+.memory-table td {
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid #e5e7eb;
+  text-align: left;
+  vertical-align: top;
+}
+
+.memory-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #f8fafc;
+  color: #475467;
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memory-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.memory-table td {
+  color: #1f2937;
+  font-size: 0.84rem;
+  line-height: 1.35;
+}
+
+.memory-status {
+  display: inline-flex;
+  min-height: 1.45rem;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.16rem 0.5rem;
+  background: #edf1f5;
+  color: #475467;
+  font-size: 0.72rem;
+  font-weight: 750;
+}
+
+.memory-status.approved {
+  background: #e7f5ef;
+  color: #087443;
 }
 
 .snapshot-browser {

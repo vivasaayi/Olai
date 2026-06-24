@@ -4,24 +4,33 @@ import './App.css'
 import antiqueFolioUrl from './assets/mock-antique-folio.png'
 import {
   complexityOptions,
-  createImportedOldBook,
   createPageSnapshotRecord,
   createQuestionRecord,
   createTranslationRecord,
   getDemoTranslationParagraphs,
   getOldBookPdfBlob,
+  importOldBookPdf,
   languageOptions,
   mergeOldBookRecords,
   readOldBooks,
-  saveOldBookPdfBlob,
   saveOldBookRecord,
   sourcePageLines,
   type OldBookRecord,
   type QuestionRecord,
   type TranslationComplexity,
+  type TranslationGlossaryEntry,
+  type TranslationJobState,
   type TranslationLanguage,
+  type TranslationMemoryEntry,
 } from './oldBooksStore'
-import { listVisionModels, requestVisionAnswer, requestVisionTranslation, type LocalVisionModel } from './localVision'
+import {
+  listVisionModels,
+  requestTextTranslation,
+  requestVisionAnswer,
+  requestVisionTranslation,
+  type LocalVisionModel,
+  type VisionTranslationResult,
+} from './localVision'
 import { renderPdfPageSnapshot, renderPdfPageSnapshots, type RenderedPdfSnapshot } from './pdfPageSnapshot'
 import type { Book, NodePersona, OutlineNode, OutlineNodeType, Resource, ResourceType } from './types'
 
@@ -67,15 +76,21 @@ type DeleteConfirmState = {
   busy: boolean
 }
 
+type SnapshotProgressState = {
+  phase: 'preparing' | 'rendering' | 'saving'
+  current: number
+  total: number
+  message: string
+}
+
 const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'download']
 const personas: NodePersona[] = ['default', 'kids', 'beginner', 'formal', 'college']
-const lmStudioEndpoint = '/api/local-llm/v1'
-const lmStudioModel = 'qwen/qwen3.6-35b-a3b'
-const lmStudioDirectEndpoint = 'http://localhost:1234/v1'
+const llmRouterEndpoint = '/api/llm-router/v1'
+const llmRouterModel = 'gpt-5.4-nano'
 const legacyRouterEndpoint = 'http://localhost:1235'
 const legacyRouterModel = 'gpt-5.4-nano'
-const defaultRouterEndpoint = lmStudioEndpoint
-const defaultRouterModel = lmStudioModel
+const defaultRouterEndpoint = llmRouterEndpoint
+const defaultRouterModel = llmRouterModel
 
 const createId = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -624,10 +639,141 @@ function getTranslatedPageCount(
   ).size
 }
 
+function getCanonicalOriginalTranslation(book: OldBookRecord | undefined, pageNumber = book?.pageNumber) {
+  if (!book || !pageNumber) return undefined
+  return book.translations.find((translation) =>
+    translation.pageNumber === pageNumber
+    && translation.complexity === 'original'
+    && translation.language === 'en'
+  )
+}
+
+function getPreviousOriginalTranslation(book: OldBookRecord | undefined) {
+  if (!book || book.pageNumber <= 1) return undefined
+  return getCanonicalOriginalTranslation(book, book.pageNumber - 1)
+}
+
+function getPreviousPageTranslation(
+  book: OldBookRecord | undefined,
+  complexity: TranslationComplexity,
+  language: TranslationLanguage,
+) {
+  if (!book || book.pageNumber <= 1) return undefined
+  return book.translations.find((translation) =>
+    translation.pageNumber === book.pageNumber - 1
+    && translation.complexity === complexity
+    && translation.language === language
+  )
+}
+
+function glossaryKey(sourceTerm: string, translatedTerm: string) {
+  return `${sourceTerm.trim()}|${translatedTerm.trim()}`.toLowerCase()
+}
+
+function getApprovedTranslationMemory(book: OldBookRecord | undefined): TranslationGlossaryEntry[] {
+  if (!book?.translationMemory?.length) return []
+  return book.translationMemory
+    .filter((entry) => entry.approved)
+    .map((entry) => ({
+      sourceTerm: entry.sourceTerm,
+      translatedTerm: entry.translatedTerm,
+      explanation: entry.explanation,
+    }))
+}
+
+function getPriorGlossary(book: OldBookRecord | undefined) {
+  if (!book) return []
+
+  const seen = new Set<string>()
+  const glossary: TranslationGlossaryEntry[] = []
+
+  for (const entry of getApprovedTranslationMemory(book)) {
+    const key = glossaryKey(entry.sourceTerm, entry.translatedTerm)
+    if (seen.has(key)) continue
+    seen.add(key)
+    glossary.push(entry)
+  }
+
+  const originals = book.translations
+    .filter((translation) =>
+      translation.complexity === 'original'
+      && translation.language === 'en'
+      && translation.pageNumber < book.pageNumber
+      && translation.glossary?.length)
+    .sort((left, right) => right.pageNumber - left.pageNumber)
+
+  for (const translation of originals) {
+    for (const entry of translation.glossary ?? []) {
+      const key = glossaryKey(entry.sourceTerm, entry.translatedTerm)
+      if (seen.has(key)) continue
+      seen.add(key)
+      glossary.push(entry)
+      if (glossary.length >= 24) return glossary
+    }
+  }
+
+  return glossary
+}
+
+function mergeTranslationMemorySuggestions(
+  memory: TranslationMemoryEntry[] = [],
+  glossary: TranslationGlossaryEntry[] = [],
+) {
+  const now = new Date().toISOString()
+  const seen = new Set(memory.map((entry) => glossaryKey(entry.sourceTerm, entry.translatedTerm)))
+  const additions = glossary
+    .filter((entry) => entry.sourceTerm.trim() || entry.translatedTerm.trim())
+    .filter((entry) => {
+      const key = glossaryKey(entry.sourceTerm, entry.translatedTerm)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    .map((entry): TranslationMemoryEntry => ({
+      id: createId(),
+      sourceTerm: entry.sourceTerm.trim(),
+      translatedTerm: entry.translatedTerm.trim(),
+      explanation: entry.explanation.trim(),
+      approved: false,
+      createdAt: now,
+      updatedAt: now,
+    }))
+
+  return additions.length ? [...memory, ...additions] : memory
+}
+
+function getTranslationMemoryRows(book: OldBookRecord | undefined): TranslationMemoryEntry[] {
+  if (!book) return []
+  return mergeTranslationMemorySuggestions(
+    book.translationMemory,
+    book.translations
+      .filter((translation) => translation.complexity === 'original' && translation.language === 'en')
+      .flatMap((translation) => translation.glossary ?? []),
+  )
+}
+
+function replaceTranslationRecord(translations: OldBookRecord['translations'], translation: OldBookRecord['translations'][number]) {
+  return [
+    translation,
+    ...translations.filter((entry) =>
+      !(entry.pageNumber === translation.pageNumber
+        && entry.complexity === translation.complexity
+        && entry.language === translation.language)
+    ),
+  ]
+}
+
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 0)
+  })
+}
+
 function TranslationWorkspace() {
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const translationAbortRef = useRef<AbortController | null>(null)
   const [oldBooks, setOldBooks] = useState<OldBookRecord[]>(() => mergeOldBookRecords([]))
-  const [activeBookId, setActiveBookId] = useState('spheres')
+  const [activeBookId, setActiveBookId] = useState('')
   const [complexity, setComplexity] = useState<TranslationComplexity>('kid-friendly')
   const [language, setLanguage] = useState<TranslationLanguage>('ml')
   const [activeSection, setActiveSection] = useState('Opening argument')
@@ -645,22 +791,29 @@ function TranslationWorkspace() {
   const [snapshotsOpen, setSnapshotsOpen] = useState(false)
   const [activeSnapshotPage, setActiveSnapshotPage] = useState<number | null>(null)
   const [snapshotViewMode, setSnapshotViewMode] = useState<'all' | 'page'>('all')
+  const [memoryOpen, setMemoryOpen] = useState(false)
+  const [sourceInspectorOpen, setSourceInspectorOpen] = useState(false)
+  const [activeTranslationJob, setActiveTranslationJob] = useState<TranslationJobState | null>(null)
+  const [snapshotProgress, setSnapshotProgress] = useState<SnapshotProgressState | null>(null)
 
   const activeBook = oldBooks.find((entry) => entry.id === activeBookId) ?? oldBooks[0]
-  const selectedLanguage = languageOptions.find((entry) => entry.value === language)?.label ?? 'Malayalam'
+  const translationLanguage: TranslationLanguage = complexity === 'original' ? 'en' : language
+  const selectedLanguage = languageOptions.find((entry) => entry.value === translationLanguage)?.label ?? 'English'
   const selectedComplexity = complexityOptions.find((entry) => entry.value === complexity)?.label ?? 'Kid Friendly'
   const visionModelOptions = availableVisionModels.some((entry) => entry.id === visionModel)
     ? availableVisionModels
     : visionModel
       ? [{ id: visionModel }, ...availableVisionModels]
       : availableVisionModels
-  const activeTranslation = activeBook ? getStoredTranslation(activeBook, complexity, language, activeSection) : undefined
+  const activeTranslation = activeBook ? getStoredTranslation(activeBook, complexity, translationLanguage, activeSection) : undefined
+  const canonicalOriginalTranslation = getCanonicalOriginalTranslation(activeBook)
+  const previousOriginalTranslation = getPreviousOriginalTranslation(activeBook)
   const activePageSnapshot = activeBook?.pageSnapshots.find((snapshot) => snapshot.pageNumber === activeBook.pageNumber)
   const hasImportedPdf = Boolean(activeBook?.pdfBlobId)
   const activePageNumber = activeBook?.pageNumber ?? 1
   const activePageLimit = activeBook?.pages && activeBook.pages > 0 ? activeBook.pages : undefined
   const activePageCount = activePageLimit ?? Math.max(activePageSnapshot?.pageNumber ?? 0, activePageNumber, 1)
-  const translatedPageCount = getTranslatedPageCount(activeBook, complexity, language)
+  const translatedPageCount = getTranslatedPageCount(activeBook, complexity, translationLanguage)
   const translatedParagraphs = activeTranslation
     ? activeTranslation.paragraphs
     : hasImportedPdf
@@ -676,18 +829,26 @@ function TranslationWorkspace() {
       entry.pageNumber === activeBook.pageNumber
       && entry.sectionTitle === activeSection
       && entry.complexity === complexity
-      && entry.language === language
+      && entry.language === translationLanguage
     )
     ?? activeBook?.questions.find((entry) =>
       entry.pageNumber === activeBook.pageNumber
       && entry.complexity === complexity
-      && entry.language === language
+      && entry.language === translationLanguage
     )
   const visibleSourceLines = activeTranslation?.sourceLines.length
     ? activeTranslation.sourceLines
     : hasImportedPdf
       ? []
       : sourcePageLines
+  const currentSourceLines = canonicalOriginalTranslation?.sourceLines.length
+    ? canonicalOriginalTranslation.sourceLines
+    : activeTranslation?.sourceLines.length
+      ? activeTranslation.sourceLines
+      : hasImportedPdf
+        ? []
+        : sourcePageLines
+  const previousSourceLines = previousOriginalTranslation?.sourceLines ?? []
   const sortedSnapshots = useMemo(
     () => [...(activeBook?.pageSnapshots ?? [])].sort((left, right) => left.pageNumber - right.pageNumber),
     [activeBook?.pageSnapshots],
@@ -696,18 +857,26 @@ function TranslationWorkspace() {
     ?? sortedSnapshots.find((snapshot) => snapshot.pageNumber === activeBook?.pageNumber)
     ?? sortedSnapshots[0]
   const snapshotBrowserItems = snapshotViewMode === 'page' && selectedSnapshot ? [selectedSnapshot] : sortedSnapshots
+  const translationMemoryRows = useMemo(() => getTranslationMemoryRows(activeBook), [activeBook])
+  const approvedMemoryCount = translationMemoryRows.filter((entry) => entry.approved).length
+  const displayedTranslationJob = activeTranslationJob
+    ?? activeBook?.translationJobs?.find((entry) => entry.status === 'running')
+    ?? activeBook?.translationJobs?.[0]
+  const snapshotProgressPercent = snapshotProgress?.total
+    ? Math.min(100, Math.max(0, Math.round((snapshotProgress.current / snapshotProgress.total) * 100)))
+    : 0
 
   async function refreshVisionModels(endpointOverride = visionEndpoint, preferredModel = visionModel) {
     setVisionModelsLoading(true)
-    setVisionModelsStatus('Loading local models...')
+    setVisionModelsStatus('Loading router models...')
     try {
       const models = await listVisionModels(endpointOverride)
       const modelIds = models.map((entry) => entry.id)
       setAvailableVisionModels(models)
       if (modelIds.length && !modelIds.includes(preferredModel)) {
-        setVisionModel(modelIds.includes(lmStudioModel) ? lmStudioModel : modelIds[0])
+        setVisionModel(modelIds.includes(llmRouterModel) ? llmRouterModel : modelIds[0])
       }
-      setVisionModelsStatus(models.length ? `${models.length} local models available.` : 'No local models returned.')
+      setVisionModelsStatus(models.length ? `${models.length} router models available.` : 'No models returned by this endpoint.')
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       setAvailableVisionModels([])
@@ -719,10 +888,10 @@ function TranslationWorkspace() {
   }
 
   useEffect(() => {
-    const migratedEndpoint = visionEndpoint === legacyRouterEndpoint || visionEndpoint === lmStudioDirectEndpoint
-      ? lmStudioEndpoint
+    const migratedEndpoint = visionEndpoint === legacyRouterEndpoint
+      ? llmRouterEndpoint
       : visionEndpoint
-    const migratedModel = visionModel === legacyRouterModel ? lmStudioModel : visionModel
+    const migratedModel = visionModel === legacyRouterModel ? llmRouterModel : visionModel
     if (migratedEndpoint !== visionEndpoint) setVisionEndpoint(migratedEndpoint)
     if (migratedModel !== visionModel) setVisionModel(migratedModel)
     void refreshVisionModels(migratedEndpoint, migratedModel)
@@ -739,7 +908,7 @@ function TranslationWorkspace() {
         const mergedBooks = mergeOldBookRecords(storedBooks)
         setOldBooks(mergedBooks)
         setActiveBookId((current) => (
-          mergedBooks.some((book) => book.id === current) ? current : mergedBooks[0]?.id ?? 'spheres'
+          mergedBooks.some((book) => book.id === current) ? current : mergedBooks[0]?.id ?? ''
         ))
       } catch (error) {
         if (!cancelled) {
@@ -803,6 +972,42 @@ function TranslationWorkspace() {
     return normalizedBook
   }
 
+  async function persistTranslationJob(book: OldBookRecord, job: TranslationJobState) {
+    const updatedJob = { ...job, updatedAt: new Date().toISOString() }
+    setActiveTranslationJob(updatedJob)
+    setOldBookStatus(updatedJob.message)
+    const updatedBook = await persistOldBook({
+      ...book,
+      status: updatedJob.message,
+      translationJobs: [
+        updatedJob,
+        ...(book.translationJobs ?? []).filter((entry) => entry.id !== updatedJob.id),
+      ],
+    })
+    await yieldToBrowser()
+    return { updatedBook, updatedJob }
+  }
+
+  function stopTranslationRequest() {
+    translationAbortRef.current?.abort()
+    translationAbortRef.current = null
+    setOldBookBusy(false)
+    setOldBookStatus('Translation request stopped.')
+    setActiveTranslationJob((current) => current ? {
+      ...current,
+      status: 'failed',
+      error: 'Stopped by user.',
+      message: 'Stopped by user.',
+      updatedAt: new Date().toISOString(),
+    } : current)
+  }
+
+  function resetTranslationControls() {
+    translationAbortRef.current = null
+    setOldBookBusy(false)
+    setOldBookStatus('Controls reset. Any in-flight model request may still finish server-side, but the UI is free.')
+  }
+
   async function handlePdfSelected(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0]
     event.currentTarget.value = ''
@@ -815,9 +1020,7 @@ function TranslationWorkspace() {
 
     setOldBookBusy(true)
     try {
-      const importedBook = createImportedOldBook(file)
-      await saveOldBookPdfBlob(importedBook.pdfBlobId!, file, file.name)
-      await saveOldBookRecord(importedBook)
+      const importedBook = await importOldBookPdf(file)
       setOldBooks((current) => [importedBook, ...current.filter((entry) => entry.id !== importedBook.id)])
       setActiveBookId(importedBook.id)
       setActiveSection('Page 1, OCR pending')
@@ -922,6 +1125,38 @@ function TranslationWorkspace() {
     return renderAndSaveActivePageSnapshot(bookToSnapshot)
   }
 
+  async function ensurePageSnapshot(bookToSnapshot: OldBookRecord, pageNumber: number) {
+    const existingSnapshot = bookToSnapshot.pageSnapshots.find((entry) => entry.pageNumber === pageNumber)
+    if (existingSnapshot) {
+      return { updatedBook: { ...bookToSnapshot, pageNumber }, snapshot: existingSnapshot, pageCount: bookToSnapshot.pages }
+    }
+
+    if (!activePdfBlob) {
+      throw new Error('Import a PDF before creating a page snapshot.')
+    }
+
+    const renderedSnapshot = await renderPdfPageSnapshot(activePdfBlob, pageNumber, { maxWidth: 1000 })
+    const snapshot = createPageSnapshotRecord(
+      renderedSnapshot.pageNumber,
+      renderedSnapshot.imageDataUrl,
+      renderedSnapshot.width,
+      renderedSnapshot.height,
+      await saveRenderedSnapshotToFolder(bookToSnapshot.id, renderedSnapshot),
+    )
+    const updatedBook = {
+      ...bookToSnapshot,
+      pageNumber: renderedSnapshot.pageNumber,
+      pages: renderedSnapshot.pageCount || bookToSnapshot.pages,
+      status: 'Page snapshot ready',
+      pageSnapshots: [
+        snapshot,
+        ...bookToSnapshot.pageSnapshots.filter((entry) => entry.pageNumber !== snapshot.pageNumber),
+      ],
+    }
+
+    return { updatedBook, snapshot, pageCount: renderedSnapshot.pageCount }
+  }
+
   async function snapshotActivePage() {
     if (!activeBook) return
     setOldBookBusy(true)
@@ -938,17 +1173,36 @@ function TranslationWorkspace() {
   async function snapshotAllPages() {
     if (!activeBook || !activePdfBlob) return
     setOldBookBusy(true)
+    setSnapshotProgress({
+      phase: 'preparing',
+      current: 0,
+      total: activeBook.pages || 0,
+      message: 'Preparing all page snapshots...',
+    })
     try {
       setOldBookStatus('Preparing all page snapshots...')
       const renderedSnapshots = await renderPdfPageSnapshots(activePdfBlob, {
         maxWidth: 1000,
         onProgress: (pageNumber, pageCount) => {
+          setSnapshotProgress({
+            phase: 'rendering',
+            current: pageNumber,
+            total: pageCount,
+            message: `Rendering page ${pageNumber} of ${pageCount}`,
+          })
           setOldBookStatus(`Rendering snapshot ${pageNumber} of ${pageCount}...`)
         },
       })
 
       const snapshotRecords = []
-      for (const renderedSnapshot of renderedSnapshots) {
+      for (const [index, renderedSnapshot] of renderedSnapshots.entries()) {
+        const current = index + 1
+        setSnapshotProgress({
+          phase: 'saving',
+          current,
+          total: renderedSnapshots.length,
+          message: `Saving page ${renderedSnapshot.pageNumber} of ${renderedSnapshots.length}`,
+        })
         setOldBookStatus(`Saving snapshot ${renderedSnapshot.pageNumber} of ${renderedSnapshot.pageCount}...`)
         snapshotRecords.push(createPageSnapshotRecord(
           renderedSnapshot.pageNumber,
@@ -957,6 +1211,7 @@ function TranslationWorkspace() {
           renderedSnapshot.height,
           await saveRenderedSnapshotToFolder(activeBook.id, renderedSnapshot),
         ))
+        await yieldToBrowser()
       }
 
       const savedBook = await persistOldBook({
@@ -972,18 +1227,79 @@ function TranslationWorkspace() {
     } catch (error) {
       setOldBookStatus(error instanceof Error ? error.message : String(error))
     } finally {
+      setSnapshotProgress(null)
       setOldBookBusy(false)
     }
+  }
+
+  async function createOriginalTranslationFromSnapshot(
+    bookForTranslation: OldBookRecord,
+    snapshotImageDataUrl: string,
+    signal?: AbortSignal,
+  ) {
+    const result = await requestVisionTranslation({
+      endpoint: visionEndpoint,
+      model: visionModel,
+      imageDataUrl: snapshotImageDataUrl,
+      bookTitle: bookForTranslation.title,
+      pageNumber: bookForTranslation.pageNumber,
+      complexityLabel: 'Original',
+      languageLabel: 'English',
+      complexity: 'original',
+      language: 'en',
+      previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation)?.paragraphs,
+      previousSourceLines: getPreviousOriginalTranslation(bookForTranslation)?.sourceLines,
+      priorGlossary: getPriorGlossary(bookForTranslation),
+      signal,
+    })
+
+    return createTranslationRecord(
+      bookForTranslation,
+      'original',
+      'en',
+      result.sectionTitle || `Page ${bookForTranslation.pageNumber}`,
+      {
+        paragraphs: result.paragraphs,
+        sourceLines: result.sourceLines,
+        glossary: result.glossary,
+        notes: result.notes,
+      },
+    )
+  }
+
+  function createPageTranslationFromResult(
+    bookForTranslation: OldBookRecord,
+    result: VisionTranslationResult,
+    outputComplexity = complexity,
+    outputLanguage = translationLanguage,
+  ) {
+    return createTranslationRecord(
+      bookForTranslation,
+      outputComplexity,
+      outputLanguage,
+      result.sectionTitle || activeSection,
+      {
+        paragraphs: result.paragraphs,
+        sourceLines: result.sourceLines,
+        glossary: result.glossary,
+        notes: result.notes,
+      },
+    )
   }
 
   async function translateActivePage() {
     if (!activeBook) return
 
+    translationAbortRef.current?.abort()
+    const abortController = new AbortController()
+    translationAbortRef.current = abortController
     setOldBookBusy(true)
     try {
       setOldBookStatus(`Translating page ${activeBook.pageNumber}...`)
       let bookForTranslation = activeBook
-      let visionTranslation: Awaited<ReturnType<typeof requestVisionTranslation>> | null = null
+      let translationsForSave = activeBook.translations
+      let translationMemoryForSave = activeBook.translationMemory
+      let translation = undefined as ReturnType<typeof createTranslationRecord> | undefined
 
       if (activeBook.pdfBlobId) {
         setOldBookStatus(
@@ -993,56 +1309,312 @@ function TranslationWorkspace() {
         )
         const { updatedBook, snapshot } = await ensureActivePageSnapshot(activeBook)
         bookForTranslation = updatedBook
-        setOldBookStatus(`Translating page ${updatedBook.pageNumber} from snapshot...`)
-        visionTranslation = await requestVisionTranslation({
-          endpoint: visionEndpoint,
-          model: visionModel,
-          imageDataUrl: snapshot.imageDataUrl,
-          bookTitle: updatedBook.title,
-          pageNumber: updatedBook.pageNumber,
-          complexityLabel: selectedComplexity,
-          languageLabel: selectedLanguage,
-          complexity,
-          language,
-        })
+        translationsForSave = updatedBook.translations
+        translationMemoryForSave = updatedBook.translationMemory
+
+        let originalTranslation = getCanonicalOriginalTranslation(updatedBook)
+        if (!originalTranslation) {
+          setOldBookStatus(`Transcribing source text and creating Original English for page ${updatedBook.pageNumber}...`)
+          originalTranslation = await createOriginalTranslationFromSnapshot(updatedBook, snapshot.imageDataUrl, abortController.signal)
+          translationsForSave = replaceTranslationRecord(translationsForSave, originalTranslation)
+          translationMemoryForSave = mergeTranslationMemorySuggestions(translationMemoryForSave, originalTranslation.glossary)
+          bookForTranslation = {
+            ...updatedBook,
+            section: originalTranslation.sectionTitle,
+            translations: translationsForSave,
+            translationMemory: translationMemoryForSave,
+          }
+        }
+
+        if (complexity === 'original') {
+          translation = originalTranslation
+        } else {
+          setOldBookStatus(`Rewriting page ${updatedBook.pageNumber} from Original English into ${selectedComplexity} ${selectedLanguage}...`)
+          const rewrittenTranslation = await requestTextTranslation({
+            endpoint: visionEndpoint,
+            model: visionModel,
+            bookTitle: updatedBook.title,
+            pageNumber: updatedBook.pageNumber,
+            complexityLabel: selectedComplexity,
+            languageLabel: selectedLanguage,
+            complexity,
+            language: translationLanguage,
+            originalParagraphs: originalTranslation.paragraphs,
+            sourceLines: originalTranslation.sourceLines,
+            glossary: [...getApprovedTranslationMemory(bookForTranslation), ...(originalTranslation.glossary ?? []), ...getPriorGlossary(bookForTranslation)],
+            previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation)?.paragraphs,
+            previousTranslatedParagraphs: getPreviousPageTranslation(bookForTranslation, complexity, translationLanguage)?.paragraphs,
+            signal: abortController.signal,
+          })
+          translation = createPageTranslationFromResult(bookForTranslation, rewrittenTranslation)
+          translationsForSave = replaceTranslationRecord(translationsForSave, translation)
+        }
       }
 
-      const sectionTitle = visionTranslation?.sectionTitle || activeSection
-      const translation = createTranslationRecord(
-        bookForTranslation,
-        complexity,
-        language,
-        sectionTitle,
-        visionTranslation ? {
-          paragraphs: visionTranslation.paragraphs,
-          sourceLines: visionTranslation.sourceLines,
-        } : undefined,
-      )
-      const existingTranslations = bookForTranslation.translations.filter((entry) =>
-        !(entry.pageNumber === translation.pageNumber
-          && entry.sectionTitle === translation.sectionTitle
-          && entry.complexity === translation.complexity
-          && entry.language === translation.language)
-      )
+      if (!translation) {
+        translation = createTranslationRecord(bookForTranslation, complexity, translationLanguage, activeSection)
+        translationsForSave = replaceTranslationRecord(translationsForSave, translation)
+      } else if (complexity === 'original') {
+        translationsForSave = replaceTranslationRecord(translationsForSave, translation)
+      }
+
       const translatedPagesAfterSave = getTranslatedPageCount(
-        { ...bookForTranslation, translations: [translation, ...existingTranslations] },
+        { ...bookForTranslation, translations: translationsForSave },
         complexity,
-        language,
+        translationLanguage,
       )
       const updatedBook = await persistOldBook({
         ...bookForTranslation,
-        section: sectionTitle,
+        section: translation.sectionTitle,
         status: 'Page translation stored',
         progress: bookForTranslation.pages
           ? Math.round((translatedPagesAfterSave / bookForTranslation.pages) * 100)
           : Math.max(bookForTranslation.progress, 1),
-        translations: [translation, ...existingTranslations],
+        translations: translationsForSave,
+        translationMemory: translationMemoryForSave,
       })
-      setActiveSection(sectionTitle)
+      setActiveSection(translation.sectionTitle)
       setOldBookStatus(`Saved page ${translation.pageNumber} as ${selectedComplexity} ${selectedLanguage} for ${updatedBook.title}.`)
     } catch (error) {
       setOldBookStatus(error instanceof Error ? error.message : String(error))
     } finally {
+      if (translationAbortRef.current === abortController) {
+        translationAbortRef.current = null
+      }
+      setOldBookBusy(false)
+    }
+  }
+
+  async function translateAllPages() {
+    if (!activeBook || !activePdfBlob) return
+
+    translationAbortRef.current?.abort()
+    const abortController = new AbortController()
+    translationAbortRef.current = abortController
+    setOldBookBusy(true)
+    const now = new Date().toISOString()
+    let job: TranslationJobState = {
+      id: createId(),
+      kind: 'translate-all',
+      status: 'running',
+      complexity,
+      language: translationLanguage,
+      currentPage: activeBook.pageNumber,
+      totalPages: activeBook.pages || 0,
+      phase: 'snapshot',
+      completedPages: 0,
+      skippedPages: 0,
+      message: 'Starting Translate All...',
+      startedAt: now,
+      updatedAt: now,
+    }
+    try {
+      let { updatedBook: workingBook, updatedJob } = await persistTranslationJob(activeBook, job)
+      job = updatedJob
+      let totalPages = workingBook.pages
+
+      if (!totalPages) {
+        ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+          ...job,
+          currentPage: 1,
+          totalPages: 0,
+          phase: 'snapshot',
+          message: 'Detecting PDF page count...',
+        }))
+        job = updatedJob
+        const firstPage = await ensurePageSnapshot({ ...workingBook, pageNumber: 1 }, 1)
+        workingBook = firstPage.updatedBook
+        totalPages = firstPage.pageCount || firstPage.updatedBook.pages || 1
+      }
+
+      let translatedCount = 0
+      let skippedCount = 0
+
+      for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+        let pageBook: OldBookRecord = {
+          ...workingBook,
+          pageNumber,
+          section: getStoredTranslation({ ...workingBook, pageNumber }, complexity, translationLanguage, `Page ${pageNumber}`)
+            ?.sectionTitle ?? `Page ${pageNumber}, OCR pending`,
+        }
+
+        const originalExists = Boolean(getCanonicalOriginalTranslation(pageBook, pageNumber))
+        const targetExists = Boolean(pageBook.translations.find((entry) =>
+          entry.pageNumber === pageNumber
+          && entry.complexity === complexity
+          && entry.language === translationLanguage
+        ))
+
+        if (originalExists && targetExists) {
+          skippedCount += 1
+          ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+            ...job,
+            currentPage: pageNumber,
+            totalPages,
+            skippedPages: skippedCount,
+            phase: 'persist',
+            message: `Skipping page ${pageNumber} of ${totalPages}; already translated.`,
+          }))
+          job = updatedJob
+          continue
+        }
+
+        ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+          ...job,
+          currentPage: pageNumber,
+          totalPages,
+          phase: 'snapshot',
+          completedPages: translatedCount,
+          skippedPages: skippedCount,
+          message: `Preparing page ${pageNumber} of ${totalPages}...`,
+        }))
+        job = updatedJob
+        const { updatedBook, snapshot } = await ensurePageSnapshot(pageBook, pageNumber)
+        pageBook = {
+          ...updatedBook,
+          translations: workingBook.translations,
+          translationMemory: workingBook.translationMemory,
+          pageSnapshots: updatedBook.pageSnapshots,
+          pages: totalPages,
+        }
+
+        let translationsForSave = pageBook.translations
+        let memoryForSave = pageBook.translationMemory
+        let originalTranslation = getCanonicalOriginalTranslation(pageBook, pageNumber)
+
+        if (!originalTranslation) {
+          ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+            ...job,
+            currentPage: pageNumber,
+            totalPages,
+            phase: 'source',
+            completedPages: translatedCount,
+            skippedPages: skippedCount,
+            message: `Transcribing source text and creating Original English for page ${pageNumber} of ${totalPages}...`,
+          }))
+          job = updatedJob
+          originalTranslation = await createOriginalTranslationFromSnapshot(pageBook, snapshot.imageDataUrl, abortController.signal)
+          translationsForSave = replaceTranslationRecord(translationsForSave, originalTranslation)
+          memoryForSave = mergeTranslationMemorySuggestions(memoryForSave, originalTranslation.glossary)
+          pageBook = {
+            ...pageBook,
+            section: originalTranslation.sectionTitle,
+            translations: translationsForSave,
+            translationMemory: memoryForSave,
+          }
+        }
+
+        if (complexity !== 'original' && !targetExists) {
+          ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+            ...job,
+            currentPage: pageNumber,
+            totalPages,
+            phase: 'rewrite',
+            completedPages: translatedCount,
+            skippedPages: skippedCount,
+            message: `Rewriting page ${pageNumber} of ${totalPages} into ${selectedComplexity} ${selectedLanguage}...`,
+          }))
+          job = updatedJob
+          const rewrittenTranslation = await requestTextTranslation({
+            endpoint: visionEndpoint,
+            model: visionModel,
+            bookTitle: pageBook.title,
+            pageNumber,
+            complexityLabel: selectedComplexity,
+            languageLabel: selectedLanguage,
+            complexity,
+            language: translationLanguage,
+            originalParagraphs: originalTranslation.paragraphs,
+            sourceLines: originalTranslation.sourceLines,
+            glossary: [...getApprovedTranslationMemory(pageBook), ...(originalTranslation.glossary ?? []), ...getPriorGlossary(pageBook)],
+            previousOriginalParagraphs: getPreviousOriginalTranslation(pageBook)?.paragraphs,
+            previousTranslatedParagraphs: getPreviousPageTranslation(pageBook, complexity, translationLanguage)?.paragraphs,
+            signal: abortController.signal,
+          })
+          const rewrittenRecord = createPageTranslationFromResult(pageBook, rewrittenTranslation)
+          translationsForSave = replaceTranslationRecord(translationsForSave, rewrittenRecord)
+          pageBook = {
+            ...pageBook,
+            section: rewrittenRecord.sectionTitle,
+            translations: translationsForSave,
+          }
+        }
+
+        const pagesDone = getTranslatedPageCount(
+          { ...pageBook, translations: translationsForSave },
+          complexity,
+          translationLanguage,
+        )
+        ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
+          ...job,
+          currentPage: pageNumber,
+          totalPages,
+          phase: 'persist',
+          completedPages: translatedCount,
+          skippedPages: skippedCount,
+          message: `Saving page ${pageNumber} of ${totalPages}...`,
+        }))
+        job = updatedJob
+        workingBook = await persistOldBook({
+          ...pageBook,
+          pages: totalPages,
+          status: 'Bulk translation in progress',
+          progress: Math.round((pagesDone / totalPages) * 100),
+          translations: translationsForSave,
+          translationMemory: memoryForSave,
+          translationJobs: [
+            {
+              ...job,
+              completedPages: translatedCount + 1,
+              skippedPages: skippedCount,
+              message: `Saved page ${pageNumber} of ${totalPages}.`,
+              updatedAt: new Date().toISOString(),
+            },
+            ...(pageBook.translationJobs ?? []).filter((entry) => entry.id !== job.id),
+          ],
+        })
+        translatedCount += 1
+        setActiveTranslationJob(workingBook.translationJobs[0] ?? null)
+        await yieldToBrowser()
+      }
+
+      const completeJob: TranslationJobState = {
+        ...job,
+        status: 'complete',
+        phase: 'complete',
+        currentPage: totalPages,
+        totalPages,
+        completedPages: translatedCount,
+        skippedPages: skippedCount,
+        message: `Translate All complete. Updated ${translatedCount} pages, skipped ${skippedCount}.`,
+        updatedAt: new Date().toISOString(),
+      }
+      workingBook = await persistOldBook({
+        ...workingBook,
+        status: completeJob.message,
+        translationJobs: [
+          completeJob,
+          ...(workingBook.translationJobs ?? []).filter((entry) => entry.id !== completeJob.id),
+        ],
+      })
+      setActiveTranslationJob(completeJob)
+      setActiveBookId(workingBook.id)
+      setActiveSection(workingBook.section)
+      setOldBookStatus(completeJob.message)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setOldBookStatus(message)
+      setActiveTranslationJob((current) => current ? {
+        ...current,
+        status: 'failed',
+        error: message,
+        message,
+        updatedAt: new Date().toISOString(),
+      } : current)
+    } finally {
+      if (translationAbortRef.current === abortController) {
+        translationAbortRef.current = null
+      }
       setOldBookBusy(false)
     }
   }
@@ -1050,6 +1622,9 @@ function TranslationWorkspace() {
   async function askActiveSection() {
     if (!activeBook || !question.trim()) return
 
+    translationAbortRef.current?.abort()
+    const abortController = new AbortController()
+    translationAbortRef.current = abortController
     setOldBookBusy(true)
     try {
       let bookForQuestion = activeBook
@@ -1069,11 +1644,12 @@ function TranslationWorkspace() {
           complexityLabel: selectedComplexity,
           languageLabel: selectedLanguage,
           translatedParagraphs,
+          signal: abortController.signal,
         })
         answerText = visionAnswer.answer
       }
 
-      const answer = createQuestionRecord(bookForQuestion, complexity, language, translationHeaderTitle, question.trim(), answerText)
+      const answer = createQuestionRecord(bookForQuestion, complexity, translationLanguage, translationHeaderTitle, question.trim(), answerText)
       await persistOldBook({
         ...bookForQuestion,
         questions: [answer, ...bookForQuestion.questions],
@@ -1083,100 +1659,131 @@ function TranslationWorkspace() {
     } catch (error) {
       setOldBookStatus(error instanceof Error ? error.message : String(error))
     } finally {
+      if (translationAbortRef.current === abortController) {
+        translationAbortRef.current = null
+      }
       setOldBookBusy(false)
     }
   }
 
+  async function setMemoryApproval(memoryEntry: TranslationMemoryEntry, approved: boolean) {
+    if (!activeBook) return
+    const now = new Date().toISOString()
+    const key = glossaryKey(memoryEntry.sourceTerm, memoryEntry.translatedTerm)
+    const existing = activeBook.translationMemory.find((entry) =>
+      entry.id === memoryEntry.id || glossaryKey(entry.sourceTerm, entry.translatedTerm) === key
+    )
+    const nextEntry: TranslationMemoryEntry = existing
+      ? { ...existing, approved, updatedAt: now }
+      : {
+        ...memoryEntry,
+        id: createId(),
+        approved,
+        createdAt: now,
+        updatedAt: now,
+      }
+    const nextMemory = existing
+      ? activeBook.translationMemory.map((entry) => (entry.id === existing.id ? nextEntry : entry))
+      : [...activeBook.translationMemory, nextEntry]
+
+    await persistOldBook({
+      ...activeBook,
+      translationMemory: nextMemory,
+      status: 'Translation memory updated',
+    })
+    setOldBookStatus(`${approved ? 'Approved' : 'Unapproved'} term: ${nextEntry.translatedTerm || nextEntry.sourceTerm}.`)
+  }
+
+  function selectOldBook(bookId: string) {
+    const selectedBook = oldBooks.find((entry) => entry.id === bookId)
+    if (!selectedBook) return
+    setActiveBookId(selectedBook.id)
+    setActiveSection(selectedBook.pdfBlobId ? selectedBook.section : 'Opening argument')
+    setActiveSnapshotPage(selectedBook.pageNumber)
+    setLatestAnswer(null)
+  }
+
   return (
     <main className="translation-view">
-      <section className="translation-toolbar panel">
+      <section className="translation-toolbar panel compact">
         <input
+          id="old-book-pdf-import"
           ref={fileInputRef}
           type="file"
           accept="application/pdf"
           className="visually-hidden-input"
           onChange={(event) => void handlePdfSelected(event)}
         />
-        <div className="translation-toolbar-primary">
-          <div>
+        <div className="translation-compact-bar">
+          <div className="translation-compact-row translation-compact-row-primary">
+          <div className="translation-title-block">
             <p className="app-overline">Translation Lab</p>
             <h2>Public-domain old book reader</h2>
           </div>
-          <div className="translation-actions">
-            <button
-              className="button secondary"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={oldBookBusy}
-              type="button"
-            >
-              Import PDF
-            </button>
-            <button
-              className="button secondary"
-              onClick={() => void snapshotAllPages()}
-              disabled={oldBookBusy || !activeBook?.pdfBlobId}
-              type="button"
-            >
-              Snapshot All
-            </button>
-            <button
-              className="button secondary"
-              onClick={openAllSnapshots}
-              disabled={!sortedSnapshots.length}
-              type="button"
-            >
-              View Snapshots
-            </button>
-          </div>
-        </div>
 
-        <div className="translation-controls">
-          <label>
+          <label className="translation-book-field">
+            <span>Book</span>
+            <select value={activeBook?.id ?? ''} onChange={(event) => selectOldBook(event.currentTarget.value)}>
+              {oldBooks.map((entry) => (
+                <option key={entry.id} value={entry.id}>
+                  {entry.title} · {entry.pages || 'pages pending'} pages
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="translation-language-field">
             <span>Language</span>
-            <select value={language} onChange={(event) => setLanguage(event.currentTarget.value as TranslationLanguage)}>
+            <select
+              value={translationLanguage}
+              onChange={(event) => setLanguage(event.currentTarget.value as TranslationLanguage)}
+              disabled={complexity === 'original'}
+            >
               {languageOptions.map((option) => (
                 <option key={option.value} value={option.value}>{option.label}</option>
               ))}
             </select>
           </label>
 
-          <div className="translation-control-group">
+          <label className="translation-complexity-field">
             <span>Complexity</span>
-            <div className="translation-segmented" role="tablist" aria-label="Translation complexity">
+            <select
+              value={complexity}
+              onChange={(event) => {
+                const nextComplexity = event.currentTarget.value as TranslationComplexity
+                setComplexity(nextComplexity)
+                if (nextComplexity === 'original') setLanguage('en')
+              }}
+            >
               {complexityOptions.map((option) => (
-                <button
-                  key={option.value}
-                  className={complexity === option.value ? 'translation-segment active' : 'translation-segment'}
-                  onClick={() => setComplexity(option.value)}
-                  type="button"
-                >
-                  {option.label}
-                </button>
+                <option key={option.value} value={option.value}>{option.label}</option>
               ))}
-            </div>
+            </select>
+          </label>
           </div>
 
+          <div className="translation-compact-row translation-compact-row-secondary">
           <label className="translation-endpoint-field">
-            <span>Vision endpoint</span>
+            <span>Endpoint</span>
             <div className="translation-inline-field">
               <input value={visionEndpoint} onChange={(event) => setVisionEndpoint(event.currentTarget.value)} />
               <button
                 className="mini-button"
                 onClick={() => {
-                  setVisionEndpoint(lmStudioEndpoint)
-                  setVisionModel(lmStudioModel)
-                  setOldBookStatus('Using LM Studio through the app proxy at /api/local-llm/v1.')
-                  void refreshVisionModels(lmStudioEndpoint, lmStudioModel)
+                  setVisionEndpoint(llmRouterEndpoint)
+                  setVisionModel(llmRouterModel)
+                  setOldBookStatus('Using the BookForge LLM router at /api/llm-router/v1.')
+                  void refreshVisionModels(llmRouterEndpoint, llmRouterModel)
                 }}
                 type="button"
               >
-                LM Studio
+                Router
               </button>
             </div>
           </label>
 
           <label className="translation-model-field">
-            <span>Local model</span>
+            <span>Model</span>
             <div className="translation-inline-field">
               <select value={visionModel} onChange={(event) => setVisionModel(event.currentTarget.value)}>
                 {visionModelOptions.length ? (
@@ -1197,35 +1804,89 @@ function TranslationWorkspace() {
               </button>
             </div>
           </label>
-        </div>
-        {visionModelsStatus ? <p className="local-model-status">{visionModelsStatus}</p> : null}
 
-        <div className="catalog-strip" aria-label="Old book catalog">
-          {oldBooks.map((entry) => {
-            const isActive = entry.id === activeBook?.id
-            const catalogStatus = entry.pages
-              ? `${entry.status} · ${entry.pages} pages`
-              : entry.pdfSizeBytes
-                ? `${entry.status} · ${formatFileSize(entry.pdfSizeBytes)}`
-                : `${entry.status} · pages pending`
-            return (
+          <div className="translation-actions compact-actions">
+            <label className="button secondary import-file-button" htmlFor="old-book-pdf-import">
+              PDF Import
+            </label>
+            {oldBookBusy ? (
               <button
-                key={entry.id}
-                className={isActive ? 'catalog-book active' : 'catalog-book'}
-                onClick={() => {
-                  setActiveBookId(entry.id)
-                  setActiveSection(entry.pdfBlobId ? entry.section : 'Opening argument')
-                }}
+                className="button danger"
+                onClick={stopTranslationRequest}
                 type="button"
               >
-                <span className="catalog-book-title">{entry.title}</span>
-                <span className="catalog-book-meta">{entry.dateLabel} · {entry.originalLanguage}</span>
-                <span className="catalog-book-status">{catalogStatus}</span>
+                Stop
               </button>
-            )
-          })}
+            ) : null}
+            <button
+              className="button secondary"
+              onClick={resetTranslationControls}
+              type="button"
+            >
+              Reset
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void snapshotAllPages()}
+              disabled={oldBookBusy || !activeBook?.pdfBlobId}
+              type="button"
+            >
+              Snapshot All
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void translateAllPages()}
+              disabled={oldBookBusy || !activeBook?.pdfBlobId}
+              type="button"
+            >
+              Translate All
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => setMemoryOpen(true)}
+              disabled={!activeBook}
+              type="button"
+            >
+              Memory
+            </button>
+            <button
+              className="button secondary"
+              onClick={openAllSnapshots}
+              disabled={!sortedSnapshots.length}
+              type="button"
+            >
+              Snapshots
+            </button>
+          </div>
+          </div>
         </div>
-        {oldBookStatus ? <p className="status">{oldBookStatus}</p> : null}
+
+        <div className="translation-toolbar-meta">
+          <span>{activeBook?.dateLabel ?? 'Unknown date'} · {activeBook?.originalLanguage ?? 'Unknown language'} · {activeBook?.status ?? 'Ready'}</span>
+          {visionModelsStatus ? <span>{visionModelsStatus}</span> : null}
+          {oldBookStatus ? <span className="translation-current-status">{oldBookStatus}</span> : null}
+        </div>
+        {snapshotProgress ? (
+          <div className="snapshot-progress-strip">
+            <div className="snapshot-progress-copy">
+              <strong>{snapshotProgress.phase === 'saving' ? 'Saving snapshots' : snapshotProgress.phase === 'rendering' ? 'Rendering snapshots' : 'Preparing snapshots'}</strong>
+              <span>{snapshotProgress.message}</span>
+              <span>{snapshotProgress.current} of {snapshotProgress.total || '?'}</span>
+            </div>
+            <div className="snapshot-progress-track" aria-label="Snapshot progress">
+              <span style={{ width: `${snapshotProgressPercent}%` }} />
+            </div>
+          </div>
+        ) : null}
+        {displayedTranslationJob ? (
+          <div className="translation-job-strip">
+            <strong>{displayedTranslationJob.status === 'running' ? 'Translate All running' : `Translate All ${displayedTranslationJob.status}`}</strong>
+            <span>Page {displayedTranslationJob.currentPage || 1} of {displayedTranslationJob.totalPages || activePageCount}</span>
+            <span>{displayedTranslationJob.phase}</span>
+            <span>{displayedTranslationJob.completedPages} saved · {displayedTranslationJob.skippedPages} skipped</span>
+            <span>{displayedTranslationJob.message}</span>
+          </div>
+        ) : null}
       </section>
 
       <section className="translation-reader-grid" aria-label="Side by side reader">
@@ -1272,8 +1933,13 @@ function TranslationWorkspace() {
           </header>
 
           <div className="pdf-viewer-shell">
-            {activePdfFrameSrc ? (
+            {activePageSnapshot ? (
+              <div className="pdf-page-stage active-snapshot">
+                <img src={activePageSnapshot.imageDataUrl} alt={`Snapshot of page ${activePageNumber}`} />
+              </div>
+            ) : activePdfFrameSrc ? (
               <iframe
+                key={activePdfFrameSrc}
                 className="pdf-frame"
                 src={activePdfFrameSrc}
                 title={`${activeBook?.title ?? 'Imported PDF'} preview`}
@@ -1322,9 +1988,22 @@ function TranslationWorkspace() {
                     ? 'Snapshot ready · Translate Page will reuse it'
                     : 'Snapshot needed'}
               </span>
-              {hasImportedPdf ? <small>{translatedPageCount} of {activePageCount} pages translated</small> : null}
+              {hasImportedPdf ? (
+                <small>
+                  {translatedPageCount} of {activePageCount} pages translated
+                  {complexity !== 'original' ? ` · ${canonicalOriginalTranslation ? 'Original source ready' : 'Original source needed'}` : ''}
+                </small>
+              ) : null}
             </div>
             <div className="page-action-buttons">
+              <button
+                className="button secondary"
+                onClick={() => setSourceInspectorOpen(true)}
+                disabled={!currentSourceLines.length && !previousSourceLines.length}
+                type="button"
+              >
+                Source OCR
+              </button>
               <button
                 className="button secondary"
                 onClick={openActivePageSnapshot}
@@ -1416,6 +2095,115 @@ function TranslationWorkspace() {
           </div>
         </article>
       </section>
+
+      {sourceInspectorOpen ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel source-modal">
+            <header className="modal-header">
+              <div>
+                <h2>Source Transcription</h2>
+                <p>{activeBook?.title ?? 'Imported book'} · Page {activePageNumber}</p>
+              </div>
+              <button className="icon-button" onClick={() => setSourceInspectorOpen(false)} type="button">x</button>
+            </header>
+
+            <div className="source-inspector-grid">
+              <section className="source-lines-panel">
+                <header>
+                  <strong>Previous page context</strong>
+                  <span>Page {Math.max(1, activePageNumber - 1)}</span>
+                </header>
+                {previousSourceLines.length ? (
+                  <ol>
+                    {previousSourceLines.map((line, index) => (
+                      <li key={`${line}-${index}`}>{line}</li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="muted">
+                    No previous-page source transcription is stored yet. Translate page {Math.max(1, activePageNumber - 1)} as Original first to create it.
+                  </p>
+                )}
+              </section>
+
+              <section className="source-lines-panel">
+                <header>
+                  <strong>Current page source</strong>
+                  <span>Page {activePageNumber}</span>
+                </header>
+                {currentSourceLines.length ? (
+                  <ol>
+                    {currentSourceLines.map((line, index) => (
+                      <li key={`${line}-${index}`}>{line}</li>
+                    ))}
+                  </ol>
+                ) : (
+                  <p className="muted">
+                    No source-language transcription is stored for this page yet. Translate this page as Original to generate it from the snapshot.
+                  </p>
+                )}
+              </section>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {memoryOpen ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel memory-modal">
+            <header className="modal-header">
+              <div>
+                <h2>Translation Memory</h2>
+                <p>{activeBook?.title ?? 'Imported book'} · {approvedMemoryCount} approved of {translationMemoryRows.length} terms</p>
+              </div>
+              <button className="icon-button" onClick={() => setMemoryOpen(false)} type="button">x</button>
+            </header>
+
+            {translationMemoryRows.length ? (
+              <div className="memory-table-wrap">
+                <table className="memory-table">
+                  <thead>
+                    <tr>
+                      <th>Status</th>
+                      <th>Source term</th>
+                      <th>Approved translation</th>
+                      <th>Context</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {translationMemoryRows.map((entry) => {
+                      const persisted = activeBook?.translationMemory.some((memoryEntry) =>
+                        glossaryKey(memoryEntry.sourceTerm, memoryEntry.translatedTerm) === glossaryKey(entry.sourceTerm, entry.translatedTerm)
+                      )
+                      const status = entry.approved ? 'Approved' : persisted ? 'Pending' : 'Suggested'
+                      return (
+                        <tr key={`${entry.id}-${entry.sourceTerm}-${entry.translatedTerm}`}>
+                          <td><span className={entry.approved ? 'memory-status approved' : 'memory-status'}>{status}</span></td>
+                          <td>{entry.sourceTerm || '-'}</td>
+                          <td>{entry.translatedTerm || '-'}</td>
+                          <td>{entry.explanation || '-'}</td>
+                          <td>
+                            <button
+                              className="mini-button"
+                              onClick={() => void setMemoryApproval(entry, !entry.approved)}
+                              type="button"
+                            >
+                              {entry.approved ? 'Unapprove' : 'Approve'}
+                            </button>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="muted">No glossary terms have been extracted yet.</p>
+            )}
+          </section>
+        </div>
+      ) : null}
 
       {snapshotsOpen ? (
         <div className="modal-backdrop">
