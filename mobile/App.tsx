@@ -36,12 +36,14 @@ import {
 } from "./src/llmAssist";
 import { readBookSourceText, readSelectableBookSourceText } from "./src/paperAssets";
 import { importPaperFromInput } from "./src/paperImport";
+import { deleteInstalledPackage, installPackageFromUrl, loadInstalledPackages } from "./src/packageStore";
 import { sampleBook } from "./src/sampleBook";
 import { defaultReaderSettings, loadReaderSettings, saveReaderSettings } from "./src/settingsStore";
+import type { InstalledPackage, PortableBookPage, PortablePageTranslation } from "./src/packageTypes";
 import type { AiNote, AiNoteKind, Book, OutlineNode, Resource, Section, TokenUsage } from "./src/types";
 
 type ThemeId = "paper" | "sepia" | "night";
-type AddMode = "book" | "paper" | "json";
+type AddMode = "book" | "paper" | "package" | "json";
 
 const themes: Record<ThemeId, {
   background: string;
@@ -169,6 +171,27 @@ function splitParagraphs(content: string) {
     .split(/\n{2,}/)
     .map((part) => part.trim())
     .filter(Boolean);
+}
+
+function packageTranslationRows(pkg: InstalledPackage | undefined, language: string) {
+  if (!pkg) return [];
+  return pkg.translations[language] ?? pkg.translations[pkg.defaultLanguage] ?? Object.values(pkg.translations)[0] ?? [];
+}
+
+function packagePageNumbers(pkg: InstalledPackage | undefined, language: string) {
+  return packageTranslationRows(pkg, language)
+    .map((row) => row.pageNumber)
+    .sort((left, right) => left - right);
+}
+
+function choosePackageTranslation(translations: PortablePageTranslation[]) {
+  return translations.find((entry) => entry.complexity === "simplified")
+    ?? translations.find((entry) => entry.complexity === "original")
+    ?? translations[0];
+}
+
+function packagePageMetadata(pkg: InstalledPackage | undefined, pageNumber: number): PortableBookPage | undefined {
+  return pkg?.pages.find((page) => page.pageNumber === pageNumber);
 }
 
 function sourceResources(book: Book): Resource[] {
@@ -511,8 +534,13 @@ function findAssistNote(book: Book, section: Section, mode: AssistMode, question
 
 export default function App() {
   const [books, setBooks] = useState<Book[]>([sampleBook]);
+  const [publishedPackages, setPublishedPackages] = useState<InstalledPackage[]>([]);
   const [storedBookIds, setStoredBookIds] = useState<string[]>([]);
+  const [activeReaderKind, setActiveReaderKind] = useState<"custom" | "published">("custom");
   const [activeBookId, setActiveBookId] = useState(sampleBook.id);
+  const [activePackageId, setActivePackageId] = useState("");
+  const [activePackageLanguage, setActivePackageLanguage] = useState("");
+  const [activePackagePageNumber, setActivePackagePageNumber] = useState(1);
   const [activeNodeId, setActiveNodeId] = useState(() => flattenBook(sampleBook)[0]?.nodeId ?? "");
   const [themeId, setThemeId] = useState<ThemeId>("sepia");
   const [fontSize, setFontSize] = useState(19);
@@ -522,6 +550,8 @@ export default function App() {
   const [editOpen, setEditOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("book");
   const [importText, setImportText] = useState("");
+  const [packageUrl, setPackageUrl] = useState("");
+  const [packageBusy, setPackageBusy] = useState(false);
   const [paperInput, setPaperInput] = useState("");
   const [paperBusy, setPaperBusy] = useState(false);
   const [statusText, setStatusText] = useState("");
@@ -547,10 +577,14 @@ export default function App() {
 
   const refreshBooks = async () => {
     try {
-      const storedBooks = await loadStoredBooks();
+      const [storedBooks, installedPackages] = await Promise.all([
+        loadStoredBooks(),
+        loadInstalledPackages(),
+      ]);
       const storedSample = storedBooks.find((book) => book.id === sampleBook.id);
       setBooks([storedSample ?? sampleBook, ...storedBooks.filter((book) => book.id !== sampleBook.id)]);
       setStoredBookIds(storedBooks.map((book) => book.id));
+      setPublishedPackages(installedPackages);
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : String(error));
     }
@@ -571,6 +605,19 @@ export default function App() {
   }, [assistOpen]);
 
   const activeBook = books.find((book) => book.id === activeBookId) ?? books[0] ?? sampleBook;
+  const activePackage = publishedPackages.find((pkg) => pkg.packageId === activePackageId);
+  const activePackageLanguageValue = activePackageLanguage || activePackage?.defaultLanguage || activePackage?.languages[0] || "";
+  const activePackagePageNumbers = useMemo(
+    () => packagePageNumbers(activePackage, activePackageLanguageValue),
+    [activePackage, activePackageLanguageValue],
+  );
+  const activePackagePageIndex = Math.max(0, activePackagePageNumbers.indexOf(activePackagePageNumber));
+  const activePackageCurrentPageNumber = activePackagePageNumbers[activePackagePageIndex] ?? activePackagePageNumbers[0] ?? 1;
+  const activePackageRows = packageTranslationRows(activePackage, activePackageLanguageValue);
+  const activePackageRow = activePackageRows.find((row) => row.pageNumber === activePackageCurrentPageNumber);
+  const activePackageTranslation = choosePackageTranslation(activePackageRow?.translations ?? []);
+  const activePackagePage = packagePageMetadata(activePackage, activePackageCurrentPageNumber);
+  const readingPublishedPackage = activeReaderKind === "published" && Boolean(activePackage);
   const flatSections = useMemo(() => flattenBook(activeBook), [activeBook]);
   const activeFlatIndex = Math.max(0, flatSections.findIndex((entry) => entry.nodeId === activeNodeId));
   const activeFlatSection = flatSections[activeFlatIndex] ?? flatSections[0];
@@ -601,13 +648,30 @@ export default function App() {
 
   const openBook = (book: Book) => {
     const firstSection = flattenBook(book)[0];
+    setActiveReaderKind("custom");
     setActiveBookId(book.id);
     setActiveNodeId(firstSection?.nodeId ?? book.outline[0]?.id ?? "");
     setLibraryOpen(false);
     setStatusText("");
   };
 
+  const openPackage = (pkg: InstalledPackage) => {
+    const language = pkg.languages.includes(pkg.defaultLanguage) ? pkg.defaultLanguage : pkg.languages[0] ?? "";
+    const pageNumbers = packagePageNumbers(pkg, language);
+    setActiveReaderKind("published");
+    setActivePackageId(pkg.packageId);
+    setActivePackageLanguage(language);
+    setActivePackagePageNumber(pageNumbers[0] ?? 1);
+    setLibraryOpen(false);
+    setStatusText("");
+  };
+
   const moveSection = (delta: number) => {
+    if (readingPublishedPackage) {
+      const nextPage = activePackagePageNumbers[activePackagePageIndex + delta];
+      if (nextPage) setActivePackagePageNumber(nextPage);
+      return;
+    }
     const next = flatSections[activeFlatIndex + delta];
     if (!next) return;
     setActiveNodeId(next.nodeId);
@@ -711,11 +775,36 @@ export default function App() {
     }
   };
 
+  const importPackage = async () => {
+    setPackageBusy(true);
+    try {
+      const installed = await installPackageFromUrl(packageUrl);
+      setPackageUrl("");
+      setAddOpen(false);
+      await refreshBooks();
+      openPackage(installed);
+      setStatusText(`Installed "${installed.title}".`);
+    } catch (error) {
+      Alert.alert("Package import failed", error instanceof Error ? error.message : String(error));
+    } finally {
+      setPackageBusy(false);
+    }
+  };
+
   const removeBook = async (book: Book) => {
     if (!storedBookIds.includes(book.id)) return;
     await deleteStoredBook(book.id);
     await refreshBooks();
     if (book.id === activeBookId) {
+      openBook(sampleBook);
+    }
+  };
+
+  const removePackage = async (pkg: InstalledPackage) => {
+    await deleteInstalledPackage(pkg.packageId);
+    await refreshBooks();
+    if (pkg.packageId === activePackageId) {
+      setActiveReaderKind("custom");
       openBook(sampleBook);
     }
   };
@@ -910,12 +999,12 @@ export default function App() {
         <View style={styles.headerTitleBlock}>
           <Text style={[styles.eyebrow, { color: theme.muted }]}>BookForge Reader</Text>
           <Text numberOfLines={2} style={[styles.headerTitle, { color: theme.text }]}>
-            {activeBook.title}
+            {readingPublishedPackage ? activePackage?.title : activeBook.title}
           </Text>
         </View>
         <View style={styles.headerActions}>
           <AppButton label="Library" onPress={() => setLibraryOpen(true)} theme={theme} variant="ghost" compact />
-          <AppButton label="Edit" onPress={() => setEditOpen(true)} theme={theme} variant="ghost" compact />
+          <AppButton label="Edit" onPress={() => setEditOpen(true)} disabled={readingPublishedPackage} theme={theme} variant="ghost" compact />
           <AppButton label="Add" onPress={() => setAddOpen(true)} theme={theme} compact />
         </View>
       </View>
@@ -925,82 +1014,164 @@ export default function App() {
         contentContainerStyle={styles.readerContent}
         showsVerticalScrollIndicator={false}
       >
-        <Text style={[styles.chapterTitle, { color: theme.muted }]}>
-          {activeChapter?.title ?? "Chapter"}
-        </Text>
-        <Text style={[styles.sectionTitle, { color: theme.text }]}>
-          {activeSection.title}
-        </Text>
-
-        <View style={styles.metaRow}>
-          <Pill text={activeSection.persona} theme={theme} />
-          {activeBook.source?.type ? <Pill text={activeBook.source.type} theme={theme} /> : null}
-          {activeSection.durationMinutes ? (
-            <Pill text={`${activeSection.durationMinutes} min`} theme={theme} />
-          ) : null}
-          {activeSection.keywords.slice(0, 3).map((keyword) => (
-            <Pill key={keyword} text={keyword} theme={theme} />
-          ))}
-        </View>
-
-        <View style={[styles.readingSurface, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-          {contentParagraphs.map((paragraph, index) => (
-            <Text
-              key={`${activeSection.id}-${index}`}
-              style={[styles.paragraph, { color: theme.text, fontSize, lineHeight: Math.round(fontSize * 1.58) }]}
-            >
-              {paragraph}
+        {readingPublishedPackage ? (
+          <>
+            <Text style={[styles.chapterTitle, { color: theme.muted }]}>
+              Published Package
             </Text>
-          ))}
-        </View>
-
-        <TopicNotesAccordion
-          notes={activeTopicNotes}
-          onAskSelection={(action, selectedText) => {
-            setAssistOpen(true);
-            void askAboutSelectedText(action, selectedText);
-          }}
-          onRemove={removeAiNote}
-          theme={theme}
-        />
-
-        {readingResources.length || activeBook.source?.localTextPath ? (
-          <View style={styles.resourcePanel}>
-            <Text style={[styles.resourceTitle, { color: theme.muted }]}>Sources</Text>
-            <View style={styles.resourceButtons}>
-              {activeBook.source?.localTextPath ? (
-                <AppButton
-                  label="Paper Text"
-                  onPress={openPaperText}
-                  theme={theme}
-                  variant="ghost"
-                  compact
-                />
-              ) : null}
-              {readingResources.map((resource) => (
-                <AppButton
-                  key={`${resource.label}-${resource.value}`}
-                  label={resource.label || resource.type}
-                  onPress={() => openResource(resource)}
-                  theme={theme}
-                  variant="ghost"
-                  compact
-                />
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>
+              {activePackageTranslation?.title || activePackagePage?.sectionTitle || `Page ${activePackageCurrentPageNumber}`}
+            </Text>
+            <View style={styles.metaRow}>
+              <Pill text={activePackageLanguageValue || "language"} theme={theme} />
+              <Pill text={`Page ${activePackageCurrentPageNumber}`} theme={theme} />
+              {activePackageTranslation?.complexity ? <Pill text={activePackageTranslation.complexity} theme={theme} /> : null}
+              {activePackage?.version ? <Pill text={`v${activePackage.version} r${activePackage.revision}`} theme={theme} /> : null}
+            </View>
+            {activePackage && activePackage.languages.length > 1 ? (
+              <View style={styles.packageLanguageRow}>
+                {activePackage.languages.map((language) => (
+                  <AppButton
+                    key={language}
+                    label={language}
+                    onPress={() => {
+                      const pageNumbers = packagePageNumbers(activePackage, language);
+                      setActivePackageLanguage(language);
+                      setActivePackagePageNumber(pageNumbers[0] ?? 1);
+                    }}
+                    theme={theme}
+                    variant={language === activePackageLanguageValue ? "solid" : "ghost"}
+                    compact
+                  />
+                ))}
+              </View>
+            ) : null}
+            <View style={[styles.readingSurface, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              {(activePackageTranslation?.paragraphs.length ? activePackageTranslation.paragraphs : ["No translation is available for this page."]).map((paragraph, index) => (
+                <Text
+                  key={`package-${activePackage?.packageId}-${activePackageCurrentPageNumber}-${index}`}
+                  style={[styles.paragraph, { color: theme.text, fontSize, lineHeight: Math.round(fontSize * 1.58) }]}
+                >
+                  {paragraph}
+                </Text>
               ))}
             </View>
-          </View>
-        ) : null}
+            {activePackagePage?.sourceLines.length ? (
+              <View style={styles.resourcePanel}>
+                <Text style={[styles.resourceTitle, { color: theme.muted }]}>Source Lines</Text>
+                {activePackagePage.sourceLines.slice(0, 8).map((line, index) => (
+                  <Text key={`${activePackageCurrentPageNumber}-source-${index}`} style={[styles.libraryMeta, { color: theme.muted }]}>
+                    {index + 1}. {line}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+            {activePackage?.glossary.length ? (
+              <View style={styles.resourcePanel}>
+                <Text style={[styles.resourceTitle, { color: theme.muted }]}>Glossary</Text>
+                {activePackage.glossary.slice(0, 10).map((term) => (
+                  <Text key={`${term.sourceTerm}-${term.translatedTerm}`} style={[styles.libraryMeta, { color: theme.muted }]}>
+                    {term.sourceTerm} {"->"} {term.translatedTerm}{term.explanation ? `: ${term.explanation}` : ""}
+                  </Text>
+                ))}
+              </View>
+            ) : null}
+          </>
+        ) : (
+          <>
+            <Text style={[styles.chapterTitle, { color: theme.muted }]}>
+              {activeChapter?.title ?? "Chapter"}
+            </Text>
+            <Text style={[styles.sectionTitle, { color: theme.text }]}>
+              {activeSection.title}
+            </Text>
+
+            <View style={styles.metaRow}>
+              <Pill text={activeSection.persona} theme={theme} />
+              {activeBook.source?.type ? <Pill text={activeBook.source.type} theme={theme} /> : null}
+              {activeSection.durationMinutes ? (
+                <Pill text={`${activeSection.durationMinutes} min`} theme={theme} />
+              ) : null}
+              {activeSection.keywords.slice(0, 3).map((keyword) => (
+                <Pill key={keyword} text={keyword} theme={theme} />
+              ))}
+            </View>
+
+            <View style={[styles.readingSurface, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+              {contentParagraphs.map((paragraph, index) => (
+                <Text
+                  key={`${activeSection.id}-${index}`}
+                  style={[styles.paragraph, { color: theme.text, fontSize, lineHeight: Math.round(fontSize * 1.58) }]}
+                >
+                  {paragraph}
+                </Text>
+              ))}
+            </View>
+
+            <TopicNotesAccordion
+              notes={activeTopicNotes}
+              onAskSelection={(action, selectedText) => {
+                setAssistOpen(true);
+                void askAboutSelectedText(action, selectedText);
+              }}
+              onRemove={removeAiNote}
+              theme={theme}
+            />
+
+            {readingResources.length || activeBook.source?.localTextPath ? (
+              <View style={styles.resourcePanel}>
+                <Text style={[styles.resourceTitle, { color: theme.muted }]}>Sources</Text>
+                <View style={styles.resourceButtons}>
+                  {activeBook.source?.localTextPath ? (
+                    <AppButton
+                      label="Paper Text"
+                      onPress={openPaperText}
+                      theme={theme}
+                      variant="ghost"
+                      compact
+                    />
+                  ) : null}
+                  {readingResources.map((resource) => (
+                    <AppButton
+                      key={`${resource.label}-${resource.value}`}
+                      label={resource.label || resource.type}
+                      onPress={() => openResource(resource)}
+                      theme={theme}
+                      variant="ghost"
+                      compact
+                    />
+                  ))}
+                </View>
+              </View>
+            ) : null}
+          </>
+        )}
       </ScrollView>
 
       <View style={[styles.footer, { borderColor: theme.border, backgroundColor: theme.background }]}>
         <View style={styles.footerTopRow}>
-          <AppButton label="Prev" onPress={() => moveSection(-1)} disabled={activeFlatIndex <= 0} theme={theme} variant="ghost" />
-          <Text style={[styles.progress, { color: theme.muted }]}>{progressLabel}</Text>
-          <AppButton label="Next" onPress={() => moveSection(1)} disabled={activeFlatIndex >= flatSections.length - 1} theme={theme} />
+          <AppButton
+            label="Prev"
+            onPress={() => moveSection(-1)}
+            disabled={readingPublishedPackage ? activePackagePageIndex <= 0 : activeFlatIndex <= 0}
+            theme={theme}
+            variant="ghost"
+          />
+          <Text style={[styles.progress, { color: theme.muted }]}>
+            {readingPublishedPackage
+              ? `${Math.min(activePackagePageIndex + 1, activePackagePageNumbers.length)} / ${activePackagePageNumbers.length}`
+              : progressLabel}
+          </Text>
+          <AppButton
+            label="Next"
+            onPress={() => moveSection(1)}
+            disabled={readingPublishedPackage ? activePackagePageIndex >= activePackagePageNumbers.length - 1 : activeFlatIndex >= flatSections.length - 1}
+            theme={theme}
+          />
         </View>
         <View style={styles.controlsRow}>
-          <AppButton label="Assist" onPress={() => setAssistOpen(true)} theme={theme} />
-          <AppButton label={aiNoteCount ? `Notes ${aiNoteCount}` : "Notes"} onPress={() => setNotesOpen(true)} theme={theme} variant="ghost" />
+          <AppButton label="Assist" onPress={() => setAssistOpen(true)} disabled={readingPublishedPackage} theme={theme} />
+          <AppButton label={aiNoteCount ? `Notes ${aiNoteCount}` : "Notes"} onPress={() => setNotesOpen(true)} disabled={readingPublishedPackage} theme={theme} variant="ghost" />
           <AppButton label="A-" onPress={() => setFontSize((value) => Math.max(15, value - 1))} theme={theme} variant="ghost" compact />
           <AppButton label="A+" onPress={() => setFontSize((value) => Math.min(28, value + 1))} theme={theme} variant="ghost" compact />
           {(["paper", "sepia", "night"] as ThemeId[]).map((id) => (
@@ -1018,16 +1189,20 @@ export default function App() {
       </View>
 
       <LibraryModal
+        activePackageId={activePackageId}
         books={books}
+        packages={publishedPackages}
         storedBookIds={storedBookIds}
         activeBookId={activeBookId}
         onClose={() => setLibraryOpen(false)}
         onOpen={openBook}
+        onOpenPackage={openPackage}
         onEdit={(book) => {
           openBook(book);
           setEditOpen(true);
         }}
         onRemove={removeBook}
+        onRemovePackage={removePackage}
         open={libraryOpen}
         theme={theme}
       />
@@ -1038,6 +1213,7 @@ export default function App() {
         createBook={createBook}
         endpoint={assistEndpoint}
         importBook={importBook}
+        importPackage={importPackage}
         importPaper={importPaper}
         importText={importText}
         model={activeAssistModel}
@@ -1045,8 +1221,11 @@ export default function App() {
         open={addOpen}
         paperBusy={paperBusy}
         paperInput={paperInput}
+        packageBusy={packageBusy}
+        packageUrl={packageUrl}
         setAddMode={setAddMode}
         setImportText={setImportText}
+        setPackageUrl={setPackageUrl}
         setPaperInput={setPaperInput}
         theme={theme}
       />
@@ -1206,6 +1385,7 @@ function AddReadingModal({
   createBook,
   endpoint,
   importBook,
+  importPackage,
   importPaper,
   importText,
   model,
@@ -1213,8 +1393,11 @@ function AddReadingModal({
   open,
   paperBusy,
   paperInput,
+  packageBusy,
+  packageUrl,
   setAddMode,
   setImportText,
+  setPackageUrl,
   setPaperInput,
   theme,
 }: {
@@ -1223,6 +1406,7 @@ function AddReadingModal({
   createBook: (book: Book) => void;
   endpoint: string;
   importBook: () => void;
+  importPackage: () => void;
   importPaper: () => void;
   importText: string;
   model: string;
@@ -1230,8 +1414,11 @@ function AddReadingModal({
   open: boolean;
   paperBusy: boolean;
   paperInput: string;
+  packageBusy: boolean;
+  packageUrl: string;
   setAddMode: (mode: AddMode) => void;
   setImportText: (value: string) => void;
+  setPackageUrl: (value: string) => void;
   setPaperInput: (value: string) => void;
   theme: Theme;
 }) {
@@ -1245,6 +1432,7 @@ function AddReadingModal({
         <View style={styles.segmentRow}>
           <AppButton label="Book" onPress={() => setAddMode("book")} theme={theme} variant={addMode === "book" ? "solid" : "ghost"} />
           <AppButton label="Paper" onPress={() => setAddMode("paper")} theme={theme} variant={addMode === "paper" ? "solid" : "ghost"} />
+          <AppButton label="Package" onPress={() => setAddMode("package")} theme={theme} variant={addMode === "package" ? "solid" : "ghost"} />
           <AppButton label="JSON" onPress={() => setAddMode("json")} theme={theme} variant={addMode === "json" ? "solid" : "ghost"} />
         </View>
 
@@ -1274,6 +1462,22 @@ function AddReadingModal({
               value={paperInput}
             />
             <AppButton label={paperBusy ? "Importing..." : "Import Paper"} onPress={importPaper} disabled={!paperInput.trim() || paperBusy} theme={theme} />
+          </View>
+        ) : addMode === "package" ? (
+          <View style={styles.modalBody}>
+            <Text style={[styles.helperText, { color: theme.muted }]}>
+              Install a published `.bookpkg` from TamilSteam or any HTTPS URL. The readable text is saved offline and appears in the Published section of the library.
+            </Text>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setPackageUrl}
+              placeholder="https://example.com/books/my-book-ta.bookpkg"
+              placeholderTextColor={theme.muted}
+              style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              value={packageUrl}
+            />
+            <AppButton label={packageBusy ? "Installing..." : "Install Package"} onPress={importPackage} disabled={!packageUrl.trim() || packageBusy} theme={theme} />
           </View>
         ) : (
           <View style={styles.modalBody}>
@@ -2265,21 +2469,29 @@ function SelectableNoteText({
 
 function LibraryModal({
   activeBookId,
+  activePackageId,
   books,
+  packages,
   onClose,
   onEdit,
   onOpen,
+  onOpenPackage,
   onRemove,
+  onRemovePackage,
   open,
   storedBookIds,
   theme,
 }: {
   activeBookId: string;
+  activePackageId: string;
   books: Book[];
+  packages: InstalledPackage[];
   onClose: () => void;
   onEdit: (book: Book) => void;
   onOpen: (book: Book) => void;
+  onOpenPackage: (pkg: InstalledPackage) => void;
   onRemove: (book: Book) => void;
+  onRemovePackage: (pkg: InstalledPackage) => void;
   open: boolean;
   storedBookIds: string[];
   theme: Theme;
@@ -2313,6 +2525,26 @@ function LibraryModal({
     );
   };
 
+  const renderPackage = (pkg: InstalledPackage) => (
+    <View
+      key={pkg.packageId}
+      style={[styles.libraryItem, { backgroundColor: theme.surface, borderColor: theme.border }]}
+    >
+      <View style={styles.libraryItemText}>
+        <Text style={[styles.libraryTitle, { color: theme.text }]}>{pkg.title}</Text>
+        <Text numberOfLines={2} style={[styles.libraryMeta, { color: theme.muted }]}>
+          {pkg.languages.join(", ") || pkg.defaultLanguage} - {pkg.pages.length} pages - v{pkg.version} r{pkg.revision}
+          {pkg.manifest.publisher?.name ? ` - ${pkg.manifest.publisher.name}` : ""}
+          {pkg.packageId === activePackageId ? " - Open" : ""}
+        </Text>
+      </View>
+      <View style={styles.libraryActions}>
+        <AppButton label="Read" onPress={() => onOpenPackage(pkg)} theme={theme} compact />
+        <AppButton label="Delete" onPress={() => onRemovePackage(pkg)} theme={theme} variant="ghost" compact />
+      </View>
+    </View>
+  );
+
   return (
     <Modal animationType="slide" visible={open} presentationStyle="pageSheet">
       <SafeAreaView style={[styles.modalShell, { backgroundColor: theme.background }]}>
@@ -2320,7 +2552,7 @@ function LibraryModal({
           <View style={styles.noteTitleBlock}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Books</Text>
             <Text style={[styles.noteMeta, { color: theme.muted }]}>
-              {storedBooks.length} saved locally - {books.length} total
+              {storedBooks.length} custom - {packages.length} published
             </Text>
           </View>
           <AppButton label="Close" onPress={onClose} theme={theme} variant="ghost" />
@@ -2331,6 +2563,14 @@ function LibraryModal({
             <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
               <Text style={[styles.helperText, { color: theme.muted }]}>
                 Created and imported books will appear here.
+              </Text>
+            </View>
+          )}
+          <Text style={[styles.previewLabel, { color: theme.muted }]}>Published</Text>
+          {packages.length ? packages.map(renderPackage) : (
+            <View style={[styles.emptyNotes, { borderColor: theme.border }]}>
+              <Text style={[styles.helperText, { color: theme.muted }]}>
+                Installed translated packages will appear here.
               </Text>
             </View>
           )}
@@ -2443,6 +2683,12 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 8,
+  },
+  packageLanguageRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 14,
   },
   topicNotesPanel: {
     borderTopWidth: 1,

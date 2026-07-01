@@ -61,6 +61,19 @@ type PortableBookPackage = {
   defaultLanguage: string
   contentHash?: string
   exportedAt: string
+  publisher?: {
+    name?: string
+  }
+  changelog?: string
+  license?: string
+  rightsStatus?: string
+  sourceUrl?: string
+  volume?: {
+    index: number
+    total: number
+    pageStart: number
+    pageEnd: number
+  }
   source: {
     app: 'book-reader'
     appBookId: string
@@ -175,6 +188,75 @@ Book Reader supports two package scopes:
 Both modes include saved page snapshots under `assets/pages/`. Both modes include `source/original.pdf` when the imported PDF is still available locally.
 
 The all-languages package is best for publisher backup, TamilSteam import, and preparing a multi-language library. Individual language packages are smaller and are better for mobile sync when a reader only wants one language.
+
+## EPUB and PDF Derivatives
+
+`.bookpkg` remains the canonical publisher package. EPUB and PDF exports are derivatives generated from the same portable package payload so TamilSteam, mobile readers, and store uploads do not drift.
+
+Book Reader currently supports:
+
+- **EPUB**: exports the selected language and selected complexity as an EPUB 3 archive. The file contains required EPUB metadata, navigation, stylesheet, and one XHTML chapter per page. This is the preferred Kindle/KDP ebook upload format.
+- **PDF / Print**: opens a print-optimized reader view for the selected language and complexity. Use the browser print dialog to save it as PDF. This is best for proofing, print review, and fixed page distribution.
+
+Store-facing EPUB/PDF output should be treated as a publishing step, not the archival source. Keep the `.bookpkg` and rights dossier with the exact exported EPUB/PDF so the published artifact can be reproduced.
+
+## Publisher Metadata
+
+Book Reader exposes package metadata controls before export:
+
+- Publisher name.
+- Package `version`.
+- Package `revision`.
+- Changelog.
+- License.
+- Rights status.
+- Source URL.
+
+These fields are written into `manifest.json`. They are package-level publisher metadata, not translation model metadata.
+
+## Asset Strategy
+
+Book Reader supports export options for package size and reader performance:
+
+- Include or exclude the original PDF.
+- Include or exclude page snapshots.
+- Export snapshots as PNG or JPEG.
+- Resize snapshots to a maximum image width.
+- Control JPEG quality.
+- Generate thumbnails under `assets/thumbnails/`.
+- Split large books into page-count volumes.
+
+When volume splitting is enabled, each exported `.bookpkg` contains only the pages, translations, and page assets for that volume. `manifest.volume` identifies the volume index, total volume count, and page range.
+
+## Package Inspector
+
+Book Reader can open a local `.bookpkg` file and inspect it before upload:
+
+- Reads `manifest.json`.
+- Shows title, package ID, book ID, version, revision, publisher, rights, languages, page count, and asset count.
+- Parses `content/pages.json`.
+- Parses all `content/translations.{language}.json` files.
+- Validates each manifest file entry with SHA-256.
+- Shows a sample translation preview per language.
+
+The current inspector supports the uncompressed ZIP-compatible `.bookpkg` archives emitted by Book Reader.
+
+## Mobile Install Safety
+
+The mobile reader treats `.bookpkg` files as untrusted until validation succeeds:
+
+- Rejects packages above the configured size limit.
+- Rejects compressed, streaming, truncated, or duplicate ZIP entries.
+- Rejects unsafe paths such as absolute paths, backslashes, empty path segments, or `..`.
+- Allows only expected top-level package paths and file extensions.
+- Requires supported `schemaVersion` and `packageType`.
+- Requires package identity, revision, default language, book metadata, and a manifest file list.
+- Verifies every `files[].sha256` entry before install.
+- Verifies `contentHash` against readable content files.
+- Enforces limits for file count, JSON file size, pages, languages, and translation records.
+- Stores only parsed readable package metadata/content, not executable package content.
+
+Future signed publishing should add `manifest.signature` verification so mobile readers can trust packages from approved publisher keys.
 
 ## Mapping From Book Reader
 

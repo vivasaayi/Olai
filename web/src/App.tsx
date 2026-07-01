@@ -97,12 +97,29 @@ type PortableBookPackage = {
   defaultLanguage: string
   contentHash?: string
   exportedAt: string
+  publisher?: PortablePublisherMetadata
+  changelog?: string
+  license?: string
+  rightsStatus?: string
+  sourceUrl?: string
+  volume?: PortablePackageVolume
   source: {
     app: 'book-reader'
     appBookId: string
   }
   files?: PortablePackageFileManifest[]
   book: PortableBook
+}
+
+type PortablePublisherMetadata = {
+  name?: string
+}
+
+type PortablePackageVolume = {
+  index: number
+  total: number
+  pageStart: number
+  pageEnd: number
 }
 
 type PortablePackageFileManifest = {
@@ -178,9 +195,48 @@ type PortablePackageFile = {
   bytes: Uint8Array
 }
 
+type EpubChapter = {
+  id: string
+  path: string
+  title: string
+  bodyHtml: string
+}
+
 type PortablePackageExportScope =
   | { kind: 'language', language: TranslationLanguage }
   | { kind: 'all', defaultLanguage: TranslationLanguage }
+
+type PortablePackageMetadataDraft = {
+  publisherName: string
+  version: string
+  revision: number
+  changelog: string
+  license: string
+  rightsStatus: string
+  sourceUrl: string
+}
+
+type PortablePackageAssetOptions = {
+  includeSourcePdf: boolean
+  includeSnapshots: boolean
+  includeThumbnails: boolean
+  imageFormat: 'png' | 'jpeg'
+  imageMaxWidth: number
+  jpegQuality: number
+  pagesPerVolume: number
+}
+
+type PortablePackageInspectorState = {
+  open: boolean
+  fileName: string
+  status: string
+  manifest?: PortableBookPackage
+  files: PortablePackageFileManifest[]
+  validation: { path: string, status: 'ok' | 'missing' | 'mismatch', detail: string }[]
+  pages: PortableBookPage[]
+  translations: { language: string, pageCount: number, translationCount: number, sample?: PortablePageTranslation }[]
+  error?: string
+}
 
 const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'download']
 const personas: NodePersona[] = ['default', 'kids', 'beginner', 'formal', 'college']
@@ -1075,6 +1131,55 @@ function dataUrlToBytes(dataUrl: string) {
   return new TextEncoder().encode(decodeURIComponent(payload))
 }
 
+function bytesToText(bytes: Uint8Array) {
+  return new TextDecoder().decode(bytes)
+}
+
+function parseJsonBytes<T>(bytes: Uint8Array): T {
+  return JSON.parse(bytesToText(bytes)) as T
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '')
+    reader.onerror = () => reject(reader.error ?? new Error('Unable to read image blob.'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+async function transformImageDataUrl(
+  dataUrl: string,
+  options: { format: 'png' | 'jpeg', maxWidth: number, jpegQuality: number },
+) {
+  if (!dataUrl || (options.format === 'png' && !options.maxWidth)) return dataUrl
+
+  const image = new Image()
+  image.decoding = 'async'
+  image.src = dataUrl
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve()
+    image.onerror = () => reject(new Error('Unable to load snapshot image.'))
+  })
+
+  const scale = options.maxWidth && image.naturalWidth > options.maxWidth
+    ? options.maxWidth / image.naturalWidth
+    : 1
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+  canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+  const context = canvas.getContext('2d')
+  if (!context) return dataUrl
+  context.drawImage(image, 0, 0, canvas.width, canvas.height)
+  const mimeType = options.format === 'jpeg' ? 'image/jpeg' : 'image/png'
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, mimeType, options.jpegQuality))
+  return blob ? blobToDataUrl(blob) : dataUrl
+}
+
+function portablePackageLanguages(book: PortableBook) {
+  return Array.from(new Set(book.pages.flatMap((page) => page.translations.map((translation) => translation.language)))).sort()
+}
+
 function sanitizePackagePathPart(value: string) {
   return slugifyFileName(value).replace(/\./g, '-') || 'asset'
 }
@@ -1083,6 +1188,11 @@ function pageAssetPath(asset: PortableBookAsset) {
   const pageNumber = String(asset.pageNumber ?? 0).padStart(4, '0')
   const extension = asset.mimeType === 'image/jpeg' ? 'jpg' : asset.mimeType === 'image/webp' ? 'webp' : 'png'
   return `assets/pages/page-${pageNumber}-${sanitizePackagePathPart(asset.id)}.${extension}`
+}
+
+function thumbnailAssetPath(asset: PortableBookAsset) {
+  const pageNumber = String(asset.pageNumber ?? 0).padStart(4, '0')
+  return `assets/thumbnails/page-${pageNumber}-${sanitizePackagePathPart(asset.id)}.jpg`
 }
 
 function concatBytes(chunks: Uint8Array[]) {
@@ -1132,7 +1242,7 @@ function currentDosDateTime() {
   return { time, date }
 }
 
-function createZipBlob(files: PortablePackageFile[]) {
+function createZipBlob(files: PortablePackageFile[], type = 'application/vnd.portable-translation-book+zip') {
   const encoder = new TextEncoder()
   const { time, date } = currentDosDateTime()
   const localChunks: Uint8Array[] = []
@@ -1196,9 +1306,57 @@ function createZipBlob(files: PortablePackageFile[]) {
   writeUint32(endView, 16, localOffset)
   writeUint16(endView, 20, 0)
 
-  return new Blob([concatBytes([...localChunks, centralDirectory, endRecord])], {
-    type: 'application/vnd.portable-translation-book+zip',
-  })
+  return new Blob([concatBytes([...localChunks, centralDirectory, endRecord])], { type })
+}
+
+function readUint16(bytes: Uint8Array, offset: number) {
+  return new DataView(bytes.buffer, bytes.byteOffset + offset, 2).getUint16(0, true)
+}
+
+function readUint32(bytes: Uint8Array, offset: number) {
+  return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(0, true)
+}
+
+function parseZipPackage(bytes: Uint8Array) {
+  const decoder = new TextDecoder()
+  const files = new Map<string, Uint8Array>()
+  let offset = 0
+
+  while (offset + 30 <= bytes.length) {
+    const signature = readUint32(bytes, offset)
+    if (signature === 0x02014b50 || signature === 0x06054b50) break
+    if (signature !== 0x04034b50) throw new Error('Unsupported package: local ZIP header not found.')
+
+    const flags = readUint16(bytes, offset + 6)
+    const compression = readUint16(bytes, offset + 8)
+    const compressedSize = readUint32(bytes, offset + 18)
+    const fileNameLength = readUint16(bytes, offset + 26)
+    const extraLength = readUint16(bytes, offset + 28)
+    const nameStart = offset + 30
+    const dataStart = nameStart + fileNameLength + extraLength
+    const dataEnd = dataStart + compressedSize
+    if (dataEnd > bytes.length) throw new Error('Unsupported package: truncated ZIP entry.')
+    if (flags & 0x0008) throw new Error('Unsupported package: streaming ZIP entries are not supported yet.')
+    if (compression !== 0) throw new Error('Unsupported package: compressed ZIP entries are not supported yet.')
+
+    const path = decoder.decode(bytes.slice(nameStart, nameStart + fileNameLength))
+    files.set(path, bytes.slice(dataStart, dataEnd))
+    offset = dataEnd
+  }
+
+  return files
+}
+
+function packageVolumeRanges(pageNumbers: number[], pagesPerVolume: number) {
+  if (!pagesPerVolume || pagesPerVolume <= 0 || pageNumbers.length <= pagesPerVolume) {
+    return [{ index: 1, total: 1, pages: pageNumbers }]
+  }
+
+  const ranges: { index: number, total: number, pages: number[] }[] = []
+  for (let index = 0; index < pageNumbers.length; index += pagesPerVolume) {
+    ranges.push({ index: ranges.length + 1, total: 0, pages: pageNumbers.slice(index, index + pagesPerVolume) })
+  }
+  return ranges.map((range) => ({ ...range, total: ranges.length }))
 }
 
 function toPortableGlossaryTerm(
@@ -1229,6 +1387,9 @@ function buildPortableBookPackage(
   book: OldBookRecord,
   scope: PortablePackageExportScope,
   snapshotImages = new Map<number, string>(),
+  metadata: PortablePackageMetadataDraft,
+  assetOptions: PortablePackageAssetOptions,
+  volume?: PortablePackageVolume,
 ): PortableBookPackage {
   const slug = slugifyFileName(book.title)
   const defaultLanguage = scope.kind === 'all' ? scope.defaultLanguage : scope.language
@@ -1244,19 +1405,22 @@ function buildPortableBookPackage(
       || left.complexity.localeCompare(right.complexity)
       || translationVariantLabel(left).localeCompare(translationVariantLabel(right)),
     )
-  const pageNumbers = Array.from(new Set([
+  const allPageNumbers = Array.from(new Set([
     ...publishableTranslations.map((translation) => translation.pageNumber),
-    ...book.pageSnapshots.map((snapshot) => snapshot.pageNumber),
+    ...(assetOptions.includeSnapshots ? book.pageSnapshots.map((snapshot) => snapshot.pageNumber) : []),
   ])).sort((left, right) => left - right)
+  const pageNumbers = volume
+    ? allPageNumbers.filter((pageNumber) => pageNumber >= volume.pageStart && pageNumber <= volume.pageEnd)
+    : allPageNumbers
   const snapshotAssets: PortableBookAsset[] = book.pageSnapshots
-    .filter((snapshot) => pageNumbers.includes(snapshot.pageNumber))
+    .filter((snapshot) => assetOptions.includeSnapshots && pageNumbers.includes(snapshot.pageNumber))
     .sort((left, right) => left.pageNumber - right.pageNumber)
     .map((snapshot) => ({
       id: snapshot.id,
       kind: 'page-snapshot',
       pageNumber: snapshot.pageNumber,
-      fileName: `${slugifyFileName(book.title)}-page-${snapshot.pageNumber}.png`,
-      mimeType: 'image/png',
+      fileName: `${slugifyFileName(book.title)}-page-${snapshot.pageNumber}.${assetOptions.imageFormat === 'jpeg' ? 'jpg' : 'png'}`,
+      mimeType: assetOptions.imageFormat === 'jpeg' ? 'image/jpeg' : 'image/png',
       dataUrl: snapshotImages.get(snapshot.pageNumber) || snapshot.imageDataUrl || undefined,
       path: snapshot.filePath,
       width: snapshot.width,
@@ -1307,10 +1471,16 @@ function buildPortableBookPackage(
     packageType: 'portable-translation-book',
     packageId: scope.kind === 'all' ? `${slug}.all` : `${slug}.${scope.language}`,
     bookId: slug,
-    version: '1.0.0',
-    revision: 1,
+    version: metadata.version.trim() || '1.0.0',
+    revision: Math.max(1, Math.floor(metadata.revision || 1)),
     defaultLanguage,
     exportedAt: new Date().toISOString(),
+    publisher: metadata.publisherName.trim() ? { name: metadata.publisherName.trim() } : undefined,
+    changelog: metadata.changelog.trim() || undefined,
+    license: metadata.license.trim() || undefined,
+    rightsStatus: metadata.rightsStatus.trim() || undefined,
+    sourceUrl: metadata.sourceUrl.trim() || undefined,
+    volume,
     source: {
       app: 'book-reader',
       appBookId: book.id,
@@ -1339,30 +1509,49 @@ function withoutUndefinedValues<T extends Record<string, unknown>>(value: T) {
 
 async function buildPortablePackageFiles(
   packagePayload: PortableBookPackage,
+  assetOptions: PortablePackageAssetOptions,
   sourcePdfBlob?: Blob | null,
 ) {
   const book = packagePayload.book
   const assetFiles: PortablePackageFile[] = []
-  const archiveAssets = book.assets.map((asset) => {
+  const archiveAssets: PortableBookAsset[] = []
+
+  for (const asset of book.assets) {
     if (asset.kind === 'page-snapshot' && asset.dataUrl) {
       const path = pageAssetPath(asset)
-      const bytes = dataUrlToBytes(asset.dataUrl)
+      const transformedDataUrl = await transformImageDataUrl(asset.dataUrl, {
+        format: assetOptions.imageFormat,
+        maxWidth: assetOptions.imageMaxWidth,
+        jpegQuality: assetOptions.jpegQuality,
+      })
+      const bytes = dataUrlToBytes(transformedDataUrl)
       assetFiles.push({ path, bytes })
-      return withoutUndefinedValues({
+      archiveAssets.push(withoutUndefinedValues({
         ...asset,
         path,
         dataUrl: undefined,
         sizeBytes: bytes.length,
-      })
+      }))
+
+      if (assetOptions.includeThumbnails) {
+        const thumbnailDataUrl = await transformImageDataUrl(asset.dataUrl, {
+          format: 'jpeg',
+          maxWidth: 360,
+          jpegQuality: 0.72,
+        })
+        const thumbnailBytes = dataUrlToBytes(thumbnailDataUrl)
+        assetFiles.push({ path: thumbnailAssetPath(asset), bytes: thumbnailBytes })
+      }
+      continue
     }
 
-    return withoutUndefinedValues({
+    archiveAssets.push(withoutUndefinedValues({
       ...asset,
       dataUrl: undefined,
-    })
-  })
+    }))
+  }
 
-  if (sourcePdfBlob) {
+  if (assetOptions.includeSourcePdf && sourcePdfBlob) {
     const pdfBytes = new Uint8Array(await sourcePdfBlob.arrayBuffer())
     const pdfPath = 'source/original.pdf'
     assetFiles.push({ path: pdfPath, bytes: pdfBytes })
@@ -1426,6 +1615,12 @@ async function buildPortablePackageFiles(
     defaultLanguage: packagePayload.defaultLanguage,
     contentHash,
     exportedAt: packagePayload.exportedAt,
+    publisher: packagePayload.publisher,
+    changelog: packagePayload.changelog,
+    license: packagePayload.license,
+    rightsStatus: packagePayload.rightsStatus,
+    sourceUrl: packagePayload.sourceUrl,
+    volume: packagePayload.volume,
     source: packagePayload.source,
     book: bookMetadata,
   }
@@ -1688,6 +1883,257 @@ function renderExportVocabulary(glossary: TranslationGlossaryEntry[] | undefined
       </dl>
     </section>
   `
+}
+
+function renderPortableVocabulary(glossary: PortableGlossaryTerm[] | undefined) {
+  if (!glossary?.length) return ''
+  return `
+    <section class="vocabulary">
+      <h3>Glossary</h3>
+      <dl>
+        ${glossary.map((entry) => `
+          <div>
+            <dt>${escapeHtml(entry.sourceTerm)}${entry.translatedTerm ? ` <span>${escapeHtml(entry.translatedTerm)}</span>` : ''}</dt>
+            ${entry.englishTerm || entry.targetTerm || entry.transliteration ? `
+              <dd class="vocabulary-meta">
+                ${entry.englishTerm ? `<strong>English:</strong> ${escapeHtml(entry.englishTerm)}` : ''}
+                ${entry.targetTerm ? `${entry.englishTerm ? ' · ' : ''}<strong>Target:</strong> ${escapeHtml(entry.targetTerm)}` : ''}
+                ${entry.transliteration ? `${entry.englishTerm || entry.targetTerm ? ' · ' : ''}<strong>Transliteration:</strong> ${escapeHtml(entry.transliteration)}` : ''}
+              </dd>
+            ` : ''}
+            ${entry.explanation ? `<dd>${escapeHtml(entry.explanation)}</dd>` : ''}
+          </div>
+        `).join('\n')}
+      </dl>
+    </section>
+  `
+}
+
+function getPreferredPortableTranslation(
+  page: PortableBookPage,
+  language: string,
+  selectedComplexity: TranslationComplexity,
+) {
+  return page.translations.find((translation) =>
+    translation.language === language && translation.complexity === selectedComplexity
+  )
+    ?? page.translations.find((translation) => translation.language === language && translation.complexity !== 'original')
+    ?? page.translations.find((translation) => translation.language === language)
+    ?? page.translations.find((translation) => translation.language === 'en' && translation.complexity === 'original')
+    ?? page.translations[0]
+}
+
+function renderPortableTranslationContent(translation: PortablePageTranslation | undefined) {
+  if (!translation?.paragraphs.length) return '<p class="missing">No exported translation for this page.</p>'
+  if (translation.complexity === 'concept-guide') return renderMarkdownishHtml(translation.paragraphs.join('\n\n'))
+  return renderExportParagraphs(translation.paragraphs)
+}
+
+function epubPath(value: string) {
+  return `OEBPS/${value}`
+}
+
+function buildPortableEpubFiles(
+  packagePayload: PortableBookPackage,
+  language: string,
+  languageLabel: string,
+  selectedComplexity: TranslationComplexity,
+) {
+  const encoder = new TextEncoder()
+  const book = packagePayload.book
+  const pages = book.pages.slice().sort((left, right) => left.pageNumber - right.pageNumber)
+  const chapters: EpubChapter[] = pages.map((page) => {
+    const translation = getPreferredPortableTranslation(page, language, selectedComplexity)
+    const title = translation?.title || page.sectionTitle || `Page ${page.pageNumber}`
+    const bodyHtml = `
+      <article class="book-page">
+        <h1>${escapeHtml(title)}</h1>
+        <p class="page-meta">Page ${page.pageNumber}${translation?.complexity ? ` · ${escapeHtml(translation.complexity)}` : ''}</p>
+        ${renderPortableTranslationContent(translation)}
+        ${renderPortableVocabulary(translation?.glossary)}
+      </article>
+    `
+    return {
+      id: `page-${page.pageNumber}`,
+      path: `pages/page-${String(page.pageNumber).padStart(4, '0')}.xhtml`,
+      title,
+      bodyHtml,
+    }
+  })
+  const title = `${book.title}${languageLabel ? ` - ${languageLabel}` : ''}`
+  const author = book.author || 'Unknown author'
+  const publisher = packagePayload.publisher?.name || 'Book Reader'
+  const modified = new Date(packagePayload.exportedAt).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const stylesheet = `
+body {
+  color: #172033;
+  font-family: serif;
+  line-height: 1.65;
+  margin: 0;
+  padding: 0;
+}
+h1, h2, h3 {
+  line-height: 1.25;
+}
+p, li, dd {
+  font-size: 1em;
+}
+.page-meta, .missing, .vocabulary-meta {
+  color: #667085;
+}
+.book-page {
+  page-break-after: always;
+}
+.vocabulary {
+  border-top: 1px solid #d8dee6;
+  margin-top: 1.5em;
+  padding-top: 1em;
+}
+dt {
+  font-weight: bold;
+}
+dt span {
+  color: #145d52;
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th, td {
+  border: 1px solid #d8dee6;
+  padding: 0.35em;
+}
+pre {
+  white-space: pre-wrap;
+}
+`
+  const chapterFiles: PortablePackageFile[] = chapters.map((chapter) => ({
+    path: epubPath(chapter.path),
+    bytes: encoder.encode(`<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="${escapeHtml(language)}" lang="${escapeHtml(language)}">
+<head>
+  <title>${escapeHtml(chapter.title)}</title>
+  <link rel="stylesheet" type="text/css" href="../styles/book.css" />
+</head>
+<body>
+${chapter.bodyHtml}
+</body>
+</html>
+`),
+  }))
+
+  const nav = `<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="${escapeHtml(language)}" lang="${escapeHtml(language)}">
+<head>
+  <title>${escapeHtml(title)} Contents</title>
+  <link rel="stylesheet" type="text/css" href="styles/book.css" />
+</head>
+<body>
+  <nav epub:type="toc" id="toc">
+    <h1>Contents</h1>
+    <ol>
+      ${chapters.map((chapter) => `<li><a href="${escapeHtml(chapter.path)}">${escapeHtml(chapter.title)}</a></li>`).join('\n')}
+    </ol>
+  </nav>
+</body>
+</html>
+`
+  const opf = `<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id" xml:lang="${escapeHtml(language)}">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="book-id">${escapeHtml(`${packagePayload.packageId}.${language}.epub`)}</dc:identifier>
+    <dc:title>${escapeHtml(title)}</dc:title>
+    <dc:language>${escapeHtml(language)}</dc:language>
+    <dc:creator>${escapeHtml(author)}</dc:creator>
+    <dc:publisher>${escapeHtml(publisher)}</dc:publisher>
+    <dc:date>${escapeHtml(packagePayload.exportedAt.slice(0, 10))}</dc:date>
+    ${packagePayload.license ? `<dc:rights>${escapeHtml(packagePayload.license)}</dc:rights>` : ''}
+    <meta property="dcterms:modified">${escapeHtml(modified)}</meta>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav" />
+    <item id="style" href="styles/book.css" media-type="text/css" />
+    ${chapters.map((chapter) => `<item id="${escapeHtml(chapter.id)}" href="${escapeHtml(chapter.path)}" media-type="application/xhtml+xml" />`).join('\n')}
+  </manifest>
+  <spine>
+    ${chapters.map((chapter) => `<itemref idref="${escapeHtml(chapter.id)}" />`).join('\n')}
+  </spine>
+</package>
+`
+
+  return [
+    { path: 'mimetype', bytes: encoder.encode('application/epub+zip') },
+    { path: 'META-INF/container.xml', bytes: encoder.encode(`<?xml version="1.0" encoding="utf-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml" />
+  </rootfiles>
+</container>
+`) },
+    { path: epubPath('package.opf'), bytes: encoder.encode(opf) },
+    { path: epubPath('nav.xhtml'), bytes: encoder.encode(nav) },
+    { path: epubPath('styles/book.css'), bytes: encoder.encode(stylesheet) },
+    ...chapterFiles,
+  ]
+}
+
+function buildPortablePrintHtml(
+  packagePayload: PortableBookPackage,
+  language: string,
+  languageLabel: string,
+  selectedComplexity: TranslationComplexity,
+) {
+  const book = packagePayload.book
+  const pages = book.pages.slice().sort((left, right) => left.pageNumber - right.pageNumber)
+  const exportedAt = new Date(packagePayload.exportedAt).toLocaleString()
+  return `<!doctype html>
+<html lang="${escapeHtml(language)}">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(book.title)} - ${escapeHtml(languageLabel)} PDF Export</title>
+  <style>
+${exportReaderStyles}
+    main { max-width: 760px; }
+    .book-page { break-before: page; }
+    .book-page:first-of-type { break-before: auto; }
+    @page { margin: 0.72in; }
+    @media print {
+      body { background: #fff; }
+      main { padding: 0; }
+      .book-page { border-top: 0; margin-top: 0; padding-top: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="book-header">
+      <h1>${escapeHtml(book.title)}</h1>
+      <p class="meta">${escapeHtml(book.author || 'Unknown author')} · ${escapeHtml(languageLabel)} · Exported ${escapeHtml(exportedAt)}</p>
+      ${packagePayload.publisher?.name ? `<p class="meta">Publisher: ${escapeHtml(packagePayload.publisher.name)}</p>` : ''}
+      ${packagePayload.license ? `<p class="meta">License: ${escapeHtml(packagePayload.license)}</p>` : ''}
+    </header>
+    ${pages.map((page) => {
+      const translation = getPreferredPortableTranslation(page, language, selectedComplexity)
+      return `
+        <article class="book-page">
+          <h2>${escapeHtml(translation?.title || page.sectionTitle || `Page ${page.pageNumber}`)}</h2>
+          <p class="meta">Page ${page.pageNumber}${translation?.complexity ? ` · ${escapeHtml(translation.complexity)}` : ''}</p>
+          ${renderPortableTranslationContent(translation)}
+          ${renderPortableVocabulary(translation?.glossary)}
+        </article>
+      `
+    }).join('\n')}
+  </main>
+  <script>
+    window.addEventListener('load', () => {
+      window.setTimeout(() => window.print(), 250)
+    })
+  </script>
+</body>
+</html>`
 }
 
 function MarkdownishContent({ markdown }: { markdown: string }) {
@@ -2205,6 +2651,34 @@ function TranslationWorkspace() {
   const [liveExportOpen, setLiveExportOpen] = useState(false)
   const [liveExportHtml, setLiveExportHtml] = useState('')
   const [liveExportTitle, setLiveExportTitle] = useState('')
+  const [packageSettingsOpen, setPackageSettingsOpen] = useState(false)
+  const [packageInspector, setPackageInspector] = useState<PortablePackageInspectorState>({
+    open: false,
+    fileName: '',
+    status: '',
+    files: [],
+    validation: [],
+    pages: [],
+    translations: [],
+  })
+  const [packageMetadata, setPackageMetadata] = useState<PortablePackageMetadataDraft>({
+    publisherName: '',
+    version: '1.0.0',
+    revision: 1,
+    changelog: '',
+    license: 'Public domain',
+    rightsStatus: 'Public domain source; translation reviewed for publication',
+    sourceUrl: '',
+  })
+  const [packageAssetOptions, setPackageAssetOptions] = useState<PortablePackageAssetOptions>({
+    includeSourcePdf: true,
+    includeSnapshots: true,
+    includeThumbnails: true,
+    imageFormat: 'jpeg',
+    imageMaxWidth: 1600,
+    jpegQuality: 0.82,
+    pagesPerVolume: 0,
+  })
   const [forceRetranslate, setForceRetranslate] = useState(false)
   const [translationPageSelection, setTranslationPageSelection] = useState('all')
   const [activeTranslationJob, setActiveTranslationJob] = useState<TranslationJobState | null>(null)
@@ -3586,6 +4060,73 @@ function TranslationWorkspace() {
     return { html, fileName, title }
   }
 
+  async function inspectPortablePackageFile(file: File) {
+    setPackageInspector({
+      open: true,
+      fileName: file.name,
+      status: 'Reading package...',
+      files: [],
+      validation: [],
+      pages: [],
+      translations: [],
+    })
+
+    try {
+      const packageFiles = parseZipPackage(new Uint8Array(await file.arrayBuffer()))
+      const manifestBytes = packageFiles.get('manifest.json')
+      if (!manifestBytes) throw new Error('manifest.json is missing.')
+      const manifest = parseJsonBytes<PortableBookPackage>(manifestBytes)
+      if (manifest.schemaVersion !== '1.0.0') throw new Error(`Unsupported schema version: ${manifest.schemaVersion}`)
+
+      const validation = await Promise.all((manifest.files ?? []).map(async (entry) => {
+        const bytes = packageFiles.get(entry.path)
+        if (!bytes) return { path: entry.path, status: 'missing' as const, detail: 'File is listed in manifest but missing from archive.' }
+        const actualHash = `sha256:${await sha256HexBytes(bytes)}`
+        if (actualHash !== entry.sha256) {
+          return { path: entry.path, status: 'mismatch' as const, detail: `Expected ${entry.sha256}, found ${actualHash}.` }
+        }
+        return { path: entry.path, status: 'ok' as const, detail: `${entry.sizeBytes.toLocaleString()} bytes` }
+      }))
+      const pagesBytes = packageFiles.get('content/pages.json')
+      const pages = pagesBytes ? parseJsonBytes<PortableBookPage[]>(pagesBytes) : []
+      const translationFiles = Array.from(packageFiles.entries())
+        .filter(([path]) => path.startsWith('content/translations.') && path.endsWith('.json'))
+        .sort(([left], [right]) => left.localeCompare(right))
+      const translations = translationFiles.map(([path, bytes]) => {
+        const language = path.replace(/^content\/translations\./, '').replace(/\.json$/, '')
+        const pageRows = parseJsonBytes<{ pageNumber: number, translations: PortablePageTranslation[] }[]>(bytes)
+        const flatTranslations = pageRows.flatMap((row) => row.translations)
+        return {
+          language,
+          pageCount: pageRows.length,
+          translationCount: flatTranslations.length,
+          sample: flatTranslations[0],
+        }
+      })
+      const mismatchCount = validation.filter((entry) => entry.status !== 'ok').length
+
+      setPackageInspector({
+        open: true,
+        fileName: file.name,
+        status: mismatchCount ? `${mismatchCount} validation issue${mismatchCount === 1 ? '' : 's'} found.` : 'Package validated.',
+        manifest,
+        files: manifest.files ?? [],
+        validation,
+        pages,
+        translations,
+      })
+      setOldBookStatus(`Inspected ${file.name}: ${mismatchCount ? `${mismatchCount} validation issue(s)` : 'valid package'}.`)
+    } catch (error) {
+      setPackageInspector((current) => ({
+        ...current,
+        open: true,
+        status: 'Package inspection failed.',
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
+  }
+
   async function exportActiveBookAsPortablePackage(scope: PortablePackageExportScope) {
     if (!activeBook) return
     const scopeLabel = scope.kind === 'all'
@@ -3593,11 +4134,12 @@ function TranslationWorkspace() {
       : languageOptions.find((entry) => entry.value === scope.language)?.label ?? scope.language
     setOldBookStatus(`Preparing ${scopeLabel} portable book package...`)
     const snapshotImages = await buildExportSnapshotImages(activeBook)
-    const packagePayload = buildPortableBookPackage(activeBook, scope, snapshotImages)
-    const fileName = `${slugifyFileName(activeBook.title)}-${scope.kind === 'all' ? 'all-languages' : slugifyFileName(scopeLabel)}.bookpkg`
+    const basePackage = buildPortableBookPackage(activeBook, scope, snapshotImages, packageMetadata, packageAssetOptions)
+    const packagePages = basePackage.book.pages.map((page) => page.pageNumber).sort((left, right) => left - right)
+    const volumeRanges = packageVolumeRanges(packagePages, packageAssetOptions.pagesPerVolume)
     let sourcePdfBlob: Blob | null = null
 
-    if (activeBook.pdfBlobId) {
+    if (packageAssetOptions.includeSourcePdf && activeBook.pdfBlobId) {
       try {
         sourcePdfBlob = await getOldBookPdfBlob(activeBook.pdfBlobId)
       } catch {
@@ -3605,9 +4147,67 @@ function TranslationWorkspace() {
       }
     }
 
-    const files = await buildPortablePackageFiles(packagePayload, sourcePdfBlob)
-    downloadBlobFile(fileName, createZipBlob(files))
-    setOldBookStatus(`${scopeLabel} portable book package exported: ${fileName}`)
+    for (const volumeRange of volumeRanges) {
+      const volume = volumeRanges.length > 1
+        ? {
+            index: volumeRange.index,
+            total: volumeRange.total,
+            pageStart: volumeRange.pages[0] ?? 1,
+            pageEnd: volumeRange.pages[volumeRange.pages.length - 1] ?? 1,
+          }
+        : undefined
+      const packagePayload = buildPortableBookPackage(activeBook, scope, snapshotImages, packageMetadata, packageAssetOptions, volume)
+      const fileName = `${slugifyFileName(activeBook.title)}-${scope.kind === 'all' ? 'all-languages' : slugifyFileName(scopeLabel)}${volume ? `-vol-${volume.index}-of-${volume.total}` : ''}.bookpkg`
+      const files = await buildPortablePackageFiles(packagePayload, packageAssetOptions, sourcePdfBlob)
+      downloadBlobFile(fileName, createZipBlob(files))
+      await yieldToBrowser()
+    }
+    setOldBookStatus(`${scopeLabel} portable book package exported${volumeRanges.length > 1 ? ` in ${volumeRanges.length} volumes` : ''}.`)
+  }
+
+  async function exportActiveBookAsEpub() {
+    if (!activeBook) return
+    const languageLabel = languageOptions.find((entry) => entry.value === translationLanguage)?.label ?? translationLanguage
+    setOldBookStatus(`Preparing ${languageLabel} EPUB...`)
+    const basePackage = buildPortableBookPackage(
+      activeBook,
+      { kind: 'language', language: translationLanguage },
+      new Map<number, string>(),
+      packageMetadata,
+      { ...packageAssetOptions, includeSnapshots: false, includeThumbnails: false, includeSourcePdf: false },
+    )
+    const fileName = `${slugifyFileName(activeBook.title)}-${slugifyFileName(languageLabel)}-${slugifyFileName(complexity)}.epub`
+    const files = buildPortableEpubFiles(basePackage, translationLanguage, languageLabel, complexity)
+    downloadBlobFile(fileName, createZipBlob(files, 'application/epub+zip'))
+    setOldBookStatus(`${languageLabel} EPUB exported.`)
+  }
+
+  async function exportActiveBookAsPdf() {
+    if (!activeBook) return
+    const languageLabel = languageOptions.find((entry) => entry.value === translationLanguage)?.label ?? translationLanguage
+    setOldBookStatus(`Preparing ${languageLabel} print/PDF export...`)
+    const basePackage = buildPortableBookPackage(
+      activeBook,
+      { kind: 'language', language: translationLanguage },
+      new Map<number, string>(),
+      packageMetadata,
+      { ...packageAssetOptions, includeSnapshots: false, includeThumbnails: false, includeSourcePdf: false },
+    )
+    const html = buildPortablePrintHtml(basePackage, translationLanguage, languageLabel, complexity)
+    const printWindow = window.open('', '_blank')
+    if (!printWindow) {
+      downloadTextFile(
+        `${slugifyFileName(activeBook.title)}-${slugifyFileName(languageLabel)}-print.html`,
+        html,
+        'text/html;charset=utf-8',
+      )
+      setOldBookStatus('Popup blocked. Downloaded print-ready HTML; open it and choose Save as PDF.')
+      return
+    }
+    printWindow.document.open()
+    printWindow.document.write(html)
+    printWindow.document.close()
+    setOldBookStatus('Print/PDF export opened. Choose Save as PDF in the print dialog.')
   }
 
   async function exportActiveBookAsHtml() {
@@ -3757,6 +4357,17 @@ function TranslationWorkspace() {
           accept="application/pdf"
           className="visually-hidden-input"
           onChange={(event) => void handlePdfSelected(event)}
+        />
+        <input
+          id="book-package-import"
+          type="file"
+          accept=".bookpkg,application/zip,application/vnd.portable-translation-book+zip"
+          className="visually-hidden-input"
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0]
+            event.currentTarget.value = ''
+            if (file) void inspectPortablePackageFile(file)
+          }}
         />
         <div className="translation-compact-bar">
           <div className="translation-compact-row translation-compact-row-primary">
@@ -3936,6 +4547,13 @@ function TranslationWorkspace() {
             </button>
             <button
               className="button secondary"
+              onClick={() => setPackageSettingsOpen(true)}
+              type="button"
+            >
+              Package Settings
+            </button>
+            <button
+              className="button secondary"
               onClick={() => void exportActiveBookAsPortablePackage({ kind: 'language', language: translationLanguage })}
               disabled={!activeBook?.translations.length}
               type="button"
@@ -3950,6 +4568,25 @@ function TranslationWorkspace() {
             >
               All Languages
             </button>
+            <button
+              className="button secondary"
+              onClick={() => void exportActiveBookAsEpub()}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              EPUB
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void exportActiveBookAsPdf()}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              PDF / Print
+            </button>
+            <label className="button secondary import-file-button" htmlFor="book-package-import">
+              Inspect Package
+            </label>
             <button
               className="button secondary"
               onClick={() => void renderActiveBookExport()}
@@ -4309,6 +4946,220 @@ function TranslationWorkspace() {
           </div>
         </article>
       </section>
+
+      {packageSettingsOpen ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel package-settings-modal">
+            <header className="modal-header">
+              <div>
+                <h2>Package Settings</h2>
+                <p>Publisher metadata, asset strategy, and volume splitting for `.bookpkg` export.</p>
+              </div>
+              <button className="icon-button" onClick={() => setPackageSettingsOpen(false)} type="button">x</button>
+            </header>
+            <div className="package-settings-grid">
+              <label>
+                <span>Publisher</span>
+                <input
+                  value={packageMetadata.publisherName}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, publisherName: event.currentTarget.value }))}
+                  placeholder="TamilSteam"
+                />
+              </label>
+              <label>
+                <span>Version</span>
+                <input
+                  value={packageMetadata.version}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, version: event.currentTarget.value }))}
+                />
+              </label>
+              <label>
+                <span>Revision</span>
+                <input
+                  type="number"
+                  min="1"
+                  value={packageMetadata.revision}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, revision: Number(event.currentTarget.value) || 1 }))}
+                />
+              </label>
+              <label>
+                <span>License</span>
+                <input
+                  value={packageMetadata.license}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, license: event.currentTarget.value }))}
+                />
+              </label>
+              <label>
+                <span>Rights Status</span>
+                <input
+                  value={packageMetadata.rightsStatus}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, rightsStatus: event.currentTarget.value }))}
+                />
+              </label>
+              <label>
+                <span>Source URL</span>
+                <input
+                  value={packageMetadata.sourceUrl}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, sourceUrl: event.currentTarget.value }))}
+                  placeholder="https://..."
+                />
+              </label>
+              <label className="package-settings-wide">
+                <span>Changelog</span>
+                <textarea
+                  value={packageMetadata.changelog}
+                  onChange={(event) => setPackageMetadata((current) => ({ ...current, changelog: event.currentTarget.value }))}
+                  rows={3}
+                  placeholder="Translation review notes, corrections, or release summary."
+                />
+              </label>
+            </div>
+            <div className="package-options-grid">
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={packageAssetOptions.includeSourcePdf}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, includeSourcePdf: event.currentTarget.checked }))}
+                />
+                <span>Include original PDF</span>
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={packageAssetOptions.includeSnapshots}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, includeSnapshots: event.currentTarget.checked }))}
+                />
+                <span>Include page snapshots</span>
+              </label>
+              <label className="checkbox-row">
+                <input
+                  type="checkbox"
+                  checked={packageAssetOptions.includeThumbnails}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, includeThumbnails: event.currentTarget.checked }))}
+                  disabled={!packageAssetOptions.includeSnapshots}
+                />
+                <span>Generate thumbnails</span>
+              </label>
+              <label>
+                <span>Image Format</span>
+                <select
+                  value={packageAssetOptions.imageFormat}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, imageFormat: event.currentTarget.value as PortablePackageAssetOptions['imageFormat'] }))}
+                  disabled={!packageAssetOptions.includeSnapshots}
+                >
+                  <option value="jpeg">JPEG</option>
+                  <option value="png">PNG</option>
+                </select>
+              </label>
+              <label>
+                <span>Max Image Width</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="100"
+                  value={packageAssetOptions.imageMaxWidth}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, imageMaxWidth: Number(event.currentTarget.value) || 0 }))}
+                  disabled={!packageAssetOptions.includeSnapshots}
+                />
+              </label>
+              <label>
+                <span>JPEG Quality</span>
+                <input
+                  type="number"
+                  min="0.1"
+                  max="1"
+                  step="0.05"
+                  value={packageAssetOptions.jpegQuality}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, jpegQuality: Math.min(1, Math.max(0.1, Number(event.currentTarget.value) || 0.82)) }))}
+                  disabled={!packageAssetOptions.includeSnapshots || packageAssetOptions.imageFormat !== 'jpeg'}
+                />
+              </label>
+              <label>
+                <span>Pages Per Volume</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="10"
+                  value={packageAssetOptions.pagesPerVolume}
+                  onChange={(event) => setPackageAssetOptions((current) => ({ ...current, pagesPerVolume: Math.max(0, Math.floor(Number(event.currentTarget.value) || 0)) }))}
+                  placeholder="0 = one package"
+                />
+              </label>
+            </div>
+            <footer className="modal-footer">
+              <button className="button secondary" onClick={() => setPackageSettingsOpen(false)} type="button">Done</button>
+            </footer>
+          </section>
+        </div>
+      ) : null}
+
+      {packageInspector.open ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel package-inspector-modal">
+            <header className="modal-header">
+              <div>
+                <h2>Package Inspector</h2>
+                <p>{packageInspector.fileName || 'No package selected'} · {packageInspector.status}</p>
+              </div>
+              <button
+                className="icon-button"
+                onClick={() => setPackageInspector((current) => ({ ...current, open: false }))}
+                type="button"
+              >
+                x
+              </button>
+            </header>
+            {packageInspector.error ? (
+              <p className="package-error">{packageInspector.error}</p>
+            ) : packageInspector.manifest ? (
+              <div className="package-inspector-grid">
+                <section className="package-summary-panel">
+                  <h3>{packageInspector.manifest.book.title}</h3>
+                  <dl>
+                    <div><dt>Package</dt><dd>{packageInspector.manifest.packageId}</dd></div>
+                    <div><dt>Book ID</dt><dd>{packageInspector.manifest.bookId}</dd></div>
+                    <div><dt>Version</dt><dd>{packageInspector.manifest.version} rev {packageInspector.manifest.revision}</dd></div>
+                    <div><dt>Default Language</dt><dd>{packageInspector.manifest.defaultLanguage}</dd></div>
+                    <div><dt>Pages</dt><dd>{packageInspector.pages.length}</dd></div>
+                    <div><dt>Assets</dt><dd>{packageInspector.files.filter((file) => file.path.startsWith('assets/') || file.path.startsWith('source/')).length}</dd></div>
+                    <div><dt>Publisher</dt><dd>{packageInspector.manifest.publisher?.name || 'Not set'}</dd></div>
+                    <div><dt>Rights</dt><dd>{packageInspector.manifest.rightsStatus || 'Not set'}</dd></div>
+                    {packageInspector.manifest.volume ? (
+                      <div><dt>Volume</dt><dd>{packageInspector.manifest.volume.index} of {packageInspector.manifest.volume.total}, pages {packageInspector.manifest.volume.pageStart}-{packageInspector.manifest.volume.pageEnd}</dd></div>
+                    ) : null}
+                  </dl>
+                </section>
+                <section className="package-summary-panel">
+                  <h3>Languages</h3>
+                  <div className="package-language-list">
+                    {packageInspector.translations.map((entry) => (
+                      <article key={entry.language}>
+                        <strong>{entry.language}</strong>
+                        <span>{entry.pageCount} pages · {entry.translationCount} records</span>
+                        {entry.sample ? <p>{entry.sample.paragraphs[0] ?? 'No preview text.'}</p> : null}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+                <section className="package-summary-panel package-validation-panel">
+                  <h3>Validation</h3>
+                  <div className="package-validation-list">
+                    {packageInspector.validation.map((entry) => (
+                      <div key={entry.path} className={`package-validation-row ${entry.status}`}>
+                        <strong>{entry.status}</strong>
+                        <span>{entry.path}</span>
+                        <small>{entry.detail}</small>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            ) : (
+              <p className="muted">Select a `.bookpkg` file to inspect.</p>
+            )}
+          </section>
+        </div>
+      ) : null}
 
       {liveExportOpen ? (
         <div className="modal-backdrop">
