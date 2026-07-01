@@ -1,12 +1,15 @@
 import { invoke } from '@tauri-apps/api/core'
 
-export type TranslationComplexity = 'original' | 'kid-friendly' | 'simplified' | 'high-school' | 'college'
+export type TranslationComplexity = 'original' | 'kid-friendly' | 'concept-guide' | 'simplified' | 'high-school' | 'college'
 export type TranslationLanguage = 'ml' | 'en' | 'ta' | 'hi' | 'es'
 
 export type TranslationGlossaryEntry = {
   sourceTerm: string
   translatedTerm: string
   explanation: string
+  englishTerm?: string
+  targetTerm?: string
+  transliteration?: string
 }
 
 export type TranslationMemoryEntry = TranslationGlossaryEntry & {
@@ -68,6 +71,8 @@ export type TranslationRecord = {
   sourceLines: string[]
   glossary?: TranslationGlossaryEntry[]
   notes?: string[]
+  model?: string
+  sourceModel?: string
   createdAt: string
 }
 
@@ -132,10 +137,12 @@ const dbName = 'bookforge-old-books'
 const dbVersion = 1
 const booksStoreName = 'books'
 const pdfsStoreName = 'pdfs'
+const legacySourceModel = 'gpt-5.4-mini'
 
 export const complexityOptions: { value: TranslationComplexity, label: string }[] = [
   { value: 'original', label: 'Original' },
   { value: 'kid-friendly', label: 'Kid Friendly' },
+  { value: 'concept-guide', label: 'Concept Guide' },
   { value: 'simplified', label: 'Simplified English' },
   { value: 'high-school', label: 'High School Friendly' },
   { value: 'college', label: 'College Friendly' },
@@ -195,6 +202,23 @@ export const translationSamples: Record<TranslationComplexity, Record<Translatio
     es: [
       'El autor imagina el cielo como un mapa enorme. Las estrellas no son puntos al azar; se mueven con patrones que se pueden estudiar.',
       'En esa epoca muchas personas ponian la Tierra en el centro. Hoy sabemos mas, pero su manera ordenada de observar sigue siendo interesante.',
+    ],
+  },
+  'concept-guide': {
+    ml: [
+      '## Concept Guide\n\nThis mode explains the page more freely. It connects the old text to modern ideas and adds examples when helpful.',
+    ],
+    en: [
+      '## Concept Guide\n\nThis mode explains the page more freely. It connects the old text to modern ideas and adds examples when helpful.',
+    ],
+    ta: [
+      '## Concept Guide\n\nThis mode explains the page more freely. It connects the old text to modern ideas and adds examples when helpful.',
+    ],
+    hi: [
+      '## Concept Guide\n\nThis mode explains the page more freely. It connects the old text to modern ideas and adds examples when helpful.',
+    ],
+    es: [
+      '## Concept Guide\n\nThis mode explains the page more freely. It connects the old text to modern ideas and adds examples when helpful.',
     ],
   },
   simplified: {
@@ -320,8 +344,11 @@ function normalizeGlossaryEntries(value: unknown): TranslationGlossaryEntry[] | 
       sourceTerm: typeof entry.sourceTerm === 'string' ? entry.sourceTerm : '',
       translatedTerm: typeof entry.translatedTerm === 'string' ? entry.translatedTerm : '',
       explanation: typeof entry.explanation === 'string' ? entry.explanation : '',
+      englishTerm: typeof entry.englishTerm === 'string' ? entry.englishTerm : undefined,
+      targetTerm: typeof entry.targetTerm === 'string' ? entry.targetTerm : undefined,
+      transliteration: typeof entry.transliteration === 'string' ? entry.transliteration : undefined,
     }))
-    .filter((entry) => entry.sourceTerm || entry.translatedTerm || entry.explanation)
+    .filter((entry) => entry.sourceTerm || entry.translatedTerm || entry.englishTerm || entry.targetTerm || entry.explanation)
   return entries.length ? entries : undefined
 }
 
@@ -339,9 +366,16 @@ function parseStoredJsonTranslation(text: string): Record<string, unknown> | nul
 }
 
 function normalizeTranslationRecord(translation: TranslationRecord): TranslationRecord {
-  if (translation.paragraphs.length !== 1) return translation
+  const withVariantMetadata = (record: TranslationRecord): TranslationRecord => ({
+    ...record,
+    sourceModel: record.sourceModel?.trim()
+      || (record.complexity === 'original' ? record.model?.trim() : legacySourceModel)
+      || undefined,
+  })
+
+  if (translation.paragraphs.length !== 1) return withVariantMetadata(translation)
   const payload = parseStoredJsonTranslation(translation.paragraphs[0])
-  if (!payload) return translation
+  if (!payload) return withVariantMetadata(translation)
 
   const paragraphs = asStringArray(payload.paragraphs)
     .map((paragraph) => paragraph.trim())
@@ -353,14 +387,16 @@ function normalizeTranslationRecord(translation: TranslationRecord): Translation
     ? payload.sectionTitle.trim()
     : translation.sectionTitle
 
-  return {
+  return withVariantMetadata({
     ...translation,
     sectionTitle,
     paragraphs: paragraphs.length ? paragraphs : translation.paragraphs,
     sourceLines,
     glossary: normalizeGlossaryEntries(payload.glossary) ?? translation.glossary,
     notes: asStringArray(payload.notes).length ? asStringArray(payload.notes) : translation.notes,
-  }
+    model: typeof payload.model === 'string' && payload.model.trim() ? payload.model.trim() : translation.model,
+    sourceModel: typeof payload.sourceModel === 'string' && payload.sourceModel.trim() ? payload.sourceModel.trim() : translation.sourceModel,
+  })
 }
 
 function normalizeOldBookRecord(value: OldBookRecord): OldBookRecord {
@@ -442,6 +478,14 @@ function upsertById<T extends { id: string }>(items: T[], item: T) {
   return [item, ...items.filter((entry) => entry.id !== item.id)]
 }
 
+function translationVariantMatches(left: TranslationRecord, right: TranslationRecord) {
+  return left.pageNumber === right.pageNumber
+    && left.complexity === right.complexity
+    && left.language === right.language
+    && (left.model?.trim() ?? '') === (right.model?.trim() ?? '')
+    && (left.sourceModel?.trim() ?? '') === (right.sourceModel?.trim() ?? '')
+}
+
 abstract class BaseOldBookRepository implements OldBookRepository {
   abstract readonly kind: OldBookRepository['kind']
   abstract listBooks(): Promise<OldBookRecord[]>
@@ -479,11 +523,7 @@ abstract class BaseOldBookRepository implements OldBookRepository {
       ...book,
       translations: [
         translation,
-        ...book.translations.filter((entry) => !(
-          entry.pageNumber === translation.pageNumber
-          && entry.complexity === translation.complexity
-          && entry.language === translation.language
-        )),
+        ...book.translations.filter((entry) => !translationVariantMatches(entry, translation)),
       ],
     }
     await this.saveBookRecord(updatedBook)
@@ -784,7 +824,7 @@ export function createTranslationRecord(
   complexity: TranslationComplexity,
   language: TranslationLanguage,
   sectionTitle: string,
-  content?: { paragraphs?: string[], sourceLines?: string[], glossary?: TranslationGlossaryEntry[], notes?: string[] },
+  content?: { paragraphs?: string[], sourceLines?: string[], glossary?: TranslationGlossaryEntry[], notes?: string[], model?: string, sourceModel?: string },
 ): TranslationRecord {
   return {
     id: createId('translation'),
@@ -796,6 +836,8 @@ export function createTranslationRecord(
     sourceLines: content ? content.sourceLines ?? [] : sourcePageLines,
     glossary: content?.glossary?.length ? content.glossary : undefined,
     notes: content?.notes?.length ? content.notes : undefined,
+    model: content?.model?.trim() || undefined,
+    sourceModel: content?.sourceModel?.trim() || undefined,
     createdAt: new Date().toISOString(),
   }
 }

@@ -429,6 +429,9 @@ function summarizeBody(jsonBody) {
     stream: jsonBody.stream === true,
     temperature: jsonBody.temperature,
     maxTokens: jsonBody.max_tokens,
+    maxCompletionTokens: jsonBody.max_completion_tokens,
+    thinking: jsonBody.thinking,
+    reasoningEffort: jsonBody.reasoning_effort,
     messages: messages.length,
     lastMessageRole: messages.length ? messages[messages.length - 1]?.role : undefined,
   };
@@ -582,7 +585,7 @@ function buildAnthropicHeaders(provider, requestBody) {
   return headers;
 }
 
-function maybeRewriteOpenAiBody(jsonBody, rawBody, modelOverride) {
+function maybeRewriteOpenAiBody(provider, jsonBody, rawBody, modelOverride) {
   if (!jsonBody || typeof jsonBody !== "object") {
     return rawBody;
   }
@@ -592,6 +595,15 @@ function maybeRewriteOpenAiBody(jsonBody, rawBody, modelOverride) {
 
   if (modelOverride) {
     rewritten.model = modelOverride;
+  }
+
+  if (provider.id === "deepseek") {
+    if (!rewritten.thinking) {
+      rewritten.thinking = { type: process.env.DEEPSEEK_THINKING || "disabled" };
+    }
+    if (rewritten.thinking?.type === "disabled") {
+      delete rewritten.reasoning_effort;
+    }
   }
 
   return Buffer.from(JSON.stringify(rewritten), "utf8");
@@ -1040,7 +1052,7 @@ function prepareProviderRequest(request, provider, jsonBody, rawBody, modelOverr
     };
   }
 
-  const upstreamBody = maybeRewriteOpenAiBody(jsonBody, rawBody, modelOverride);
+  const upstreamBody = maybeRewriteOpenAiBody(provider, jsonBody, rawBody, modelOverride);
   return {
     upstreamUrl: buildUpstreamUrl(provider, request.url),
     upstreamBody,

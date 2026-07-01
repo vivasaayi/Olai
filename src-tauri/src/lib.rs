@@ -21,6 +21,9 @@ pub fn run() {
             save_old_book_snapshot,
             old_book_snapshot_dir,
             export_old_book_html,
+            browse_old_book_exports,
+            old_book_export_http_url,
+            old_book_export_api_url,
         ])
         .setup(|app| {
             if cfg!(debug_assertions) {
@@ -44,11 +47,17 @@ use std::path::PathBuf;
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::blocking::Client;
 use rusqlite::{params, Connection, Transaction};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
 use tauri::Emitter;
+
+static EXPORT_SERVER_PORT: OnceLock<u16> = OnceLock::new();
 
 #[tauri::command]
 fn app_data_dir() -> Result<String, String> {
@@ -200,7 +209,45 @@ fn migrate_library_db(conn: &Connection) -> Result<(), String> {
     INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (1, 'old_book_library');
     ",
     )
-    .map_err(|e| format!("migrate library sqlite: {}", e))
+    .map_err(|e| format!("migrate library sqlite: {}", e))?;
+
+    let translations_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'old_book_translations'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("inspect old_book_translations schema: {}", e))?;
+
+    if translations_sql.contains("UNIQUE(book_id, page_number, complexity, language)") {
+        conn.execute_batch(
+            "
+      CREATE TABLE old_book_translations_next (
+        id TEXT PRIMARY KEY,
+        book_id TEXT NOT NULL,
+        page_number INTEGER NOT NULL,
+        complexity TEXT NOT NULL,
+        language TEXT NOT NULL,
+        section_title TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        FOREIGN KEY(book_id) REFERENCES old_book_records(id) ON DELETE CASCADE
+      );
+
+      INSERT OR REPLACE INTO old_book_translations_next
+        (id, book_id, page_number, complexity, language, section_title, created_at, payload_json)
+      SELECT id, book_id, page_number, complexity, language, section_title, created_at, payload_json
+      FROM old_book_translations;
+
+      DROP TABLE old_book_translations;
+      ALTER TABLE old_book_translations_next RENAME TO old_book_translations;
+      INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (2, 'translation_variants');
+      ",
+        )
+        .map_err(|e| format!("migrate translation variants: {}", e))?;
+    }
+
+    Ok(())
 }
 
 fn safe_path_segment(value: &str) -> String {
@@ -234,6 +281,47 @@ fn old_book_snapshot_dir(book_id: String) -> Result<String, String> {
     let dir = old_book_snapshots_dir(&book_id)?;
     fs::create_dir_all(&dir).map_err(|e| format!("create snapshot dir: {}", e))?;
     Ok(dir.to_string_lossy().into_owned())
+}
+
+fn old_book_export_file_name(file_name: &str) -> String {
+    let trimmed = file_name
+        .strip_suffix(".html")
+        .or_else(|| file_name.strip_suffix(".htm"))
+        .unwrap_or(file_name);
+    let safe_name = safe_path_segment(trimmed);
+    if safe_name.is_empty() {
+        "book.html".into()
+    } else {
+        format!("{}.html", safe_name)
+    }
+}
+
+fn open_folder(path: &PathBuf) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("open folder in Finder: {}", e))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("open folder in Explorer: {}", e))?;
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("open folder: {}", e))?;
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -276,13 +364,8 @@ fn export_old_book_html(
     dir.push("exports");
     fs::create_dir_all(&dir).map_err(|e| format!("create export dir: {}", e))?;
 
-    let safe_name = safe_path_segment(&file_name);
     let mut file_path = dir;
-    file_path.push(if safe_name.ends_with(".html") {
-        safe_name
-    } else {
-        format!("{}.html", safe_name)
-    });
+    file_path.push(old_book_export_file_name(&file_name));
     fs::write(&file_path, html).map_err(|e| format!("write export file: {}", e))?;
 
     if reveal {
@@ -316,6 +399,317 @@ fn export_old_book_html(
     }
 
     Ok(file_path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn browse_old_book_exports(book_id: String) -> Result<String, String> {
+    let mut dir = old_book_book_dir(&book_id)?;
+    dir.push("exports");
+    fs::create_dir_all(&dir).map_err(|e| format!("create export dir: {}", e))?;
+    open_folder(&dir)?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OldBookExportUrl {
+    local_url: String,
+    network_url: Option<String>,
+    port: u16,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OldBookExportFile {
+    book_id: String,
+    file_name: String,
+    url: String,
+    size_bytes: u64,
+    modified_unix_ms: Option<u128>,
+}
+
+fn list_old_book_export_files(book_id_filter: Option<&str>) -> Result<Vec<OldBookExportFile>, String> {
+    let mut books_root = bookforge_dir()?;
+    books_root.push("books");
+    if !books_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let book_ids = if let Some(book_id) = book_id_filter {
+        vec![safe_path_segment(book_id)]
+    } else {
+        fs::read_dir(&books_root)
+            .map_err(|e| format!("read books dir: {}", e))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if !entry.file_type().ok()?.is_dir() {
+                    return None;
+                }
+                Some(entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect()
+    };
+
+    let mut files = Vec::new();
+    for book_id in book_ids {
+        let mut exports_dir = books_root.clone();
+        exports_dir.push(&book_id);
+        exports_dir.push("exports");
+        if !exports_dir.exists() {
+            continue;
+        }
+
+        for entry in fs::read_dir(&exports_dir)
+            .map_err(|e| format!("read export dir for {}: {}", book_id, e))?
+        {
+            let entry = entry.map_err(|e| format!("read export file entry: {}", e))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("read export file type: {}", e))?;
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            if !file_name.ends_with(".html") {
+                continue;
+            }
+
+            let metadata = entry
+                .metadata()
+                .map_err(|e| format!("read export file metadata: {}", e))?;
+            let modified_unix_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis());
+
+            files.push(OldBookExportFile {
+                url: format!("/exports/{}/{}", book_id, file_name),
+                book_id: book_id.clone(),
+                file_name,
+                size_bytes: metadata.len(),
+                modified_unix_ms,
+            });
+        }
+    }
+
+    files.sort_by(|left, right| {
+        left.book_id
+            .cmp(&right.book_id)
+            .then(left.file_name.cmp(&right.file_name))
+    });
+    Ok(files)
+}
+
+fn local_network_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    )?;
+    stream.write_all(body)
+}
+
+fn handle_export_http_connection(mut stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let mut buffer = [0_u8; 2048];
+    let bytes_read = match stream.read(&mut buffer) {
+        Ok(bytes_read) => bytes_read,
+        Err(_) => return,
+    };
+    if bytes_read == 0 {
+        return;
+    }
+
+    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+    let Some(request_line) = request.lines().next() else {
+        return;
+    };
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let path = request_parts.next().unwrap_or("");
+
+    if method != "GET" && method != "HEAD" {
+        let _ = write_http_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"Only GET and HEAD are supported.",
+        );
+        return;
+    }
+
+    let clean_path = path.split('?').next().unwrap_or(path);
+    let path_parts: Vec<&str> = clean_path.trim_start_matches('/').split('/').collect();
+
+    if path_parts.len() >= 2 && path_parts[0] == "api" && path_parts[1] == "exports" {
+        if path_parts.len() > 3 {
+            let _ = write_http_response(
+                &mut stream,
+                "404 Not Found",
+                "application/json; charset=utf-8",
+                br#"{"error":"Export API route not found."}"#,
+            );
+            return;
+        }
+
+        let book_id = path_parts.get(2).copied().map(safe_path_segment);
+        let files = match list_old_book_export_files(book_id.as_deref()) {
+            Ok(files) => files,
+            Err(error) => {
+                let body = json!({ "error": error }).to_string();
+                let response_body = if method == "HEAD" { &[][..] } else { body.as_bytes() };
+                let _ = write_http_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    response_body,
+                );
+                return;
+            }
+        };
+        let body = json!({
+            "bookId": book_id,
+            "files": files,
+        })
+        .to_string();
+        let response_body = if method == "HEAD" { &[][..] } else { body.as_bytes() };
+        let _ = write_http_response(
+            &mut stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            response_body,
+        );
+        return;
+    }
+
+    if path_parts.len() != 3 || path_parts[0] != "exports" {
+        let _ = write_http_response(
+            &mut stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"Export not found.",
+        );
+        return;
+    }
+
+    let book_id = safe_path_segment(path_parts[1]);
+    let file_name = old_book_export_file_name(path_parts[2]);
+    let mut file_path = match old_book_book_dir(&book_id) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = write_http_response(
+                &mut stream,
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                error.as_bytes(),
+            );
+            return;
+        }
+    };
+    file_path.push("exports");
+    file_path.push(file_name);
+
+    let body = match fs::read(&file_path) {
+        Ok(body) => body,
+        Err(_) => {
+            let _ = write_http_response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"Export file not found.",
+            );
+            return;
+        }
+    };
+
+    let response_body = if method == "HEAD" { &[][..] } else { &body[..] };
+    let _ = write_http_response(
+        &mut stream,
+        "200 OK",
+        "text/html; charset=utf-8",
+        response_body,
+    );
+}
+
+fn ensure_old_book_export_server() -> Result<u16, String> {
+    if let Some(port) = EXPORT_SERVER_PORT.get() {
+        return Ok(*port);
+    }
+
+    let listener = TcpListener::bind("0.0.0.0:0")
+        .map_err(|e| format!("start export server: {}", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("read export server port: {}", e))?
+        .port();
+
+    let _ = EXPORT_SERVER_PORT.set(port);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => handle_export_http_connection(stream),
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(port)
+}
+
+#[tauri::command]
+fn old_book_export_http_url(book_id: String, file_name: String) -> Result<OldBookExportUrl, String> {
+    let port = ensure_old_book_export_server()?;
+    let safe_book_id = safe_path_segment(&book_id);
+    let safe_file_name = old_book_export_file_name(&file_name);
+    let local_url = format!(
+        "http://127.0.0.1:{}/exports/{}/{}",
+        port, safe_book_id, safe_file_name
+    );
+    let network_url = local_network_ip().map(|ip| {
+        format!(
+            "http://{}:{}/exports/{}/{}",
+            ip, port, safe_book_id, safe_file_name
+        )
+    });
+
+    Ok(OldBookExportUrl {
+        local_url,
+        network_url,
+        port,
+    })
+}
+
+#[tauri::command]
+fn old_book_export_api_url(book_id: Option<String>) -> Result<OldBookExportUrl, String> {
+    let port = ensure_old_book_export_server()?;
+    let path = book_id
+        .as_deref()
+        .map(|id| format!("/api/exports/{}", safe_path_segment(id)))
+        .unwrap_or_else(|| "/api/exports".to_string());
+    let local_url = format!("http://127.0.0.1:{}{}", port, path);
+    let network_url = local_network_ip().map(|ip| format!("http://{}:{}{}", ip, port, path));
+
+    Ok(OldBookExportUrl {
+        local_url,
+        network_url,
+        port,
+    })
 }
 
 #[derive(Serialize)]

@@ -87,6 +87,101 @@ type SnapshotProgressState = {
   message: string
 }
 
+type PortableBookPackage = {
+  schemaVersion: '1.0.0'
+  packageType: 'portable-translation-book'
+  packageId: string
+  bookId: string
+  version: string
+  revision: number
+  defaultLanguage: string
+  contentHash?: string
+  exportedAt: string
+  source: {
+    app: 'book-reader'
+    appBookId: string
+  }
+  files?: PortablePackageFileManifest[]
+  book: PortableBook
+}
+
+type PortablePackageFileManifest = {
+  path: string
+  mimeType: string
+  sizeBytes: number
+  sha256: string
+}
+
+type PortableBook = {
+  slug: string
+  title: string
+  subtitle?: string
+  author?: string
+  originalLanguage?: string
+  dateLabel?: string
+  description?: string
+  tags: string[]
+  status: 'draft' | 'reviewed' | 'published'
+  pageCount: number
+  languages: string[]
+  pages: PortableBookPage[]
+  glossary: PortableGlossaryTerm[]
+  assets: PortableBookAsset[]
+}
+
+type PortableBookPage = {
+  pageNumber: number
+  sectionTitle?: string
+  sourceLines: string[]
+  snapshotAssetId?: string
+  translations: PortablePageTranslation[]
+}
+
+type PortablePageTranslation = {
+  language: string
+  complexity: TranslationComplexity
+  title?: string
+  paragraphs: string[]
+  notes?: string[]
+  glossary?: PortableGlossaryTerm[]
+  model?: string
+  sourceModel?: string
+  createdAt: string
+}
+
+type PortableGlossaryTerm = {
+  sourceTerm: string
+  translatedTerm: string
+  explanation?: string
+  englishTerm?: string
+  targetTerm?: string
+  transliteration?: string
+  language?: string
+  approved?: boolean
+}
+
+type PortableBookAsset = {
+  id: string
+  kind: 'cover' | 'page-snapshot' | 'pdf'
+  pageNumber?: number
+  fileName: string
+  mimeType: string
+  dataUrl?: string
+  path?: string
+  width?: number
+  height?: number
+  sizeBytes?: number
+}
+
+type PortablePackageFile = {
+  path: string
+  bytes: Uint8Array
+}
+
+type PortablePackageExportScope =
+  | { kind: 'language', language: TranslationLanguage }
+  | { kind: 'all', defaultLanguage: TranslationLanguage }
+
 const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'download']
 const personas: NodePersona[] = ['default', 'kids', 'beginner', 'formal', 'college']
 const llmRouterEndpoint = '/api/llm-router/v1'
@@ -621,17 +716,44 @@ function formatFileSize(sizeBytes: number | undefined) {
   return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+function normalizedModelKey(value: string | undefined) {
+  return value?.trim() ?? ''
+}
+
+function translationMatchesVariant(
+  translation: OldBookRecord['translations'][number],
+  model?: string,
+  sourceModel?: string,
+) {
+  const expectedModel = normalizedModelKey(model)
+  const expectedSourceModel = normalizedModelKey(sourceModel)
+  if (expectedModel && normalizedModelKey(translation.model) !== expectedModel) return false
+  if (expectedSourceModel && normalizedModelKey(translation.sourceModel) !== expectedSourceModel) return false
+  return true
+}
+
+function translationVariantLabel(translation: OldBookRecord['translations'][number]) {
+  const model = normalizedModelKey(translation.model) || 'Unknown model'
+  const sourceModel = normalizedModelKey(translation.sourceModel)
+  return sourceModel && sourceModel !== model ? `${sourceModel} -> ${model}` : model
+}
+
 function getStoredTranslation(
   book: OldBookRecord,
   complexity: TranslationComplexity,
   language: TranslationLanguage,
   sectionTitle: string,
+  model?: string,
+  sourceModel?: string,
 ) {
+  const matchesVariant = (translation: OldBookRecord['translations'][number]) =>
+    translationMatchesVariant(translation, model, sourceModel)
   const exactSection = book.translations.find((translation) =>
     translation.pageNumber === book.pageNumber
     && translation.sectionTitle === sectionTitle
     && translation.complexity === complexity
     && translation.language === language
+    && matchesVariant(translation)
   )
 
   if (exactSection) return exactSection
@@ -640,6 +762,7 @@ function getStoredTranslation(
     translation.pageNumber === book.pageNumber
     && translation.complexity === complexity
     && translation.language === language
+    && matchesVariant(translation)
   )
 }
 
@@ -647,11 +770,17 @@ function getTranslatedPageCount(
   book: OldBookRecord | undefined,
   complexity: TranslationComplexity,
   language: TranslationLanguage,
+  model?: string,
+  sourceModel?: string,
 ) {
   if (!book?.pdfBlobId) return 0
   return new Set(
     book.translations
-      .filter((translation) => translation.complexity === complexity && translation.language === language)
+      .filter((translation) =>
+        translation.complexity === complexity
+        && translation.language === language
+        && translationMatchesVariant(translation, model, sourceModel)
+      )
       .map((translation) => translation.pageNumber),
   ).size
 }
@@ -694,30 +823,39 @@ function isAllPagesSelection(selection: string) {
   return !normalizedSelection || normalizedSelection === 'all'
 }
 
-function getCanonicalOriginalTranslation(book: OldBookRecord | undefined, pageNumber = book?.pageNumber) {
+function getCanonicalOriginalTranslation(book: OldBookRecord | undefined, pageNumber = book?.pageNumber, model?: string) {
   if (!book || !pageNumber) return undefined
   return book.translations.find((translation) =>
     translation.pageNumber === pageNumber
     && translation.complexity === 'original'
     && translation.language === 'en'
+    && translationMatchesVariant(translation, model)
   )
 }
 
-function getPreviousOriginalTranslation(book: OldBookRecord | undefined) {
+function getPreviousOriginalTranslation(book: OldBookRecord | undefined, model?: string) {
   if (!book || book.pageNumber <= 1) return undefined
-  return getCanonicalOriginalTranslation(book, book.pageNumber - 1)
+  return getCanonicalOriginalTranslation(book, book.pageNumber - 1, model)
+}
+
+function getNextOriginalTranslation(book: OldBookRecord | undefined, model?: string) {
+  if (!book) return undefined
+  return getCanonicalOriginalTranslation(book, book.pageNumber + 1, model)
 }
 
 function getPreviousPageTranslation(
   book: OldBookRecord | undefined,
   complexity: TranslationComplexity,
   language: TranslationLanguage,
+  model?: string,
+  sourceModel?: string,
 ) {
   if (!book || book.pageNumber <= 1) return undefined
   return book.translations.find((translation) =>
     translation.pageNumber === book.pageNumber - 1
     && translation.complexity === complexity
     && translation.language === language
+    && translationMatchesVariant(translation, model, sourceModel)
   )
 }
 
@@ -733,6 +871,9 @@ function getApprovedTranslationMemory(book: OldBookRecord | undefined): Translat
       sourceTerm: entry.sourceTerm,
       translatedTerm: entry.translatedTerm,
       explanation: entry.explanation,
+      englishTerm: entry.englishTerm,
+      targetTerm: entry.targetTerm,
+      transliteration: entry.transliteration,
     }))
 }
 
@@ -789,6 +930,9 @@ function mergeTranslationMemorySuggestions(
       sourceTerm: entry.sourceTerm.trim(),
       translatedTerm: entry.translatedTerm.trim(),
       explanation: entry.explanation.trim(),
+      englishTerm: entry.englishTerm?.trim() || undefined,
+      targetTerm: entry.targetTerm?.trim() || undefined,
+      transliteration: entry.transliteration?.trim() || undefined,
       approved: false,
       createdAt: now,
       updatedAt: now,
@@ -818,6 +962,9 @@ function mergeApprovedTranslationMemory(
         sourceTerm,
         translatedTerm,
         explanation: entry.explanation.trim() || existing.explanation,
+        englishTerm: entry.englishTerm?.trim() || existing.englishTerm,
+        targetTerm: entry.targetTerm?.trim() || existing.targetTerm,
+        transliteration: entry.transliteration?.trim() || existing.transliteration,
         approved: true,
         updatedAt: now,
       }
@@ -826,6 +973,9 @@ function mergeApprovedTranslationMemory(
         sourceTerm,
         translatedTerm,
         explanation: entry.explanation.trim(),
+        englishTerm: entry.englishTerm?.trim() || undefined,
+        targetTerm: entry.targetTerm?.trim() || undefined,
+        transliteration: entry.transliteration?.trim() || undefined,
         approved: true,
         createdAt: now,
         updatedAt: now,
@@ -860,6 +1010,8 @@ function replaceTranslationRecord(translations: OldBookRecord['translations'], t
       !(entry.pageNumber === translation.pageNumber
         && entry.complexity === translation.complexity
         && entry.language === translation.language)
+        || normalizedModelKey(entry.model) !== normalizedModelKey(translation.model)
+        || normalizedModelKey(entry.sourceModel) !== normalizedModelKey(translation.sourceModel)
     ),
   ]
 }
@@ -881,22 +1033,632 @@ function slugifyFileName(value: string) {
     || 'bookforge-export'
 }
 
+function downloadTextFile(fileName: string, content: string, type: string) {
+  const blob = new Blob([content], { type })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = fileName
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+function downloadBlobFile(fileName: string, blob: Blob) {
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = fileName
+  link.click()
+  URL.revokeObjectURL(link.href)
+}
+
+async function sha256HexBytes(value: Uint8Array) {
+  const digest = await crypto.subtle.digest('SHA-256', value)
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function jsonBytes(value: unknown) {
+  return new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`)
+}
+
+function dataUrlToBytes(dataUrl: string) {
+  const [meta, payload] = dataUrl.split(',', 2)
+  if (!payload) return new Uint8Array()
+  if (meta.endsWith(';base64')) {
+    const binary = atob(payload)
+    const bytes = new Uint8Array(binary.length)
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index)
+    }
+    return bytes
+  }
+  return new TextEncoder().encode(decodeURIComponent(payload))
+}
+
+function sanitizePackagePathPart(value: string) {
+  return slugifyFileName(value).replace(/\./g, '-') || 'asset'
+}
+
+function pageAssetPath(asset: PortableBookAsset) {
+  const pageNumber = String(asset.pageNumber ?? 0).padStart(4, '0')
+  const extension = asset.mimeType === 'image/jpeg' ? 'jpg' : asset.mimeType === 'image/webp' ? 'webp' : 'png'
+  return `assets/pages/page-${pageNumber}-${sanitizePackagePathPart(asset.id)}.${extension}`
+}
+
+function concatBytes(chunks: Uint8Array[]) {
+  const totalLength = chunks.reduce((total, chunk) => total + chunk.length, 0)
+  const result = new Uint8Array(totalLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    result.set(chunk, offset)
+    offset += chunk.length
+  }
+  return result
+}
+
+const crc32Table = (() => {
+  const table = new Uint32Array(256)
+  for (let index = 0; index < 256; index += 1) {
+    let value = index
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1
+    }
+    table[index] = value >>> 0
+  }
+  return table
+})()
+
+function crc32(bytes: Uint8Array) {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc = crc32Table[(crc ^ byte) & 0xff] ^ (crc >>> 8)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function writeUint16(view: DataView, offset: number, value: number) {
+  view.setUint16(offset, value, true)
+}
+
+function writeUint32(view: DataView, offset: number, value: number) {
+  view.setUint32(offset, value >>> 0, true)
+}
+
+function currentDosDateTime() {
+  const now = new Date()
+  const year = Math.max(1980, now.getFullYear())
+  const time = (now.getHours() << 11) | (now.getMinutes() << 5) | Math.floor(now.getSeconds() / 2)
+  const date = ((year - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate()
+  return { time, date }
+}
+
+function createZipBlob(files: PortablePackageFile[]) {
+  const encoder = new TextEncoder()
+  const { time, date } = currentDosDateTime()
+  const localChunks: Uint8Array[] = []
+  const centralChunks: Uint8Array[] = []
+  let localOffset = 0
+
+  for (const file of files) {
+    const nameBytes = encoder.encode(file.path)
+    const fileCrc = crc32(file.bytes)
+    const localHeader = new Uint8Array(30 + nameBytes.length)
+    const localView = new DataView(localHeader.buffer)
+
+    writeUint32(localView, 0, 0x04034b50)
+    writeUint16(localView, 4, 20)
+    writeUint16(localView, 6, 0x0800)
+    writeUint16(localView, 8, 0)
+    writeUint16(localView, 10, time)
+    writeUint16(localView, 12, date)
+    writeUint32(localView, 14, fileCrc)
+    writeUint32(localView, 18, file.bytes.length)
+    writeUint32(localView, 22, file.bytes.length)
+    writeUint16(localView, 26, nameBytes.length)
+    writeUint16(localView, 28, 0)
+    localHeader.set(nameBytes, 30)
+    localChunks.push(localHeader, file.bytes)
+
+    const centralHeader = new Uint8Array(46 + nameBytes.length)
+    const centralView = new DataView(centralHeader.buffer)
+    writeUint32(centralView, 0, 0x02014b50)
+    writeUint16(centralView, 4, 20)
+    writeUint16(centralView, 6, 20)
+    writeUint16(centralView, 8, 0x0800)
+    writeUint16(centralView, 10, 0)
+    writeUint16(centralView, 12, time)
+    writeUint16(centralView, 14, date)
+    writeUint32(centralView, 16, fileCrc)
+    writeUint32(centralView, 20, file.bytes.length)
+    writeUint32(centralView, 24, file.bytes.length)
+    writeUint16(centralView, 28, nameBytes.length)
+    writeUint16(centralView, 30, 0)
+    writeUint16(centralView, 32, 0)
+    writeUint16(centralView, 34, 0)
+    writeUint16(centralView, 36, 0)
+    writeUint32(centralView, 38, 0)
+    writeUint32(centralView, 42, localOffset)
+    centralHeader.set(nameBytes, 46)
+    centralChunks.push(centralHeader)
+
+    localOffset += localHeader.length + file.bytes.length
+  }
+
+  const centralDirectory = concatBytes(centralChunks)
+  const endRecord = new Uint8Array(22)
+  const endView = new DataView(endRecord.buffer)
+  writeUint32(endView, 0, 0x06054b50)
+  writeUint16(endView, 4, 0)
+  writeUint16(endView, 6, 0)
+  writeUint16(endView, 8, files.length)
+  writeUint16(endView, 10, files.length)
+  writeUint32(endView, 12, centralDirectory.length)
+  writeUint32(endView, 16, localOffset)
+  writeUint16(endView, 20, 0)
+
+  return new Blob([concatBytes([...localChunks, centralDirectory, endRecord])], {
+    type: 'application/vnd.portable-translation-book+zip',
+  })
+}
+
+function toPortableGlossaryTerm(
+  entry: TranslationGlossaryEntry | TranslationMemoryEntry,
+  language?: string,
+): PortableGlossaryTerm {
+  return {
+    sourceTerm: entry.sourceTerm,
+    translatedTerm: entry.translatedTerm,
+    explanation: entry.explanation || undefined,
+    englishTerm: entry.englishTerm || undefined,
+    targetTerm: entry.targetTerm || undefined,
+    transliteration: entry.transliteration || undefined,
+    language,
+    approved: 'approved' in entry ? entry.approved : undefined,
+  }
+}
+
+function shouldPublishTranslation(
+  translation: OldBookRecord['translations'][number],
+  targetLanguage: TranslationLanguage,
+) {
+  if (targetLanguage === 'en') return translation.language === 'en'
+  return translation.language === targetLanguage || (translation.language === 'en' && translation.complexity === 'original')
+}
+
+function buildPortableBookPackage(
+  book: OldBookRecord,
+  scope: PortablePackageExportScope,
+  snapshotImages = new Map<number, string>(),
+): PortableBookPackage {
+  const slug = slugifyFileName(book.title)
+  const defaultLanguage = scope.kind === 'all' ? scope.defaultLanguage : scope.language
+  const publishableTranslations = book.translations
+    .filter((translation) =>
+      scope.kind === 'all'
+        ? true
+        : shouldPublishTranslation(translation, scope.language),
+    )
+    .sort((left, right) =>
+      left.pageNumber - right.pageNumber
+      || left.language.localeCompare(right.language)
+      || left.complexity.localeCompare(right.complexity)
+      || translationVariantLabel(left).localeCompare(translationVariantLabel(right)),
+    )
+  const pageNumbers = Array.from(new Set([
+    ...publishableTranslations.map((translation) => translation.pageNumber),
+    ...book.pageSnapshots.map((snapshot) => snapshot.pageNumber),
+  ])).sort((left, right) => left - right)
+  const snapshotAssets: PortableBookAsset[] = book.pageSnapshots
+    .filter((snapshot) => pageNumbers.includes(snapshot.pageNumber))
+    .sort((left, right) => left.pageNumber - right.pageNumber)
+    .map((snapshot) => ({
+      id: snapshot.id,
+      kind: 'page-snapshot',
+      pageNumber: snapshot.pageNumber,
+      fileName: `${slugifyFileName(book.title)}-page-${snapshot.pageNumber}.png`,
+      mimeType: 'image/png',
+      dataUrl: snapshotImages.get(snapshot.pageNumber) || snapshot.imageDataUrl || undefined,
+      path: snapshot.filePath,
+      width: snapshot.width,
+      height: snapshot.height,
+    }))
+  const snapshotAssetByPage = new Map(snapshotAssets.map((asset) => [asset.pageNumber, asset]))
+  const translationsByPage = new Map<number, typeof publishableTranslations>()
+
+  for (const translation of publishableTranslations) {
+    translationsByPage.set(translation.pageNumber, [
+      ...(translationsByPage.get(translation.pageNumber) ?? []),
+      translation,
+    ])
+  }
+
+  const pages: PortableBookPage[] = pageNumbers.map((pageNumber) => {
+    const pageTranslations = translationsByPage.get(pageNumber) ?? []
+    const original = pageTranslations.find((translation) => translation.language === 'en' && translation.complexity === 'original')
+      ?? book.translations.find((translation) => translation.pageNumber === pageNumber && translation.language === 'en' && translation.complexity === 'original')
+    const firstTranslation = pageTranslations[0]
+    const snapshotAsset = snapshotAssetByPage.get(pageNumber)
+
+    return {
+      pageNumber,
+      sectionTitle: firstTranslation?.sectionTitle || original?.sectionTitle || undefined,
+      sourceLines: original?.sourceLines ?? firstTranslation?.sourceLines ?? [],
+      snapshotAssetId: snapshotAsset?.id,
+      translations: pageTranslations.map((translation) => ({
+        language: translation.language,
+        complexity: translation.complexity,
+        title: translation.sectionTitle || undefined,
+        paragraphs: translation.paragraphs,
+        notes: translation.notes,
+        glossary: translation.glossary?.map((entry) => toPortableGlossaryTerm(entry, translation.language)),
+        model: translation.model,
+        sourceModel: translation.sourceModel,
+        createdAt: translation.createdAt,
+      })),
+    }
+  })
+  const languages = Array.from(new Set(publishableTranslations.map((translation) => translation.language))).sort()
+  const approvedGlossary = book.translationMemory
+    .filter((entry) => entry.approved)
+    .map((entry) => toPortableGlossaryTerm(entry))
+
+  return {
+    schemaVersion: '1.0.0',
+    packageType: 'portable-translation-book',
+    packageId: scope.kind === 'all' ? `${slug}.all` : `${slug}.${scope.language}`,
+    bookId: slug,
+    version: '1.0.0',
+    revision: 1,
+    defaultLanguage,
+    exportedAt: new Date().toISOString(),
+    source: {
+      app: 'book-reader',
+      appBookId: book.id,
+    },
+    book: {
+      slug,
+      title: book.title,
+      author: book.author || undefined,
+      originalLanguage: book.originalLanguage || undefined,
+      dateLabel: book.dateLabel || undefined,
+      description: book.section || undefined,
+      tags: book.tags,
+      status: 'reviewed',
+      pageCount: book.pages || pageNumbers.length,
+      languages,
+      pages,
+      glossary: approvedGlossary,
+      assets: snapshotAssets,
+    },
+  }
+}
+
+function withoutUndefinedValues<T extends Record<string, unknown>>(value: T) {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as T
+}
+
+async function buildPortablePackageFiles(
+  packagePayload: PortableBookPackage,
+  sourcePdfBlob?: Blob | null,
+) {
+  const book = packagePayload.book
+  const assetFiles: PortablePackageFile[] = []
+  const archiveAssets = book.assets.map((asset) => {
+    if (asset.kind === 'page-snapshot' && asset.dataUrl) {
+      const path = pageAssetPath(asset)
+      const bytes = dataUrlToBytes(asset.dataUrl)
+      assetFiles.push({ path, bytes })
+      return withoutUndefinedValues({
+        ...asset,
+        path,
+        dataUrl: undefined,
+        sizeBytes: bytes.length,
+      })
+    }
+
+    return withoutUndefinedValues({
+      ...asset,
+      dataUrl: undefined,
+    })
+  })
+
+  if (sourcePdfBlob) {
+    const pdfBytes = new Uint8Array(await sourcePdfBlob.arrayBuffer())
+    const pdfPath = 'source/original.pdf'
+    assetFiles.push({ path: pdfPath, bytes: pdfBytes })
+    archiveAssets.push({
+      id: 'source-pdf',
+      kind: 'pdf',
+      fileName: book.assets.find((asset) => asset.kind === 'pdf')?.fileName ?? `${book.slug}.pdf`,
+      mimeType: sourcePdfBlob.type || 'application/pdf',
+      path: pdfPath,
+      sizeBytes: pdfBytes.length,
+    })
+  }
+
+  const bookMetadata = {
+    slug: book.slug,
+    title: book.title,
+    subtitle: book.subtitle,
+    author: book.author,
+    originalLanguage: book.originalLanguage,
+    dateLabel: book.dateLabel,
+    description: book.description,
+    tags: book.tags,
+    status: book.status,
+    pageCount: book.pageCount,
+    languages: book.languages,
+    assets: archiveAssets,
+  }
+  const pages = book.pages.map((page) => ({
+    pageNumber: page.pageNumber,
+    sectionTitle: page.sectionTitle,
+    sourceLines: page.sourceLines,
+    snapshotAssetId: page.snapshotAssetId,
+  }))
+  const translationFiles = book.languages.map((language) => ({
+    path: `content/translations.${language}.json`,
+    bytes: jsonBytes(book.pages
+      .map((page) => ({
+        pageNumber: page.pageNumber,
+        translations: page.translations.filter((translation) => translation.language === language),
+      }))
+      .filter((page) => page.translations.length)),
+  }))
+  const contentFiles: PortablePackageFile[] = [
+    { path: 'content/book.json', bytes: jsonBytes(bookMetadata) },
+    { path: 'content/pages.json', bytes: jsonBytes(pages) },
+    { path: 'content/glossary.json', bytes: jsonBytes(book.glossary) },
+    ...translationFiles,
+  ]
+  const contentHashInput = concatBytes(contentFiles.flatMap((file) => [
+    new TextEncoder().encode(`${file.path}\n`),
+    file.bytes,
+  ]))
+  const contentHash = `sha256:${await sha256HexBytes(contentHashInput)}`
+  const manifestBase = {
+    schemaVersion: packagePayload.schemaVersion,
+    packageType: packagePayload.packageType,
+    packageId: packagePayload.packageId,
+    bookId: packagePayload.bookId,
+    version: packagePayload.version,
+    revision: packagePayload.revision,
+    defaultLanguage: packagePayload.defaultLanguage,
+    contentHash,
+    exportedAt: packagePayload.exportedAt,
+    source: packagePayload.source,
+    book: bookMetadata,
+  }
+  const filesForManifest = [...contentFiles, ...assetFiles]
+  const fileManifest: PortablePackageFileManifest[] = await Promise.all(filesForManifest.map(async (file) => ({
+    path: file.path,
+    mimeType: file.path.endsWith('.json')
+      ? 'application/json'
+      : file.path.endsWith('.pdf')
+        ? 'application/pdf'
+        : 'image/png',
+    sizeBytes: file.bytes.length,
+    sha256: `sha256:${await sha256HexBytes(file.bytes)}`,
+  })))
+  const manifest = {
+    ...manifestBase,
+    files: fileManifest,
+  }
+
+  return [
+    { path: 'manifest.json', bytes: jsonBytes(manifest) },
+    ...contentFiles,
+    ...assetFiles,
+  ]
+}
+
 function getPageTranslation(
   book: OldBookRecord,
   pageNumber: number,
   complexity: TranslationComplexity,
   language: TranslationLanguage,
+  model?: string,
+  sourceModel?: string,
 ) {
   return book.translations.find((translation) =>
     translation.pageNumber === pageNumber
     && translation.complexity === complexity
     && translation.language === language
+    && translationMatchesVariant(translation, model, sourceModel)
   )
+}
+
+function getPageTranslations(
+  book: OldBookRecord,
+  pageNumber: number,
+  complexity: TranslationComplexity,
+  language: TranslationLanguage,
+) {
+  return book.translations
+    .filter((translation) =>
+      translation.pageNumber === pageNumber
+      && translation.complexity === complexity
+      && translation.language === language
+    )
+    .sort((left, right) => translationVariantLabel(left).localeCompare(translationVariantLabel(right)))
+}
+
+function getTranslationModelLabel(translation: OldBookRecord['translations'][number] | undefined) {
+  if (!translation) return ''
+  return translationVariantLabel(translation)
 }
 
 function renderExportParagraphs(paragraphs: string[] | undefined) {
   if (!paragraphs?.length) return '<p class="missing">Not exported yet.</p>'
   return paragraphs.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('\n')
+}
+
+function markdownSourceLines(markdown: string) {
+  return markdown
+    .split(/\r?\n/)
+    .flatMap((line) => line.replace(/\s+(\d+)\.\s+/g, '\n$1. ').split('\n'))
+}
+
+function renderInlineMarkdownHtml(value: string) {
+  return escapeHtml(value).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+}
+
+function inlineMarkdownParts(value = '') {
+  return value.split(/(\*\*.+?\*\*)/g).filter(Boolean).map((part) => {
+    const strong = part.match(/^\*\*(.+)\*\*$/)
+    return { text: strong?.[1] ?? part, strong: Boolean(strong) }
+  })
+}
+
+function parseMarkdownTableLine(line: string) {
+  if (!line.trim().startsWith('|') || !line.trim().endsWith('|')) return null
+  return line.trim().slice(1, -1).split('|').map((cell) => cell.trim())
+}
+
+function isMarkdownTableSeparator(line: string) {
+  const cells = parseMarkdownTableLine(line)
+  return Boolean(cells?.length && cells.every((cell) => /^:?-{3,}:?$/.test(cell)))
+}
+
+function renderMarkdownishHtml(markdown: string) {
+  const lines = markdownSourceLines(markdown)
+  const html: string[] = []
+  let paragraph: string[] = []
+  let listItems: string[] = []
+  let orderedItems: string[] = []
+  let tableRows: string[][] = []
+  let codeFence: { language: string, lines: string[] } | null = null
+
+  const flushParagraph = () => {
+    if (!paragraph.length) return
+    html.push(`<p>${renderInlineMarkdownHtml(paragraph.join(' '))}</p>`)
+    paragraph = []
+  }
+  const flushList = () => {
+    if (!listItems.length) return
+    html.push(`<ul>${listItems.map((item) => `<li>${renderInlineMarkdownHtml(item)}</li>`).join('')}</ul>`)
+    listItems = []
+  }
+  const flushOrderedList = () => {
+    if (!orderedItems.length) return
+    html.push(`<ol>${orderedItems.map((item) => `<li>${renderInlineMarkdownHtml(item)}</li>`).join('')}</ol>`)
+    orderedItems = []
+  }
+  const flushTable = () => {
+    if (tableRows.length < 2) {
+      tableRows = []
+      return
+    }
+    const [header, ...body] = tableRows
+    html.push(`
+      <table>
+        <thead><tr>${header.map((cell) => `<th>${renderInlineMarkdownHtml(cell)}</th>`).join('')}</tr></thead>
+        <tbody>${body.map((row) => `<tr>${row.map((cell) => `<td>${renderInlineMarkdownHtml(cell)}</td>`).join('')}</tr>`).join('')}</tbody>
+      </table>
+    `)
+    tableRows = []
+  }
+
+  for (const line of lines) {
+    const fenceMatch = line.match(/^```(\w+)?\s*$/)
+    if (fenceMatch) {
+      if (codeFence) {
+        const code = escapeHtml(codeFence.lines.join('\n'))
+        html.push(codeFence.language === 'mermaid'
+          ? `<pre class="mermaid">${code}</pre>`
+          : `<pre><code>${code}</code></pre>`)
+        codeFence = null
+      } else {
+        flushParagraph()
+        flushList()
+        flushOrderedList()
+        flushTable()
+        codeFence = { language: fenceMatch[1] ?? '', lines: [] }
+      }
+      continue
+    }
+
+    if (codeFence) {
+      codeFence.lines.push(line)
+      continue
+    }
+
+    if (!line.trim()) {
+      flushParagraph()
+      flushList()
+      flushOrderedList()
+      flushTable()
+      continue
+    }
+
+    const tableCells = parseMarkdownTableLine(line)
+    if (tableCells) {
+      if (isMarkdownTableSeparator(line)) continue
+      flushParagraph()
+      flushList()
+      flushOrderedList()
+      tableRows.push(tableCells)
+      continue
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)$/)
+    if (heading) {
+      flushParagraph()
+      flushList()
+      flushOrderedList()
+      flushTable()
+      const level = Math.min(4, heading[1].length + 2)
+      html.push(`<h${level}>${renderInlineMarkdownHtml(heading[2])}</h${level}>`)
+      continue
+    }
+
+    const listItem = line.match(/^[-*]\s+(.+)$/)
+    if (listItem) {
+      flushParagraph()
+      flushOrderedList()
+      flushTable()
+      listItems.push(listItem[1])
+      continue
+    }
+
+    const orderedItem = line.match(/^\d+\.\s+(.+)$/)
+    if (orderedItem) {
+      flushParagraph()
+      flushList()
+      flushTable()
+      orderedItems.push(orderedItem[1])
+      continue
+    }
+
+    paragraph.push(line.trim())
+  }
+
+  flushParagraph()
+  flushList()
+  flushOrderedList()
+  flushTable()
+  if (codeFence) {
+    const code = escapeHtml(codeFence.lines.join('\n'))
+    html.push(codeFence.language === 'mermaid'
+      ? `<pre class="mermaid">${code}</pre>`
+      : `<pre><code>${code}</code></pre>`)
+  }
+
+  return html.join('\n')
+}
+
+function renderExportContent(translation: OldBookRecord['translations'][number] | undefined) {
+  if (!translation?.paragraphs.length) return '<p class="missing">Not exported yet.</p>'
+  if (translation.complexity === 'concept-guide') {
+    return renderMarkdownishHtml(translation.paragraphs.join('\n\n'))
+  }
+  return renderExportParagraphs(translation.paragraphs)
+}
+
+function renderExportModelMeta(translation: OldBookRecord['translations'][number] | undefined) {
+  const model = getTranslationModelLabel(translation)
+  if (!model) return ''
+  return `<p class="model-meta">Model: ${escapeHtml(model)}</p>`
 }
 
 function renderExportSourceLines(sourceLines: string[] | undefined) {
@@ -913,12 +1675,185 @@ function renderExportVocabulary(glossary: TranslationGlossaryEntry[] | undefined
         ${glossary.map((entry) => `
           <div>
             <dt>${escapeHtml(entry.sourceTerm)}${entry.translatedTerm ? ` <span>${escapeHtml(entry.translatedTerm)}</span>` : ''}</dt>
+            ${entry.englishTerm || entry.targetTerm || entry.transliteration ? `
+              <dd class="vocabulary-meta">
+                ${entry.englishTerm ? `<strong>English:</strong> ${escapeHtml(entry.englishTerm)}` : ''}
+                ${entry.targetTerm ? `${entry.englishTerm ? ' · ' : ''}<strong>Target:</strong> ${escapeHtml(entry.targetTerm)}` : ''}
+                ${entry.transliteration ? `${entry.englishTerm || entry.targetTerm ? ' · ' : ''}<strong>Transliteration:</strong> ${escapeHtml(entry.transliteration)}` : ''}
+              </dd>
+            ` : ''}
             ${entry.explanation ? `<dd>${escapeHtml(entry.explanation)}</dd>` : ''}
           </div>
         `).join('\n')}
       </dl>
     </section>
   `
+}
+
+function MarkdownishContent({ markdown }: { markdown: string }) {
+  const blocks = useMemo(() => {
+    const lines = markdownSourceLines(markdown)
+    const parsedBlocks: { kind: 'heading' | 'paragraph' | 'list' | 'ordered-list' | 'table' | 'code' | 'mermaid', text?: string, level?: number, items?: string[], rows?: string[][] }[] = []
+    let paragraph: string[] = []
+    let listItems: string[] = []
+    let orderedItems: string[] = []
+    let tableRows: string[][] = []
+    let codeFence: { language: string, lines: string[] } | null = null
+
+    const flushParagraph = () => {
+      if (!paragraph.length) return
+      parsedBlocks.push({ kind: 'paragraph', text: paragraph.join(' ') })
+      paragraph = []
+    }
+    const flushList = () => {
+      if (!listItems.length) return
+      parsedBlocks.push({ kind: 'list', items: listItems })
+      listItems = []
+    }
+    const flushOrderedList = () => {
+      if (!orderedItems.length) return
+      parsedBlocks.push({ kind: 'ordered-list', items: orderedItems })
+      orderedItems = []
+    }
+    const flushTable = () => {
+      if (tableRows.length >= 2) {
+        parsedBlocks.push({ kind: 'table', rows: tableRows })
+      }
+      tableRows = []
+    }
+
+    for (const line of lines) {
+      const fenceMatch = line.match(/^```(\w+)?\s*$/)
+      if (fenceMatch) {
+        if (codeFence) {
+          parsedBlocks.push({
+            kind: codeFence.language === 'mermaid' ? 'mermaid' : 'code',
+            text: codeFence.lines.join('\n'),
+          })
+          codeFence = null
+        } else {
+          flushParagraph()
+          flushList()
+          flushOrderedList()
+          flushTable()
+          codeFence = { language: fenceMatch[1] ?? '', lines: [] }
+        }
+        continue
+      }
+
+      if (codeFence) {
+        codeFence.lines.push(line)
+        continue
+      }
+
+      if (!line.trim()) {
+        flushParagraph()
+        flushList()
+        flushOrderedList()
+        flushTable()
+        continue
+      }
+
+      const tableCells = parseMarkdownTableLine(line)
+      if (tableCells) {
+        if (isMarkdownTableSeparator(line)) continue
+        flushParagraph()
+        flushList()
+        flushOrderedList()
+        tableRows.push(tableCells)
+        continue
+      }
+
+      const heading = line.match(/^(#{1,4})\s+(.+)$/)
+      if (heading) {
+        flushParagraph()
+        flushList()
+        flushOrderedList()
+        flushTable()
+        parsedBlocks.push({ kind: 'heading', level: Math.min(4, heading[1].length + 2), text: heading[2] })
+        continue
+      }
+
+      const listItem = line.match(/^[-*]\s+(.+)$/)
+      if (listItem) {
+        flushParagraph()
+        flushOrderedList()
+        flushTable()
+        listItems.push(listItem[1])
+        continue
+      }
+
+      const orderedItem = line.match(/^\d+\.\s+(.+)$/)
+      if (orderedItem) {
+        flushParagraph()
+        flushList()
+        flushTable()
+        orderedItems.push(orderedItem[1])
+        continue
+      }
+
+      paragraph.push(line.trim())
+    }
+
+    flushParagraph()
+    flushList()
+    flushOrderedList()
+    flushTable()
+    if (codeFence) {
+      parsedBlocks.push({
+        kind: codeFence.language === 'mermaid' ? 'mermaid' : 'code',
+        text: codeFence.lines.join('\n'),
+      })
+    }
+    return parsedBlocks
+  }, [markdown])
+
+  const renderInline = (text = '') => inlineMarkdownParts(text).map((part, index) =>
+    part.strong ? <strong key={index}>{part.text}</strong> : <span key={index}>{part.text}</span>,
+  )
+
+  return (
+    <div className="markdownish-content">
+      {blocks.map((block, index) => {
+        if (block.kind === 'heading') {
+          const HeadingTag = `h${block.level ?? 3}` as keyof JSX.IntrinsicElements
+          return <HeadingTag key={index}>{renderInline(block.text)}</HeadingTag>
+        }
+        if (block.kind === 'list') {
+          return <ul key={index}>{block.items?.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{renderInline(item)}</li>)}</ul>
+        }
+        if (block.kind === 'ordered-list') {
+          return <ol key={index}>{block.items?.map((item, itemIndex) => <li key={`${item}-${itemIndex}`}>{renderInline(item)}</li>)}</ol>
+        }
+        if (block.kind === 'table') {
+          const [header = [], ...rows] = block.rows ?? []
+          return (
+            <div key={index} className="markdown-table-wrap">
+              <table className="markdown-table">
+                <thead>
+                  <tr>{header.map((cell, cellIndex) => <th key={`${cell}-${cellIndex}`}>{renderInline(cell)}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {rows.map((row, rowIndex) => (
+                    <tr key={rowIndex}>
+                      {row.map((cell, cellIndex) => <td key={`${cell}-${cellIndex}`}>{renderInline(cell)}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+        if (block.kind === 'mermaid') {
+          return <pre key={index} className="mermaid-block">{block.text}</pre>
+        }
+        if (block.kind === 'code') {
+          return <pre key={index} className="code-block">{block.text}</pre>
+        }
+        return <p key={index}>{renderInline(block.text)}</p>
+      })}
+    </div>
+  )
 }
 
 function renderExportSnapshotImage(pageNumber: number, snapshotImages: Map<number, string>) {
@@ -932,12 +1867,88 @@ function renderExportSnapshotImage(pageNumber: number, snapshotImages: Map<numbe
   `
 }
 
+const exportReaderStyles = `
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f6f7f9; }
+    body { margin: 0; }
+    main { max-width: 980px; margin: 0 auto; padding: 32px 24px 72px; background: #fff; min-height: 100vh; }
+    header.book-header { border-bottom: 2px solid #172033; padding-bottom: 20px; margin-bottom: 24px; }
+    h1 { margin: 0 0 8px; font-size: 2rem; line-height: 1.15; }
+    .meta { color: #667085; margin: 0; }
+    .tabs { position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; overflow-x: auto; border-bottom: 1px solid #d8dee6; padding: 12px 0; background: #fff; }
+    .tab-button { flex: 0 0 auto; border: 1px solid #d8dee6; border-radius: 8px; padding: 10px 14px; background: #f8fafc; color: #344054; cursor: pointer; font: inherit; font-weight: 750; }
+    .tab-button.active { border-color: #16816f; background: #eef6f4; color: #145d52; }
+    .tab-panel { display: block; padding-top: 24px; }
+    .tab-panel + .tab-panel { border-top: 2px solid #d8dee6; margin-top: 36px; }
+    .js-tabs .tab-panel { display: none; }
+    .js-tabs .tab-panel.active { display: block; border-top: 0; margin-top: 0; }
+    .book-page { border-top: 1px solid #d8dee6; padding-top: 28px; margin-top: 32px; }
+    .book-page:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+    .all-version-block { margin-top: 22px; }
+    .translation-variant-block { border-top: 1px solid #eef2f6; margin-top: 14px; padding-top: 14px; }
+    .translation-variant-block:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+    h2 { margin: 0 0 16px; font-size: 1.45rem; }
+    h3 { margin: 22px 0 10px; font-size: 1.05rem; color: #145d52; }
+    h4 { margin: 16px 0 8px; font-size: 0.9rem; color: #475467; }
+    p, li, dd { font-size: 0.98rem; line-height: 1.65; }
+    ol { padding-left: 1.35rem; }
+    ul { padding-left: 1.35rem; }
+    table { width: 100%; border-collapse: collapse; margin: 0 0 18px; font-size: 0.9rem; line-height: 1.45; }
+    th, td { border: 1px solid #d8dee6; padding: 8px 10px; text-align: left; vertical-align: top; }
+    th { background: #f8fafc; color: #111827; font-weight: 800; }
+    pre { overflow-x: auto; border: 1px solid #d8dee6; border-radius: 8px; padding: 14px; background: #f8fafc; color: #172033; font-size: 0.85rem; line-height: 1.45; }
+    pre.mermaid::before { content: "Mermaid diagram"; display: block; margin-bottom: 8px; color: #145d52; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; }
+    .missing { color: #98a2b3; font-style: italic; }
+    .model-meta { display: inline-flex; margin: 0 0 12px; border: 1px solid #d8dee6; border-radius: 999px; padding: 4px 10px; background: #f8fafc; color: #475467; font-size: 0.82rem; line-height: 1.35; }
+    .vocabulary { border-left: 3px solid #16816f; margin-top: 12px; padding-left: 12px; }
+    dl { margin: 0; }
+    dt { font-weight: 750; }
+    dt span { color: #145d52; margin-left: 8px; }
+    dd { margin: 2px 0 10px; color: #475467; }
+    .vocabulary-meta { color: #667085; font-size: 0.82rem; }
+    .vocabulary-meta strong { color: #475467; }
+    @media print {
+      body { background: #fff; }
+      main { max-width: none; padding: 0; }
+      .tabs { display: none; }
+      .tab-panel,
+      .js-tabs .tab-panel { display: block; }
+      .book-page { break-before: page; }
+    }
+`
+
+function renderExportTabScript(initialTab: string) {
+  return `
+  <script>
+    (() => {
+      document.documentElement.classList.add('js-tabs')
+      let activeTab = ${JSON.stringify(initialTab)}
+      const update = () => {
+        document.querySelectorAll('.tab-button').forEach((button) => {
+          button.classList.toggle('active', button.dataset.tabTarget === activeTab)
+        })
+        document.querySelectorAll('.tab-panel').forEach((panel) => {
+          panel.classList.toggle('active', panel.dataset.tab === activeTab)
+        })
+      }
+      document.querySelectorAll('.tab-button').forEach((button) => {
+        button.addEventListener('click', () => {
+          activeTab = button.dataset.tabTarget || activeTab
+          update()
+          window.scrollTo({ top: 0, behavior: 'smooth' })
+        })
+      })
+      update()
+    })()
+  </script>`
+}
+
 function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Map<number, string>()) {
   const versionTabs: { id: string, label: string, complexity?: TranslationComplexity }[] = [
     { id: 'german', label: 'German' },
     { id: 'faithful', label: 'Good Faith English', complexity: 'original' },
     { id: 'simplified', label: 'Simplified English', complexity: 'simplified' },
     { id: 'kid', label: 'Kid-Friendly English', complexity: 'kid-friendly' },
+    { id: 'guide', label: 'Concept Guide', complexity: 'concept-guide' },
     { id: 'school', label: 'School-Friendly English', complexity: 'high-school' },
     { id: 'college', label: 'College English', complexity: 'college' },
   ]
@@ -946,8 +1957,15 @@ function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Ma
     new Set(book.translations.map((translation) => translation.pageNumber)),
   ).sort((left, right) => left - right)
   const exportedAt = new Date().toLocaleString()
+  const renderTranslationVariantBlock = (translation: OldBookRecord['translations'][number] | undefined) => `
+    <section class="translation-variant-block">
+      ${renderExportModelMeta(translation)}
+      ${renderExportContent(translation)}
+      ${renderExportVocabulary(translation?.glossary)}
+    </section>
+  `
   const renderGermanPage = (pageNumber: number) => {
-    const original = getPageTranslation(book, pageNumber, 'original', 'en')
+    const originals = getPageTranslations(book, pageNumber, 'original', 'en')
     return `
       <article class="book-page" id="german-page-${pageNumber}">
         <h2>Page ${pageNumber}</h2>
@@ -958,21 +1976,35 @@ function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Ma
           </section>
           <section>
             <h3>German Extraction</h3>
-            ${renderExportSourceLines(original?.sourceLines)}
+            ${originals.length
+              ? originals.map((original) => `
+                <section class="translation-variant-block">
+                  ${renderExportModelMeta(original)}
+                  ${renderExportSourceLines(original.sourceLines)}
+                </section>
+              `).join('\n')
+              : renderExportSourceLines(undefined)}
+          </section>
+          <section>
+            <h3>Good Faith English</h3>
+            ${originals.length
+              ? originals.map((original) => renderTranslationVariantBlock(original)).join('\n')
+              : renderExportContent(undefined)}
           </section>
         </div>
-        ${renderExportVocabulary(original?.glossary)}
+        ${originals.map((original) => renderExportVocabulary(original.glossary)).join('\n')}
       </article>
     `
   }
   const renderVersionPage = (pageNumber: number, tab: typeof versionTabs[number]) => {
-    const translation = tab.complexity ? getPageTranslation(book, pageNumber, tab.complexity, 'en') : undefined
+    const translations = tab.complexity ? getPageTranslations(book, pageNumber, tab.complexity, 'en') : []
     return `
       <article class="book-page" id="${tab.id}-page-${pageNumber}">
         <h2>Page ${pageNumber}</h2>
         <h3>${escapeHtml(tab.label)}</h3>
-        ${renderExportParagraphs(translation?.paragraphs)}
-        ${renderExportVocabulary(translation?.glossary)}
+        ${translations.length
+          ? translations.map(renderTranslationVariantBlock).join('\n')
+          : renderExportContent(undefined)}
       </article>
     `
   }
@@ -986,13 +2018,28 @@ function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Ma
         </section>
         <section>
           <h3>German Extraction</h3>
-          ${renderExportSourceLines(getPageTranslation(book, pageNumber, 'original', 'en')?.sourceLines)}
+          ${getPageTranslations(book, pageNumber, 'original', 'en').length
+            ? getPageTranslations(book, pageNumber, 'original', 'en').map((original) => `
+              <section class="translation-variant-block">
+                ${renderExportModelMeta(original)}
+                ${renderExportSourceLines(original.sourceLines)}
+              </section>
+            `).join('\n')
+            : renderExportSourceLines(undefined)}
+        </section>
+        <section>
+          <h3>Good Faith English</h3>
+          ${getPageTranslations(book, pageNumber, 'original', 'en').length
+            ? getPageTranslations(book, pageNumber, 'original', 'en').map(renderTranslationVariantBlock).join('\n')
+            : renderExportContent(undefined)}
         </section>
       </div>
       ${versionTabs.filter((tab) => tab.id !== 'german').map((tab) => `
         <section class="all-version-block">
           <h3>${escapeHtml(tab.label)}</h3>
-          ${renderExportParagraphs(tab.complexity ? getPageTranslation(book, pageNumber, tab.complexity, 'en')?.paragraphs : undefined)}
+          ${tab.complexity && getPageTranslations(book, pageNumber, tab.complexity, 'en').length
+            ? getPageTranslations(book, pageNumber, tab.complexity, 'en').map(renderTranslationVariantBlock).join('\n')
+            : renderExportContent(undefined)}
         </section>
       `).join('\n')}
     </article>
@@ -1005,45 +2052,15 @@ function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Ma
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(book.title)} - BookForge Export</title>
   <style>
-    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f6f7f9; }
-    body { margin: 0; }
-    main { max-width: 980px; margin: 0 auto; padding: 32px 24px 72px; background: #fff; min-height: 100vh; }
-    header.book-header { border-bottom: 2px solid #172033; padding-bottom: 20px; margin-bottom: 24px; }
-    h1 { margin: 0 0 8px; font-size: 2rem; line-height: 1.15; }
-    .meta { color: #667085; margin: 0; }
-    .tabs { position: sticky; top: 0; z-index: 2; display: flex; gap: 8px; overflow-x: auto; border-bottom: 1px solid #d8dee6; padding: 12px 0; background: #fff; }
-    .tab-button { flex: 0 0 auto; border: 1px solid #d8dee6; border-radius: 8px; padding: 10px 14px; background: #f8fafc; color: #344054; cursor: pointer; font: inherit; font-weight: 750; }
-    .tab-button.active { border-color: #16816f; background: #eef6f4; color: #145d52; }
-    .tab-panel { display: none; padding-top: 24px; }
-    .tab-panel.active { display: block; }
-    .book-page { border-top: 1px solid #d8dee6; padding-top: 28px; margin-top: 32px; }
-    .book-page:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
-    .all-version-block { margin-top: 22px; }
-    .german-spotcheck-grid { display: grid; grid-template-columns: minmax(280px, 0.95fr) minmax(280px, 1.05fr); gap: 24px; align-items: start; }
-    h2 { margin: 0 0 16px; font-size: 1.45rem; }
-    h3 { margin: 22px 0 10px; font-size: 1.05rem; color: #145d52; }
-    h4 { margin: 16px 0 8px; font-size: 0.9rem; color: #475467; }
-    p, li, dd { font-size: 0.98rem; line-height: 1.65; }
-    ol { padding-left: 1.35rem; }
-    .missing { color: #98a2b3; font-style: italic; }
+${exportReaderStyles}
+    .german-spotcheck-grid { display: grid; grid-template-columns: minmax(240px, 0.85fr) minmax(260px, 1fr) minmax(280px, 1fr); gap: 24px; align-items: start; }
     .page-image { margin: 0 0 22px; border: 1px solid #d8dee6; border-radius: 8px; overflow: hidden; background: #f8fafc; }
     .page-image img { display: block; width: 100%; max-height: 82vh; object-fit: contain; background: #26323d; }
     .page-image figcaption { padding: 8px 10px; color: #667085; font-size: 0.82rem; }
-    .vocabulary { border-left: 3px solid #16816f; margin-top: 12px; padding-left: 12px; }
-    dl { margin: 0; }
-    dt { font-weight: 750; }
-    dt span { color: #145d52; margin-left: 8px; }
-    dd { margin: 2px 0 10px; color: #475467; }
     @media print {
-      body { background: #fff; }
-      main { max-width: none; padding: 0; }
-      .tabs { display: none; }
-      .tab-panel { display: none; }
-      .tab-panel.active { display: block; }
       .german-spotcheck-grid { grid-template-columns: 1fr 1fr; gap: 18px; }
-      .book-page { break-before: page; }
     }
-    @media (max-width: 820px) { .german-spotcheck-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 1020px) { .german-spotcheck-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -1067,27 +2084,87 @@ function buildEnglishBookExportHtml(book: OldBookRecord, snapshotImages = new Ma
       </section>
     `).join('\n')}
   </main>
-  <script>
-    (() => {
-      let activeTab = 'all'
-      const update = () => {
-        document.querySelectorAll('.tab-button').forEach((button) => {
-          button.classList.toggle('active', button.dataset.tabTarget === activeTab)
-        })
-        document.querySelectorAll('.tab-panel').forEach((panel) => {
-          panel.classList.toggle('active', panel.dataset.tab === activeTab)
-        })
-      }
-      document.querySelectorAll('.tab-button').forEach((button) => {
-        button.addEventListener('click', () => {
-          activeTab = button.dataset.tabTarget || activeTab
-          update()
-          window.scrollTo({ top: 0, behavior: 'smooth' })
-        })
-      })
-      update()
-    })()
-  </script>
+${renderExportTabScript('all')}
+</body>
+</html>`
+}
+
+function buildLanguageBookExportHtml(
+  book: OldBookRecord,
+  targetLanguage: TranslationLanguage,
+  targetLanguageLabel: string,
+) {
+  const targetComplexities = complexityOptions
+    .filter((option) => option.value !== 'original')
+    .map((option) => ({ id: option.value, label: option.label, complexity: option.value }))
+  const pageNumbers = Array.from(
+    new Set(book.translations
+      .filter((translation) => translation.language === targetLanguage || (translation.complexity === 'original' && translation.language === 'en'))
+      .map((translation) => translation.pageNumber)),
+  ).sort((left, right) => left - right)
+  const exportedAt = new Date().toLocaleString()
+  const renderTranslationVariantBlock = (translation: OldBookRecord['translations'][number] | undefined) => `
+    <section class="translation-variant-block">
+      ${renderExportModelMeta(translation)}
+      ${renderExportContent(translation)}
+      ${renderExportVocabulary(translation?.glossary)}
+    </section>
+  `
+  const renderFaithfulPage = (pageNumber: number) => {
+    const originals = getPageTranslations(book, pageNumber, 'original', 'en')
+    return `
+      <article class="book-page" id="faithful-page-${pageNumber}">
+        <h2>Page ${pageNumber}</h2>
+        ${originals.length
+          ? originals.map(renderTranslationVariantBlock).join('\n')
+          : renderExportContent(undefined)}
+      </article>
+    `
+  }
+  const renderTargetPage = (pageNumber: number) => `
+    <article class="book-page" id="target-page-${pageNumber}">
+      <h2>Page ${pageNumber}</h2>
+      ${targetComplexities.map((tab) => {
+        const translations = getPageTranslations(book, pageNumber, tab.complexity, targetLanguage)
+        if (!translations.length) return ''
+        return `
+          <section class="all-version-block">
+            <h3>${escapeHtml(tab.label)}</h3>
+            ${translations.map(renderTranslationVariantBlock).join('\n')}
+          </section>
+        `
+      }).join('\n') || '<p class="missing">No target-language translation stored for this page yet.</p>'}
+    </article>
+  `
+
+  return `<!doctype html>
+<html lang="${escapeHtml(targetLanguage)}">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(book.title)} - ${escapeHtml(targetLanguageLabel)} BookForge Export</title>
+  <style>
+${exportReaderStyles}
+  </style>
+</head>
+<body>
+  <main>
+    <header class="book-header">
+      <h1>${escapeHtml(book.title)}</h1>
+      <p class="meta">${escapeHtml(book.author || 'Unknown author')} · ${escapeHtml(book.dateLabel || 'Unknown date')} · ${escapeHtml(targetLanguageLabel)} export · Exported ${escapeHtml(exportedAt)}</p>
+    </header>
+    <nav class="tabs" aria-label="Book versions">
+      <button class="tab-button active" data-tab-target="faithful" type="button">Good Faith English</button>
+      <button class="tab-button" data-tab-target="target" type="button">${escapeHtml(targetLanguageLabel)}</button>
+    </nav>
+    <section class="tab-panel active" data-tab="faithful">
+      ${pageNumbers.length ? pageNumbers.map(renderFaithfulPage).join('\n') : '<p class="missing">No Good Faith English pages stored yet.</p>'}
+    </section>
+    <section class="tab-panel" data-tab="target">
+      ${pageNumbers.length ? pageNumbers.map(renderTargetPage).join('\n') : '<p class="missing">No translated pages stored yet.</p>'}
+    </section>
+  </main>
+${renderExportTabScript('faithful')}
 </body>
 </html>`
 }
@@ -1124,6 +2201,10 @@ function TranslationWorkspace() {
   const [snapshotViewMode, setSnapshotViewMode] = useState<'all' | 'page'>('all')
   const [memoryOpen, setMemoryOpen] = useState(false)
   const [sourceInspectorOpen, setSourceInspectorOpen] = useState(false)
+  const [sourceInspectorTab, setSourceInspectorTab] = useState<'source' | 'faithful'>('source')
+  const [liveExportOpen, setLiveExportOpen] = useState(false)
+  const [liveExportHtml, setLiveExportHtml] = useState('')
+  const [liveExportTitle, setLiveExportTitle] = useState('')
   const [forceRetranslate, setForceRetranslate] = useState(false)
   const [translationPageSelection, setTranslationPageSelection] = useState('all')
   const [activeTranslationJob, setActiveTranslationJob] = useState<TranslationJobState | null>(null)
@@ -1144,15 +2225,36 @@ function TranslationWorkspace() {
     : sourceExtractionModel
       ? [{ id: sourceExtractionModel }, ...availableVisionModels]
       : availableVisionModels
-  const activeTranslation = activeBook ? getStoredTranslation(activeBook, complexity, translationLanguage, activeSection) : undefined
-  const canonicalOriginalTranslation = getCanonicalOriginalTranslation(activeBook)
-  const previousOriginalTranslation = getPreviousOriginalTranslation(activeBook)
+  const activeOutputModel = complexity === 'original' ? sourceExtractionModel : visionModel
+  const activeSourceModel = sourceExtractionModel
+  const activeTranslation = activeBook
+    ? getStoredTranslation(
+      activeBook,
+      complexity,
+      translationLanguage,
+      activeSection,
+      activeOutputModel,
+      complexity === 'original' ? activeOutputModel : activeSourceModel,
+    )
+    : undefined
+  const activeTranslationVariants = activeBook
+    ? getPageTranslations(activeBook, activeBook.pageNumber, complexity, translationLanguage)
+    : []
+  const canonicalOriginalTranslation = getCanonicalOriginalTranslation(activeBook, activeBook?.pageNumber, activeSourceModel)
+  const previousOriginalTranslation = getPreviousOriginalTranslation(activeBook, activeSourceModel)
+  const nextOriginalTranslation = getNextOriginalTranslation(activeBook, activeSourceModel)
   const activePageSnapshot = activeBook?.pageSnapshots.find((snapshot) => snapshot.pageNumber === activeBook.pageNumber)
   const hasImportedPdf = Boolean(activeBook?.pdfBlobId)
   const activePageNumber = activeBook?.pageNumber ?? 1
   const activePageLimit = activeBook?.pages && activeBook.pages > 0 ? activeBook.pages : undefined
   const activePageCount = activePageLimit ?? Math.max(activePageSnapshot?.pageNumber ?? 0, activePageNumber, 1)
-  const translatedPageCount = getTranslatedPageCount(activeBook, complexity, translationLanguage)
+  const translatedPageCount = getTranslatedPageCount(
+    activeBook,
+    complexity,
+    translationLanguage,
+    activeOutputModel,
+    complexity === 'original' ? activeOutputModel : activeSourceModel,
+  )
   const translatedParagraphs = activeTranslation
     ? activeTranslation.paragraphs
     : hasImportedPdf
@@ -1188,6 +2290,10 @@ function TranslationWorkspace() {
         ? []
         : sourcePageLines
   const previousSourceLines = previousOriginalTranslation?.sourceLines ?? []
+  const nextSourceLines = nextOriginalTranslation?.sourceLines ?? []
+  const previousGoodFaithParagraphs = previousOriginalTranslation?.paragraphs ?? []
+  const goodFaithParagraphs = canonicalOriginalTranslation?.paragraphs ?? []
+  const nextGoodFaithParagraphs = nextOriginalTranslation?.paragraphs ?? []
   const sortedSnapshots = useMemo(
     () => [...(activeBook?.pageSnapshots ?? [])].sort((left, right) => left.pageNumber - right.pageNumber),
     [activeBook?.pageSnapshots],
@@ -1809,8 +2915,8 @@ function TranslationWorkspace() {
       languageLabel: 'English',
       complexity: 'original',
       language: 'en',
-      previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation)?.paragraphs,
-      previousSourceLines: getPreviousOriginalTranslation(bookForTranslation)?.sourceLines,
+      previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)?.paragraphs,
+      previousSourceLines: getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)?.sourceLines,
       priorGlossary: getPriorGlossary(bookForTranslation),
       signal,
     })
@@ -1825,6 +2931,8 @@ function TranslationWorkspace() {
         sourceLines: result.sourceLines,
         glossary: result.glossary,
         notes: result.notes,
+        model: sourceExtractionModel,
+        sourceModel: sourceExtractionModel,
       },
     )
   }
@@ -1858,6 +2966,7 @@ function TranslationWorkspace() {
     result: VisionTranslationResult,
     outputComplexity = complexity,
     outputLanguage = translationLanguage,
+    outputSourceModel = sourceExtractionModel,
   ) {
     return createTranslationRecord(
       bookForTranslation,
@@ -1869,6 +2978,8 @@ function TranslationWorkspace() {
         sourceLines: result.sourceLines,
         glossary: result.glossary,
         notes: result.notes,
+        model: visionModel,
+        sourceModel: outputSourceModel,
       },
     )
   }
@@ -1898,7 +3009,7 @@ function TranslationWorkspace() {
         translationsForSave = updatedBook.translations
         translationMemoryForSave = updatedBook.translationMemory
 
-        let originalTranslation = getCanonicalOriginalTranslation(updatedBook)
+        let originalTranslation = getCanonicalOriginalTranslation(updatedBook, updatedBook.pageNumber, sourceExtractionModel)
         if (!originalTranslation) {
           setOldBookStatus(`Transcribing source text and creating Original English for page ${updatedBook.pageNumber}...`)
           originalTranslation = await createOriginalTranslationFromSnapshot(
@@ -1938,17 +3049,29 @@ function TranslationWorkspace() {
             originalParagraphs: originalTranslation.paragraphs,
             sourceLines: originalTranslation.sourceLines,
             glossary: [...getApprovedTranslationMemory(bookForTranslation), ...(originalTranslation.glossary ?? []), ...getPriorGlossary(bookForTranslation)],
-            previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation)?.paragraphs,
-            previousTranslatedParagraphs: getPreviousPageTranslation(bookForTranslation, complexity, translationLanguage)?.paragraphs,
+            previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)?.paragraphs,
+            previousSourceLines: getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)?.sourceLines,
+            nextOriginalParagraphs: getNextOriginalTranslation(bookForTranslation, sourceExtractionModel)?.paragraphs,
+            nextSourceLines: getNextOriginalTranslation(bookForTranslation, sourceExtractionModel)?.sourceLines,
+            previousTranslatedParagraphs: getPreviousPageTranslation(bookForTranslation, complexity, translationLanguage, visionModel, sourceExtractionModel)?.paragraphs,
             signal: abortController.signal,
           })
-          translation = createPageTranslationFromResult(bookForTranslation, rewrittenTranslation)
+          translation = createPageTranslationFromResult(
+            bookForTranslation,
+            rewrittenTranslation,
+            complexity,
+            translationLanguage,
+            normalizedModelKey(originalTranslation.model) || sourceExtractionModel,
+          )
           translationsForSave = replaceTranslationRecord(translationsForSave, translation)
         }
       }
 
       if (!translation) {
-        translation = createTranslationRecord(bookForTranslation, complexity, translationLanguage, activeSection)
+        translation = createTranslationRecord(bookForTranslation, complexity, translationLanguage, activeSection, {
+          model: activeOutputModel,
+          sourceModel: complexity === 'original' ? activeOutputModel : activeSourceModel,
+        })
         translationsForSave = replaceTranslationRecord(translationsForSave, translation)
       } else if (complexity === 'original') {
         translationsForSave = replaceTranslationRecord(translationsForSave, translation)
@@ -1958,6 +3081,8 @@ function TranslationWorkspace() {
         { ...bookForTranslation, translations: translationsForSave },
         complexity,
         translationLanguage,
+        activeOutputModel,
+        complexity === 'original' ? activeOutputModel : activeSourceModel,
       )
       const updatedBook = await persistOldBook({
         ...bookForTranslation,
@@ -2073,15 +3198,27 @@ function TranslationWorkspace() {
         let pageBook: OldBookRecord = {
           ...workingBook,
           pageNumber,
-          section: getStoredTranslation({ ...workingBook, pageNumber }, complexity, translationLanguage, `Page ${pageNumber}`)
+          section: getStoredTranslation(
+            { ...workingBook, pageNumber },
+            complexity,
+            translationLanguage,
+            `Page ${pageNumber}`,
+            activeOutputModel,
+            complexity === 'original' ? activeOutputModel : activeSourceModel,
+          )
             ?.sectionTitle ?? `Page ${pageNumber}, OCR pending`,
         }
 
-        const originalExists = Boolean(getCanonicalOriginalTranslation(pageBook, pageNumber))
+        const originalExists = Boolean(getCanonicalOriginalTranslation(pageBook, pageNumber, sourceExtractionModel))
         const targetExists = Boolean(pageBook.translations.find((entry) =>
           entry.pageNumber === pageNumber
           && entry.complexity === complexity
           && entry.language === translationLanguage
+          && translationMatchesVariant(
+            entry,
+            activeOutputModel,
+            complexity === 'original' ? activeOutputModel : activeSourceModel,
+          )
         ))
 
         if (!forceRetranslate && originalExists && targetExists) {
@@ -2119,7 +3256,7 @@ function TranslationWorkspace() {
 
         let translationsForSave = pageBook.translations
         let memoryForSave = pageBook.translationMemory
-        let originalTranslation = getCanonicalOriginalTranslation(pageBook, pageNumber)
+        let originalTranslation = getCanonicalOriginalTranslation(pageBook, pageNumber, sourceExtractionModel)
 
         if (!originalTranslation || (forceRetranslate && complexity === 'original')) {
           ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
@@ -2185,11 +3322,20 @@ function TranslationWorkspace() {
             originalParagraphs: originalTranslation.paragraphs,
             sourceLines: originalTranslation.sourceLines,
             glossary: [...getApprovedTranslationMemory(pageBook), ...(originalTranslation.glossary ?? []), ...getPriorGlossary(pageBook)],
-            previousOriginalParagraphs: getPreviousOriginalTranslation(pageBook)?.paragraphs,
-            previousTranslatedParagraphs: getPreviousPageTranslation(pageBook, complexity, translationLanguage)?.paragraphs,
+            previousOriginalParagraphs: getPreviousOriginalTranslation(pageBook, sourceExtractionModel)?.paragraphs,
+            previousSourceLines: getPreviousOriginalTranslation(pageBook, sourceExtractionModel)?.sourceLines,
+            nextOriginalParagraphs: getNextOriginalTranslation(pageBook, sourceExtractionModel)?.paragraphs,
+            nextSourceLines: getNextOriginalTranslation(pageBook, sourceExtractionModel)?.sourceLines,
+            previousTranslatedParagraphs: getPreviousPageTranslation(pageBook, complexity, translationLanguage, visionModel, sourceExtractionModel)?.paragraphs,
             signal: abortController.signal,
           })
-          const rewrittenRecord = createPageTranslationFromResult(pageBook, rewrittenTranslation)
+          const rewrittenRecord = createPageTranslationFromResult(
+            pageBook,
+            rewrittenTranslation,
+            complexity,
+            translationLanguage,
+            normalizedModelKey(originalTranslation.model) || sourceExtractionModel,
+          )
           translationsForSave = replaceTranslationRecord(translationsForSave, rewrittenRecord)
           pageBook = {
             ...pageBook,
@@ -2202,6 +3348,8 @@ function TranslationWorkspace() {
           { ...pageBook, translations: translationsForSave },
           complexity,
           translationLanguage,
+          activeOutputModel,
+          complexity === 'original' ? activeOutputModel : activeSourceModel,
         )
         ;({ updatedBook: workingBook, updatedJob } = await persistTranslationJob(workingBook, {
           ...job,
@@ -2420,12 +3568,54 @@ function TranslationWorkspace() {
     return snapshotImages
   }
 
+  async function buildActiveBookExportHtml() {
+    if (!activeBook) return null
+    const shouldExportTargetLanguage = translationLanguage !== 'en'
+    const exportLanguageLabel = languageOptions.find((entry) => entry.value === translationLanguage)?.label ?? selectedLanguage
+    const snapshotImages = shouldExportTargetLanguage ? new Map<number, string>() : await buildExportSnapshotImages(activeBook)
+    const html = shouldExportTargetLanguage
+      ? buildLanguageBookExportHtml(activeBook, translationLanguage, exportLanguageLabel)
+      : buildEnglishBookExportHtml(activeBook, snapshotImages)
+    const fileName = shouldExportTargetLanguage
+      ? `${slugifyFileName(activeBook.title)}-${slugifyFileName(exportLanguageLabel)}-book.html`
+      : `${slugifyFileName(activeBook.title)}-english-book.html`
+    const title = shouldExportTargetLanguage
+      ? `${activeBook.title} - ${exportLanguageLabel} export`
+      : `${activeBook.title} - English export`
+
+    return { html, fileName, title }
+  }
+
+  async function exportActiveBookAsPortablePackage(scope: PortablePackageExportScope) {
+    if (!activeBook) return
+    const scopeLabel = scope.kind === 'all'
+      ? 'all languages'
+      : languageOptions.find((entry) => entry.value === scope.language)?.label ?? scope.language
+    setOldBookStatus(`Preparing ${scopeLabel} portable book package...`)
+    const snapshotImages = await buildExportSnapshotImages(activeBook)
+    const packagePayload = buildPortableBookPackage(activeBook, scope, snapshotImages)
+    const fileName = `${slugifyFileName(activeBook.title)}-${scope.kind === 'all' ? 'all-languages' : slugifyFileName(scopeLabel)}.bookpkg`
+    let sourcePdfBlob: Blob | null = null
+
+    if (activeBook.pdfBlobId) {
+      try {
+        sourcePdfBlob = await getOldBookPdfBlob(activeBook.pdfBlobId)
+      } catch {
+        // The package is still useful without the original PDF.
+      }
+    }
+
+    const files = await buildPortablePackageFiles(packagePayload, sourcePdfBlob)
+    downloadBlobFile(fileName, createZipBlob(files))
+    setOldBookStatus(`${scopeLabel} portable book package exported: ${fileName}`)
+  }
+
   async function exportActiveBookAsHtml() {
     if (!activeBook) return
     setOldBookStatus('Preparing HTML export...')
-    const snapshotImages = await buildExportSnapshotImages(activeBook)
-    const html = buildEnglishBookExportHtml(activeBook, snapshotImages)
-    const fileName = `${slugifyFileName(activeBook.title)}-english-book.html`
+    const exportPayload = await buildActiveBookExportHtml()
+    if (!exportPayload) return
+    const { html, fileName } = exportPayload
 
     invoke('export_old_book_html', {
       bookId: activeBook.id,
@@ -2442,14 +3632,110 @@ function TranslationWorkspace() {
           return
         }
 
-        const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
-        const link = document.createElement('a')
-        link.href = URL.createObjectURL(blob)
-        link.download = fileName
-        link.click()
-        URL.revokeObjectURL(link.href)
+        downloadTextFile(fileName, html, 'text/html;charset=utf-8')
         setOldBookStatus('Exported through the browser download folder.')
       })
+  }
+
+  async function renderActiveBookExport() {
+    if (!activeBook) return
+    setOldBookStatus('Rendering live export...')
+    const exportPayload = await buildActiveBookExportHtml()
+    if (!exportPayload) return
+    setLiveExportHtml(exportPayload.html)
+    setLiveExportTitle(exportPayload.title)
+    setLiveExportOpen(true)
+    setOldBookStatus('Live export render ready.')
+  }
+
+  async function exposeActiveBookExportUrl() {
+    if (!activeBook) return
+    setOldBookStatus('Preparing browser export URL...')
+    const exportPayload = await buildActiveBookExportHtml()
+    if (!exportPayload) return
+    const { html, fileName } = exportPayload
+
+    try {
+      await invoke('export_old_book_html', {
+        bookId: activeBook.id,
+        fileName,
+        html,
+        reveal: false,
+      })
+      const urlInfo = await invoke('old_book_export_http_url', {
+        bookId: activeBook.id,
+        fileName,
+      }) as { localUrl: string, networkUrl?: string | null, port: number }
+      const preferredUrl = urlInfo.networkUrl || urlInfo.localUrl
+      try {
+        await navigator.clipboard?.writeText(preferredUrl)
+      } catch {
+        // Clipboard can be unavailable depending on host permissions.
+      }
+      setOldBookStatus(
+        `Browser URL copied: ${preferredUrl}${urlInfo.networkUrl ? ` · Mac-only URL: ${urlInfo.localUrl}` : ''}`,
+      )
+    } catch (error) {
+      if (isTauriUnavailable(error)) {
+        setOldBookStatus('Browser URL is available only in the Tauri app.')
+        return
+      }
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  async function browseActiveBookExports() {
+    if (!activeBook) return
+    try {
+      const exportDir = await invoke('browse_old_book_exports', {
+        bookId: activeBook.id,
+      }) as string
+      setOldBookStatus(`Opened export folder: ${exportDir}`)
+    } catch (error) {
+      if (isTauriUnavailable(error)) {
+        setOldBookStatus('Browse Files is available only in the Tauri app.')
+        return
+      }
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  async function exposeActiveBookExportApiUrl() {
+    if (!activeBook) return
+    setOldBookStatus('Preparing export API URL...')
+
+    try {
+      if (activeBook.translations.length) {
+        const exportPayload = await buildActiveBookExportHtml()
+        if (exportPayload) {
+          await invoke('export_old_book_html', {
+            bookId: activeBook.id,
+            fileName: exportPayload.fileName,
+            html: exportPayload.html,
+            reveal: false,
+          })
+        }
+      }
+
+      const urlInfo = await invoke('old_book_export_api_url', {
+        bookId: activeBook.id,
+      }) as { localUrl: string, networkUrl?: string | null, port: number }
+      const preferredUrl = urlInfo.networkUrl || urlInfo.localUrl
+      try {
+        await navigator.clipboard?.writeText(preferredUrl)
+      } catch {
+        // Clipboard can be unavailable depending on host permissions.
+      }
+      setOldBookStatus(
+        `Export API URL copied: ${preferredUrl}${urlInfo.networkUrl ? ` · Mac-only URL: ${urlInfo.localUrl}` : ''}`,
+      )
+    } catch (error) {
+      if (isTauriUnavailable(error)) {
+        setOldBookStatus('Export API is available only in the Tauri app.')
+        return
+      }
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
   }
 
   function selectOldBook(bookId: string) {
@@ -2650,6 +3936,54 @@ function TranslationWorkspace() {
             </button>
             <button
               className="button secondary"
+              onClick={() => void exportActiveBookAsPortablePackage({ kind: 'language', language: translationLanguage })}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              Language Package
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void exportActiveBookAsPortablePackage({ kind: 'all', defaultLanguage: translationLanguage })}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              All Languages
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void renderActiveBookExport()}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              Live Render
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void exposeActiveBookExportUrl()}
+              disabled={!activeBook?.translations.length}
+              type="button"
+            >
+              Browser URL
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void exposeActiveBookExportApiUrl()}
+              disabled={!activeBook}
+              type="button"
+            >
+              API URL
+            </button>
+            <button
+              className="button secondary"
+              onClick={() => void browseActiveBookExports()}
+              disabled={!activeBook}
+              type="button"
+            >
+              Browse Files
+            </button>
+            <button
+              className="button secondary"
               onClick={openAllSnapshots}
               disabled={!sortedSnapshots.length}
               type="button"
@@ -2778,13 +4112,41 @@ function TranslationWorkspace() {
             <div>
               <p className="app-overline">{selectedComplexity} {selectedLanguage}</p>
               <h2>{translationHeaderTitle}</h2>
-              <p>{activeTranslation ? 'Stored page translation' : 'Page translation pending'} · Page {activePageNumber}</p>
+              <p>
+                {activeTranslation ? 'Stored page translation' : 'Page translation pending'} · Page {activePageNumber}
+                {activeTranslation ? ` · Model ${getTranslationModelLabel(activeTranslation)}` : ''}
+              </p>
             </div>
             <div className="progress-summary">
               <span>{currentProgress}%</span>
               <div aria-hidden="true"><i style={{ width: `${currentProgress}%` }} /></div>
             </div>
           </header>
+
+          {activeTranslationVariants.length > 1 ? (
+            <div className="translation-variant-strip" aria-label="Stored translation variants">
+              {activeTranslationVariants.map((translation) => {
+                const isActive = activeTranslation?.id === translation.id
+                return (
+                  <button
+                    key={translation.id}
+                    className={isActive ? 'translation-variant-chip active' : 'translation-variant-chip'}
+                    onClick={() => {
+                      if (translation.complexity === 'original') {
+                        if (translation.model) setSourceExtractionModel(translation.model)
+                      } else {
+                        if (translation.sourceModel) setSourceExtractionModel(translation.sourceModel)
+                        if (translation.model) setVisionModel(translation.model)
+                      }
+                    }}
+                    type="button"
+                  >
+                    {translationVariantLabel(translation)}
+                  </button>
+                )
+              })}
+            </div>
+          ) : null}
 
           <div className="page-action-bar">
             <div className="page-action-status">
@@ -2807,7 +4169,7 @@ function TranslationWorkspace() {
               <button
                 className="button secondary"
                 onClick={() => setSourceInspectorOpen(true)}
-                disabled={!currentSourceLines.length && !previousSourceLines.length}
+                disabled={!currentSourceLines.length && !previousSourceLines.length && !nextSourceLines.length && !goodFaithParagraphs.length}
                 type="button"
               >
                 Source OCR
@@ -2897,9 +4259,13 @@ function TranslationWorkspace() {
           )}
 
           <div className="translated-reading-surface">
-            {translatedParagraphs.map((paragraph) => (
-              <p key={paragraph}>{paragraph}</p>
-            ))}
+            {activeTranslation?.complexity === 'concept-guide' ? (
+              <MarkdownishContent markdown={translatedParagraphs.join('\n\n')} />
+            ) : (
+              translatedParagraphs.map((paragraph) => (
+                <p key={paragraph}>{paragraph}</p>
+              ))
+            )}
 
             {activeTranslation?.glossary?.length ? (
               <section className="page-vocabulary-panel" aria-label="Page vocabulary">
@@ -2916,6 +4282,13 @@ function TranslationWorkspace() {
                           <span>{entry.translatedTerm}</span>
                         ) : null}
                       </dt>
+                      {entry.englishTerm || entry.targetTerm || entry.transliteration ? (
+                        <dd className="vocabulary-meta">
+                          {entry.englishTerm ? <span><strong>English:</strong> {entry.englishTerm}</span> : null}
+                          {entry.targetTerm ? <span><strong>Target:</strong> {entry.targetTerm}</span> : null}
+                          {entry.transliteration ? <span><strong>Transliteration:</strong> {entry.transliteration}</span> : null}
+                        </dd>
+                      ) : null}
                       {entry.explanation ? <dd>{entry.explanation}</dd> : null}
                     </div>
                   ))}
@@ -2937,54 +4310,204 @@ function TranslationWorkspace() {
         </article>
       </section>
 
+      {liveExportOpen ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel export-render-modal">
+            <header className="modal-header">
+              <div>
+                <h2>Live Export Render</h2>
+                <p>{liveExportTitle || 'Generated book preview'}</p>
+              </div>
+              <div className="modal-header-actions">
+                <button
+                  className="mini-button"
+                  onClick={() => void exportActiveBookAsHtml()}
+                  disabled={!activeBook?.translations.length}
+                  type="button"
+                >
+                  Export File
+                </button>
+                <button
+                  className="mini-button"
+                  onClick={() => void exposeActiveBookExportUrl()}
+                  disabled={!activeBook?.translations.length}
+                  type="button"
+                >
+                  Browser URL
+                </button>
+                <button
+                  className="mini-button"
+                  onClick={() => void exposeActiveBookExportApiUrl()}
+                  disabled={!activeBook}
+                  type="button"
+                >
+                  API URL
+                </button>
+                <button
+                  className="mini-button"
+                  onClick={() => void browseActiveBookExports()}
+                  disabled={!activeBook}
+                  type="button"
+                >
+                  Browse Files
+                </button>
+                <button className="icon-button" onClick={() => setLiveExportOpen(false)} type="button">x</button>
+              </div>
+            </header>
+            <iframe
+              className="export-render-frame"
+              srcDoc={liveExportHtml}
+              title={liveExportTitle || 'Live export preview'}
+              sandbox="allow-scripts"
+            />
+          </section>
+        </div>
+      ) : null}
+
       {sourceInspectorOpen ? (
         <div className="modal-backdrop">
           <section className="modal-panel source-modal">
             <header className="modal-header">
               <div>
                 <h2>Source Transcription</h2>
-                <p>{activeBook?.title ?? 'Imported book'} · Page {activePageNumber}</p>
+                <p>
+                  {activeBook?.title ?? 'Imported book'} · Page {activePageNumber}
+                  {canonicalOriginalTranslation ? ` · Model ${getTranslationModelLabel(canonicalOriginalTranslation)}` : ''}
+                </p>
               </div>
               <button className="icon-button" onClick={() => setSourceInspectorOpen(false)} type="button">x</button>
             </header>
 
-            <div className="source-inspector-grid">
-              <section className="source-lines-panel">
-                <header>
-                  <strong>Previous page context</strong>
-                  <span>Page {Math.max(1, activePageNumber - 1)}</span>
-                </header>
-                {previousSourceLines.length ? (
-                  <ol>
-                    {previousSourceLines.map((line, index) => (
-                      <li key={`${line}-${index}`}>{line}</li>
-                    ))}
-                  </ol>
-                ) : (
-                  <p className="muted">
-                    No previous-page source transcription is stored yet. Translate page {Math.max(1, activePageNumber - 1)} as Original first to create it.
-                  </p>
-                )}
-              </section>
-
-              <section className="source-lines-panel">
-                <header>
-                  <strong>Current page source</strong>
-                  <span>Page {activePageNumber}</span>
-                </header>
-                {currentSourceLines.length ? (
-                  <ol>
-                    {currentSourceLines.map((line, index) => (
-                      <li key={`${line}-${index}`}>{line}</li>
-                    ))}
-                  </ol>
-                ) : (
-                  <p className="muted">
-                    No source-language transcription is stored for this page yet. Translate this page as Original to generate it from the snapshot.
-                  </p>
-                )}
-              </section>
+            <div className="source-modal-tabs" role="tablist" aria-label="Source inspector views">
+              <button
+                className={sourceInspectorTab === 'source' ? 'active' : ''}
+                onClick={() => setSourceInspectorTab('source')}
+                type="button"
+              >
+                Source OCR
+              </button>
+              <button
+                className={sourceInspectorTab === 'faithful' ? 'active' : ''}
+                onClick={() => setSourceInspectorTab('faithful')}
+                type="button"
+              >
+                Good Faith English
+              </button>
             </div>
+
+            {sourceInspectorTab === 'source' ? (
+              <div className="source-inspector-grid three-column">
+                <section className="source-lines-panel">
+                  <header>
+                    <strong>Previous page</strong>
+                    <span>Page {Math.max(1, activePageNumber - 1)}</span>
+                  </header>
+                  {previousSourceLines.length ? (
+                    <ol>
+                      {previousSourceLines.map((line, index) => (
+                        <li key={`${line}-${index}`}>{line}</li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p className="muted">
+                      No previous-page source transcription is stored yet. Translate page {Math.max(1, activePageNumber - 1)} as Original first to create it.
+                    </p>
+                  )}
+                </section>
+
+                <section className="source-lines-panel">
+                  <header>
+                    <strong>Current page</strong>
+                    <span>Page {activePageNumber}</span>
+                  </header>
+                  {currentSourceLines.length ? (
+                    <ol>
+                      {currentSourceLines.map((line, index) => (
+                        <li key={`${line}-${index}`}>{line}</li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p className="muted">
+                      No source-language transcription is stored for this page yet. Translate this page as Original to generate it from the snapshot.
+                    </p>
+                  )}
+                </section>
+
+                <section className="source-lines-panel">
+                  <header>
+                    <strong>Next page</strong>
+                    <span>Page {Math.min(activePageCount, activePageNumber + 1)}</span>
+                  </header>
+                  {nextSourceLines.length ? (
+                    <ol>
+                      {nextSourceLines.map((line, index) => (
+                        <li key={`${line}-${index}`}>{line}</li>
+                      ))}
+                    </ol>
+                  ) : (
+                    <p className="muted">
+                      No next-page source transcription is stored yet. Translate page {Math.min(activePageCount, activePageNumber + 1)} as Original first to create it.
+                    </p>
+                  )}
+                </section>
+              </div>
+            ) : (
+              <div className="source-inspector-grid three-column">
+                <section className="source-lines-panel">
+                  <header>
+                    <strong>Previous page</strong>
+                    <span>Page {Math.max(1, activePageNumber - 1)}</span>
+                  </header>
+                  {previousGoodFaithParagraphs.length ? (
+                    <div className="source-prose">
+                      {previousGoodFaithParagraphs.map((paragraph, index) => (
+                        <p key={`${paragraph}-${index}`}>{paragraph}</p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      No previous-page Good Faith English is stored yet. Translate page {Math.max(1, activePageNumber - 1)} as Original first to create it.
+                    </p>
+                  )}
+                </section>
+
+                <section className="source-lines-panel">
+                  <header>
+                    <strong>Current page</strong>
+                    <span>Page {activePageNumber}</span>
+                  </header>
+                  {goodFaithParagraphs.length ? (
+                    <div className="source-prose">
+                      {goodFaithParagraphs.map((paragraph, index) => (
+                        <p key={`${paragraph}-${index}`}>{paragraph}</p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      No Good Faith English translation is stored for this page yet. Translate this page as Original to generate it.
+                    </p>
+                  )}
+                </section>
+
+                <section className="source-lines-panel">
+                  <header>
+                    <strong>Next page</strong>
+                    <span>Page {Math.min(activePageCount, activePageNumber + 1)}</span>
+                  </header>
+                  {nextGoodFaithParagraphs.length ? (
+                    <div className="source-prose">
+                      {nextGoodFaithParagraphs.map((paragraph, index) => (
+                        <p key={`${paragraph}-${index}`}>{paragraph}</p>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="muted">
+                      No next-page Good Faith English is stored yet. Translate page {Math.min(activePageCount, activePageNumber + 1)} as Original first to create it.
+                    </p>
+                  )}
+                </section>
+              </div>
+            )}
           </section>
         </div>
       ) : null}
@@ -3403,12 +4926,7 @@ function App() {
 
   function exportStructure() {
     const payload = JSON.stringify(book, null, 2)
-    const blob = new Blob([payload], { type: 'application/json' })
-    const link = document.createElement('a')
-    link.href = URL.createObjectURL(blob)
-    link.download = `${book.title || 'bookforge'}.json`
-    link.click()
-    URL.revokeObjectURL(link.href)
+    downloadTextFile(`${book.title || 'bookforge'}.json`, payload, 'application/json;charset=utf-8')
   }
 
   function openPreview(mode: PreviewMode = 'reader') {
