@@ -53,7 +53,7 @@ export interface AiNote {
 }
 
 export interface BookSource {
-  type: "bookforge" | "arxiv" | "open-web" | "pdf";
+  type: "bookforge" | "arxiv" | "open-web" | "pdf" | "archive-article";
   id?: string;
   url?: string;
   htmlUrl?: string;
@@ -64,6 +64,10 @@ export interface BookSource {
   authors?: string[];
   publishedAt?: string;
   journal?: string;
+  issueVolume?: string;
+  issueNumber?: string;
+  articleId?: string;
+  archiveProvider?: string;
   offlineStatus?: string[];
 }
 

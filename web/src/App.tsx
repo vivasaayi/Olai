@@ -70,7 +70,7 @@ type BookTab = {
   isCurrentDraft: boolean
 }
 
-type WorkspaceTab = 'books' | 'contents' | 'preview' | 'translation'
+type WorkspaceTab = 'books' | 'contents' | 'preview' | 'archive' | 'translation'
 type BookSettingsMode = 'create' | 'edit'
 type PreviewMode = 'reader' | 'outline' | 'json'
 type DeleteConfirmState = {
@@ -85,6 +85,42 @@ type SnapshotProgressState = {
   current: number
   total: number
   message: string
+}
+
+type JournalArchiveArticle = {
+  id: string
+  provider: 'royal-society' | 'open-web'
+  publisherName: string
+  journalName: string
+  issueTitle: string
+  issueUrl: string
+  articleId: string
+  title: string
+  authors: string[]
+  year?: string
+  month?: string
+  publishedAt?: string
+  volume?: string
+  issue?: string
+  pages?: string
+  sourceUrl: string
+  pdfUrl?: string
+  importedBookId?: string
+}
+
+type JournalArchiveIssue = {
+  id: string
+  provider: 'royal-society' | 'open-web'
+  publisherName: string
+  journalName: string
+  issueTitle: string
+  issueUrl: string
+  year?: string
+  month?: string
+  volume?: string
+  issue?: string
+  importedAt: string
+  articles: JournalArchiveArticle[]
 }
 
 type PortableBookPackage = {
@@ -238,7 +274,7 @@ type PortablePackageInspectorState = {
   error?: string
 }
 
-const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'download']
+const resourceTypes: ResourceType[] = ['link', 'image', 'video', 'prompt', 'download', 'pdf']
 const personas: NodePersona[] = ['default', 'kids', 'beginner', 'formal', 'college']
 const llmRouterEndpoint = '/api/llm-router/v1'
 const llmRouterModel = 'gpt-5.4-nano'
@@ -1079,6 +1115,177 @@ function escapeHtml(value: string) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
+}
+
+function decodeHtmlEntities(value: string) {
+  const textarea = typeof document !== 'undefined' ? document.createElement('textarea') : null
+  if (!textarea) {
+    return value
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&#x27;/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+  textarea.innerHTML = value
+  return textarea.value.replace(/\s+/g, ' ').trim()
+}
+
+function stripHtml(value: string) {
+  return decodeHtmlEntities(
+    value
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<[^>]+>/g, ' '),
+  )
+}
+
+function readHtmlTitle(html: string) {
+  const title = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+  return title ? stripHtml(title) : ''
+}
+
+function readHtmlMeta(html: string, key: string) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const pattern = new RegExp(`<meta\\s+[^>]*(?:name|property)=["']${escaped}["'][^>]*content=["']([^"']+)["'][^>]*>`, 'i')
+  const reversePattern = new RegExp(`<meta\\s+[^>]*content=["']([^"']+)["'][^>]*(?:name|property)=["']${escaped}["'][^>]*>`, 'i')
+  return decodeHtmlEntities(html.match(pattern)?.[1] ?? html.match(reversePattern)?.[1] ?? '')
+}
+
+function absoluteArchiveUrl(baseUrl: string, value: string) {
+  try {
+    return new URL(value, baseUrl).toString()
+  } catch {
+    return ''
+  }
+}
+
+function stableArchiveId(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/[^a-z0-9_.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    || 'archive'
+}
+
+function yearFromArchiveDate(value: string) {
+  const year = value.match(/\b(16|17|18|19|20)\d{2}\b/)?.[0]
+  if (year) return year
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? undefined : String(date.getUTCFullYear())
+}
+
+function monthFromArchiveDate(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? undefined : String(date.getUTCMonth() + 1).padStart(2, '0')
+}
+
+function royalSocietyJournalName(journalCode: string) {
+  const journals: Record<string, string> = {
+    rstl: 'Philosophical Transactions of the Royal Society of London',
+    rsta: 'Philosophical Transactions of the Royal Society A',
+    rstb: 'Philosophical Transactions of the Royal Society B',
+    rspa: 'Proceedings of the Royal Society A',
+    rspb: 'Proceedings of the Royal Society B',
+    rsos: 'Royal Society Open Science',
+    rsif: 'Journal of The Royal Society Interface',
+    rsbl: 'Biology Letters',
+  }
+  return journals[journalCode] ?? 'Royal Society Publishing'
+}
+
+function parseRoyalSocietyIssuePath(url: string) {
+  try {
+    const parsed = new URL(url)
+    const [, journalCode = '', issueMarker = '', volume = '', issue = ''] = parsed.pathname.split('/')
+    return issueMarker === 'issue' ? { journalCode, volume, issue } : { journalCode, volume: '', issue: '' }
+  } catch {
+    return { journalCode: '', volume: '', issue: '' }
+  }
+}
+
+function articleTitleNearHref(html: string, href: string) {
+  const escapedHref = href.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const anchor = html.match(new RegExp(`<a\\s+[^>]*href=["']${escapedHref}["'][^>]*>([\\s\\S]*?)<\\/a>`, 'i'))?.[1]
+  return anchor ? stripHtml(anchor) : ''
+}
+
+function parseRoyalSocietyIssueHtml(html: string, issueUrl: string): JournalArchiveIssue {
+  const parsedUrl = new URL(issueUrl)
+  const pathParts = parseRoyalSocietyIssuePath(issueUrl)
+  const publishedAt = readHtmlMeta(html, 'citation_publication_date') || readHtmlMeta(html, 'dc.Date') || readHtmlTitle(html)
+  const journalName = readHtmlMeta(html, 'citation_journal_title') || royalSocietyJournalName(pathParts.journalCode)
+  const issueTitle = readHtmlTitle(html) || `${journalName} Volume ${pathParts.volume} Issue ${pathParts.issue}`
+  const issueBase = {
+    id: `royal-society-${stableArchiveId(parsedUrl.pathname)}`,
+    provider: 'royal-society' as const,
+    publisherName: 'Royal Society Publishing',
+    journalName,
+    issueTitle,
+    issueUrl,
+    year: yearFromArchiveDate(publishedAt),
+    month: monthFromArchiveDate(publishedAt),
+    volume: pathParts.volume || undefined,
+    issue: pathParts.issue || undefined,
+    importedAt: new Date().toISOString(),
+  }
+  const articlesByDoi = new Map<string, JournalArchiveArticle>()
+  const hrefPattern = /href=["']([^"']*\/doi\/(?:abs\/|full\/|pdf\/)?(10\.[^"'?#\s<>]+))["']/gi
+  let match: RegExpExecArray | null
+
+  while ((match = hrefPattern.exec(html))) {
+    const href = match[1]
+    const doi = decodeURIComponent(match[2])
+    if (!doi.startsWith('10.') || articlesByDoi.has(doi)) continue
+    const sourceUrl = absoluteArchiveUrl(issueUrl, href.replace(/\/doi\/pdf\//, '/doi/abs/').replace(/\/doi\/full\//, '/doi/abs/'))
+    if (!sourceUrl) continue
+    const pdfUrl = absoluteArchiveUrl(issueUrl, href.includes('/doi/pdf/') ? href : href.replace(/\/doi\/(?:abs\/|full\/)?/, '/doi/pdf/'))
+    const title = articleTitleNearHref(html, href) || `Royal Society article ${doi}`
+    articlesByDoi.set(doi, {
+      id: `royal-society-${stableArchiveId(doi)}`,
+      provider: 'royal-society',
+      publisherName: issueBase.publisherName,
+      journalName: issueBase.journalName,
+      issueTitle: issueBase.issueTitle,
+      issueUrl,
+      articleId: doi,
+      title,
+      authors: [],
+      year: issueBase.year,
+      month: issueBase.month,
+      publishedAt: issueBase.year,
+      volume: issueBase.volume,
+      issue: issueBase.issue,
+      sourceUrl,
+      pdfUrl,
+    })
+  }
+
+  return {
+    ...issueBase,
+    articles: Array.from(articlesByDoi.values()).sort((left, right) => left.title.localeCompare(right.title)),
+  }
+}
+
+const archiveCatalogStorageKey = 'bookforge.journalArchiveIssues.v1'
+
+function loadArchiveIssuesFromStorage(): JournalArchiveIssue[] {
+  if (typeof localStorage === 'undefined') return []
+  try {
+    const parsed = JSON.parse(localStorage.getItem(archiveCatalogStorageKey) || '[]')
+    return Array.isArray(parsed) ? parsed as JournalArchiveIssue[] : []
+  } catch {
+    return []
+  }
+}
+
+function saveArchiveIssuesToStorage(issues: JournalArchiveIssue[]) {
+  if (typeof localStorage === 'undefined') return
+  localStorage.setItem(archiveCatalogStorageKey, JSON.stringify(issues, null, 2))
 }
 
 function slugifyFileName(value: string) {
@@ -5501,6 +5708,7 @@ function getInitialWorkspaceTab(): WorkspaceTab {
   return requestedTab === 'books'
     || requestedTab === 'contents'
     || requestedTab === 'preview'
+    || requestedTab === 'archive'
     || requestedTab === 'translation'
     ? requestedTab
     : 'books'
@@ -5527,6 +5735,10 @@ function App() {
   const [selectedSuggestionIds, setSelectedSuggestionIds] = useState<Set<string>>(new Set())
   const [suggestBusy, setSuggestBusy] = useState(false)
   const [suggestError, setSuggestError] = useState('')
+  const [archiveIssueUrl, setArchiveIssueUrl] = useState('https://royalsocietypublishing.org/rstl/issue/1/8')
+  const [archiveIssues, setArchiveIssues] = useState<JournalArchiveIssue[]>(() => loadArchiveIssuesFromStorage())
+  const [archiveBusy, setArchiveBusy] = useState(false)
+  const [archiveError, setArchiveError] = useState('')
 
   const selectedLocation = useMemo(() => findNode(book.outline, activeNodeId), [book.outline, activeNodeId])
   const activeNode = selectedLocation?.node
@@ -5570,6 +5782,10 @@ function App() {
   useEffect(() => {
     void refreshLibrary()
   }, [])
+
+  useEffect(() => {
+    saveArchiveIssuesToStorage(archiveIssues)
+  }, [archiveIssues])
 
   useEffect(() => {
     if (!book.outline.length) {
@@ -5640,6 +5856,106 @@ function App() {
     setActiveFileName(fileName)
     await refreshLibrary()
     return updated
+  }
+
+  async function importRoyalSocietyIssueToDesktop() {
+    setArchiveBusy(true)
+    setArchiveError('')
+    try {
+      const parsedUrl = new URL(archiveIssueUrl.trim())
+      if (!parsedUrl.hostname.includes('royalsocietypublishing.org')) {
+        throw new Error('Enter a Royal Society Publishing issue URL.')
+      }
+      const response = await fetch(parsedUrl.toString(), {
+        headers: { Accept: 'text/html,application/xhtml+xml' },
+      })
+      if (!response.ok) {
+        throw new Error(`Royal Society issue request failed: ${response.status}`)
+      }
+      const issue = parseRoyalSocietyIssueHtml(await response.text(), parsedUrl.toString())
+      if (!issue.articles.length) {
+        throw new Error('No article DOI links were found on this issue page.')
+      }
+      setArchiveIssues((current) => [issue, ...current.filter((entry) => entry.id !== issue.id)])
+      setStatusText(`Imported ${issue.articles.length} article records from ${issue.journalName}.`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setArchiveError(message)
+      setStatusText(message)
+    } finally {
+      setArchiveBusy(false)
+    }
+  }
+
+  async function importArchiveArticleToBook(issue: JournalArchiveIssue, article: JournalArchiveArticle) {
+    const now = new Date().toISOString()
+    const overview = createNode('chapter', 'Article Overview', [
+      {
+        ...createNode('section', 'Source and Reading Plan'),
+        intent: 'Keep the archive source attached and prepare this article for reading, explanation, and translation.',
+        summary: article.title,
+        content: [
+          `Journal: ${article.journalName}`,
+          `Publisher: ${article.publisherName}`,
+          article.year ? `Year: ${article.year}` : '',
+          article.volume ? `Volume: ${article.volume}` : '',
+          article.issue ? `Issue: ${article.issue}` : '',
+          `Article ID: ${article.articleId}`,
+          '',
+          'Open the source/PDF from Resources, read or extract the article, then use the Translation Lab workflow for translation and package export.',
+        ].filter(Boolean).join('\n'),
+        keywords: ['archive article', article.journalName, article.year ?? '', article.articleId].filter(Boolean),
+        persona: 'college',
+        resources: [
+          {
+            id: `source-${article.id}`,
+            type: 'link',
+            label: 'Article Page',
+            value: article.sourceUrl,
+            description: article.articleId,
+          },
+          ...(article.pdfUrl ? [{
+            id: `pdf-${article.id}`,
+            type: 'pdf' as ResourceType,
+            label: 'Article PDF',
+            value: article.pdfUrl,
+            description: 'Royal Society PDF URL',
+          }] : []),
+          {
+            id: `issue-${issue.id}`,
+            type: 'link',
+            label: 'Issue Page',
+            value: issue.issueUrl,
+            description: issue.issueTitle,
+          },
+        ],
+      },
+    ])
+    const archiveBook: Book = {
+      id: `archive-${article.id}`,
+      title: article.title,
+      synopsis: `Archive article from ${article.journalName}. ${article.articleId}`,
+      audience: 'Research reader',
+      tone: 'Academic',
+      tags: ['Archive Article', article.publisherName, article.journalName, article.year ?? ''].filter(Boolean),
+      outline: [overview],
+      createdAt: now,
+      updatedAt: now,
+    }
+    const saved = await persistBook(archiveBook)
+    setActiveNodeId(findFirstNodeId(saved.outline))
+    setActiveWorkspaceTab('contents')
+    setArchiveIssues((current) => current.map((entry) =>
+      entry.id === issue.id
+        ? {
+            ...entry,
+            articles: entry.articles.map((item) =>
+              item.id === article.id ? { ...item, importedBookId: saved.id } : item
+            ),
+          }
+        : entry
+    ))
+    setStatusText(`Imported archive article "${saved.title}".`)
   }
 
   function openCreateBookModal(options: { tab?: WorkspaceTab } = {}) {
@@ -5987,6 +6303,13 @@ function App() {
           type="button"
         >
           Preview
+        </button>
+        <button
+          className={activeWorkspaceTab === 'archive' ? 'workspace-tab active' : 'workspace-tab'}
+          onClick={() => setActiveWorkspaceTab('archive')}
+          type="button"
+        >
+          Archive
         </button>
         <button
           className={activeWorkspaceTab === 'translation' ? 'workspace-tab active' : 'workspace-tab'}
@@ -6363,6 +6686,110 @@ function App() {
             </section>
           </aside>
         </div>
+      ) : activeWorkspaceTab === 'archive' ? (
+        <main className="archive-view">
+          <section className="panel archive-import-panel">
+            <div className="content-book-header">
+              <div>
+                <h2>Journal Archive</h2>
+                <p className="panel-subtitle">
+                  Build a local catalog of journal issues, then import articles as reader entries for explanation and translation.
+                </p>
+              </div>
+              <div className="book-actions">
+                <button className="button secondary" onClick={() => window.open(archiveIssueUrl, '_blank', 'noopener,noreferrer')} type="button">
+                  Browse Issue
+                </button>
+              </div>
+            </div>
+
+            <div className="archive-import-card">
+              <label className="full-width">
+                <span>Royal Society issue URL</span>
+                <input
+                  value={archiveIssueUrl}
+                  onChange={(event) => setArchiveIssueUrl(event.currentTarget.value)}
+                  placeholder="https://royalsocietypublishing.org/rstl/issue/1/8"
+                />
+              </label>
+              <div className="stack-actions">
+                <button className="button" onClick={() => void importRoyalSocietyIssueToDesktop()} disabled={!archiveIssueUrl.trim() || archiveBusy} type="button">
+                  {archiveBusy ? 'Importing...' : 'Import Issue'}
+                </button>
+                <button className="button secondary" onClick={() => window.open(archiveIssueUrl, '_blank', 'noopener,noreferrer')} disabled={!archiveIssueUrl.trim()} type="button">
+                  Open in Browser
+                </button>
+              </div>
+              {archiveError ? <p className="status error">{archiveError}</p> : null}
+              <p className="muted">
+                First target: Philosophical Transactions, volume 1, issue 8. The importer stores article DOI IDs and source/PDF URLs when the issue page exposes them.
+              </p>
+            </div>
+          </section>
+
+          <section className="panel archive-catalog-panel">
+            <div className="panel-heading horizontal">
+              <div>
+                <h2>Local Journal Catalog</h2>
+                <p className="panel-subtitle">
+                  {archiveIssues.length ? `${archiveIssues.length} issue${archiveIssues.length === 1 ? '' : 's'} saved locally.` : 'No issues imported yet.'}
+                </p>
+              </div>
+            </div>
+
+            {!archiveIssues.length ? (
+              <p className="muted">Import the Royal Society issue above to create local article records.</p>
+            ) : null}
+
+            <div className="archive-issue-list">
+              {archiveIssues.map((issue) => (
+                <article key={issue.id} className="archive-issue-card">
+                  <header className="archive-issue-header">
+                    <div>
+                      <h3>{issue.journalName || issue.issueTitle}</h3>
+                      <p className="muted">
+                        {[issue.publisherName, issue.year, issue.month ? `Month ${issue.month}` : '', issue.volume ? `Vol. ${issue.volume}` : '', issue.issue ? `Issue ${issue.issue}` : '', `${issue.articles.length} articles`].filter(Boolean).join(' - ')}
+                      </p>
+                    </div>
+                    <button className="mini-button" onClick={() => window.open(issue.issueUrl, '_blank', 'noopener,noreferrer')} type="button">
+                      Open Issue
+                    </button>
+                  </header>
+
+                  <div className="archive-article-list">
+                    {issue.articles.map((article) => (
+                      <div key={article.id} className="archive-article-row">
+                        <div>
+                          <strong>{article.title}</strong>
+                          <span>{article.articleId}{article.importedBookId ? ' - Imported' : ''}</span>
+                        </div>
+                        <div className="table-actions">
+                          <button className="mini-button" onClick={() => window.open(article.sourceUrl, '_blank', 'noopener,noreferrer')} type="button">
+                            Source
+                          </button>
+                          {article.pdfUrl ? (
+                            <button className="mini-button" onClick={() => window.open(article.pdfUrl, '_blank', 'noopener,noreferrer')} type="button">
+                              PDF
+                            </button>
+                          ) : null}
+                          <button
+                            className="mini-button"
+                            onClick={() => void importArchiveArticleToBook(issue, article)}
+                            type="button"
+                          >
+                            {article.importedBookId ? 'Import Again' : 'Import Article'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </article>
+              ))}
+            </div>
+
+            {statusText ? <p className="status">{statusText}</p> : null}
+          </section>
+        </main>
       ) : activeWorkspaceTab === 'translation' ? (
         <TranslationWorkspace />
       ) : (

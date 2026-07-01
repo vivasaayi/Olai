@@ -37,6 +37,13 @@ import {
 import { readBookSourceText, readSelectableBookSourceText } from "./src/paperAssets";
 import { importPaperFromInput } from "./src/paperImport";
 import { deleteInstalledPackage, installPackageFromUrl, loadInstalledPackages } from "./src/packageStore";
+import { importRoyalSocietyIssue } from "./src/archiveImport";
+import {
+  loadJournalArchiveIssues,
+  markArchiveArticleImported,
+  type JournalArchiveArticle,
+  type JournalArchiveIssue,
+} from "./src/archiveStore";
 import { sampleBook } from "./src/sampleBook";
 import { defaultReaderSettings, loadReaderSettings, saveReaderSettings } from "./src/settingsStore";
 import type { InstalledPackage, PortableBookPage, PortablePageTranslation } from "./src/packageTypes";
@@ -581,6 +588,7 @@ function findAssistNote(book: Book, section: Section, mode: AssistMode, question
 export default function App() {
   const [books, setBooks] = useState<Book[]>([sampleBook]);
   const [publishedPackages, setPublishedPackages] = useState<InstalledPackage[]>([]);
+  const [archiveIssues, setArchiveIssues] = useState<JournalArchiveIssue[]>([]);
   const [storedBookIds, setStoredBookIds] = useState<string[]>([]);
   const [activeReaderKind, setActiveReaderKind] = useState<"custom" | "published">("custom");
   const [activeBookId, setActiveBookId] = useState(sampleBook.id);
@@ -597,6 +605,8 @@ export default function App() {
   const [addMode, setAddMode] = useState<AddMode>("book");
   const [importText, setImportText] = useState("");
   const [archiveQuery, setArchiveQuery] = useState("");
+  const [archiveIssueUrl, setArchiveIssueUrl] = useState("https://royalsocietypublishing.org/rstl/issue/1/8");
+  const [archiveBusy, setArchiveBusy] = useState(false);
   const [packageUrl, setPackageUrl] = useState("");
   const [packageBusy, setPackageBusy] = useState(false);
   const [paperInput, setPaperInput] = useState("");
@@ -625,14 +635,16 @@ export default function App() {
 
   const refreshBooks = async () => {
     try {
-      const [storedBooks, installedPackages] = await Promise.all([
+      const [storedBooks, installedPackages, storedArchiveIssues] = await Promise.all([
         loadStoredBooks(),
         loadInstalledPackages(),
+        loadJournalArchiveIssues(),
       ]);
       const storedSample = storedBooks.find((book) => book.id === sampleBook.id);
       setBooks([storedSample ?? sampleBook, ...storedBooks.filter((book) => book.id !== sampleBook.id)]);
       setStoredBookIds(storedBooks.map((book) => book.id));
       setPublishedPackages(installedPackages);
+      setArchiveIssues(storedArchiveIssues);
     } catch (error) {
       setStatusText(error instanceof Error ? error.message : String(error));
     }
@@ -847,6 +859,53 @@ export default function App() {
       Alert.alert("Package import failed", error instanceof Error ? error.message : String(error));
     } finally {
       setPackageBusy(false);
+    }
+  };
+
+  const importArchiveIssue = async () => {
+    setArchiveBusy(true);
+    try {
+      const issue = await importRoyalSocietyIssue(archiveIssueUrl);
+      await refreshBooks();
+      setStatusText(`Imported ${issue.articles.length} article records from ${issue.journalName}.`);
+    } catch (error) {
+      Alert.alert("Issue import failed", error instanceof Error ? error.message : String(error));
+    } finally {
+      setArchiveBusy(false);
+    }
+  };
+
+  const importArchiveArticle = async (issue: JournalArchiveIssue, article: JournalArchiveArticle) => {
+    setPaperBusy(true);
+    try {
+      const parsed = await importPaperFromInput(article.sourceUrl);
+      const enriched: Book = {
+        ...parsed,
+        title: parsed.title || article.title,
+        tags: Array.from(new Set([...parsed.tags, issue.publisherName, article.journalName, "Archive Article"].filter(Boolean))),
+        source: {
+          ...parsed.source,
+          type: "archive-article",
+          id: article.articleId,
+          url: article.sourceUrl,
+          pdfUrl: parsed.source?.pdfUrl || article.pdfUrl,
+          journal: article.journalName,
+          publishedAt: article.publishedAt,
+          issueVolume: article.volume,
+          issueNumber: article.issue,
+          articleId: article.articleId,
+          archiveProvider: article.provider,
+        },
+      };
+      await saveStoredBook(enriched);
+      await markArchiveArticleImported(issue.id, article.id, enriched.id);
+      await refreshBooks();
+      openBook(enriched);
+      setStatusText(`Imported archive article "${enriched.title}". ${offlineSummary(enriched)}`);
+    } catch (error) {
+      Alert.alert("Article import failed", error instanceof Error ? error.message : String(error));
+    } finally {
+      setPaperBusy(false);
     }
   };
 
@@ -1254,6 +1313,9 @@ export default function App() {
       <AddReadingModal
         addMode={addMode}
         apiKey={assistApiKey}
+        archiveBusy={archiveBusy}
+        archiveIssueUrl={archiveIssueUrl}
+        archiveIssues={archiveIssues}
         archiveQuery={archiveQuery}
         createBook={createBook}
         endpoint={assistEndpoint}
@@ -1263,6 +1325,8 @@ export default function App() {
         importText={importText}
         model={activeAssistModel}
         onClose={() => setAddOpen(false)}
+        onImportArchiveArticle={importArchiveArticle}
+        onImportArchiveIssue={importArchiveIssue}
         onOpenArchiveUrl={openArchiveUrl}
         open={addOpen}
         paperBusy={paperBusy}
@@ -1270,6 +1334,7 @@ export default function App() {
         packageBusy={packageBusy}
         packageUrl={packageUrl}
         setAddMode={setAddMode}
+        setArchiveIssueUrl={setArchiveIssueUrl}
         setArchiveQuery={setArchiveQuery}
         setImportText={setImportText}
         setPackageUrl={setPackageUrl}
@@ -1445,6 +1510,9 @@ function Pill({ text, theme }: { text: string; theme: Theme }) {
 function AddReadingModal({
   addMode,
   apiKey,
+  archiveBusy,
+  archiveIssueUrl,
+  archiveIssues,
   archiveQuery,
   createBook,
   endpoint,
@@ -1454,6 +1522,8 @@ function AddReadingModal({
   importText,
   model,
   onClose,
+  onImportArchiveArticle,
+  onImportArchiveIssue,
   onOpenArchiveUrl,
   open,
   paperBusy,
@@ -1461,6 +1531,7 @@ function AddReadingModal({
   packageBusy,
   packageUrl,
   setAddMode,
+  setArchiveIssueUrl,
   setArchiveQuery,
   setImportText,
   setPackageUrl,
@@ -1469,6 +1540,9 @@ function AddReadingModal({
 }: {
   addMode: AddMode;
   apiKey: string;
+  archiveBusy: boolean;
+  archiveIssueUrl: string;
+  archiveIssues: JournalArchiveIssue[];
   archiveQuery: string;
   createBook: (book: Book) => void;
   endpoint: string;
@@ -1478,6 +1552,8 @@ function AddReadingModal({
   importText: string;
   model: string;
   onClose: () => void;
+  onImportArchiveArticle: (issue: JournalArchiveIssue, article: JournalArchiveArticle) => void;
+  onImportArchiveIssue: () => void;
   onOpenArchiveUrl: (title: string, url: string) => void;
   open: boolean;
   paperBusy: boolean;
@@ -1485,6 +1561,7 @@ function AddReadingModal({
   packageBusy: boolean;
   packageUrl: string;
   setAddMode: (mode: AddMode) => void;
+  setArchiveIssueUrl: (value: string) => void;
   setArchiveQuery: (value: string) => void;
   setImportText: (value: string) => void;
   setPackageUrl: (value: string) => void;
@@ -1538,6 +1615,88 @@ function AddReadingModal({
             <Text style={[styles.helperText, { color: theme.muted }]}>
               Browse research archives, search for older papers, then tap Import in the browser when you reach an article, PDF, or landing page.
             </Text>
+            <View style={[styles.archiveCard, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+              <Text style={[styles.libraryTitle, { color: theme.text }]}>Royal Society Issue Import</Text>
+              <Text style={[styles.libraryMeta, { color: theme.muted }]}>
+                Save a local article catalog for a journal issue, including journal name, volume, issue, DOI/article ID, source URL, and PDF URL when detected.
+              </Text>
+              <TextInput
+                autoCapitalize="none"
+                autoCorrect={false}
+                onChangeText={setArchiveIssueUrl}
+                placeholder="https://royalsocietypublishing.org/rstl/issue/1/8"
+                placeholderTextColor={theme.muted}
+                style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.background, marginTop: 10 }]}
+                value={archiveIssueUrl}
+              />
+              <View style={styles.libraryActions}>
+                <AppButton
+                  label={archiveBusy ? "Importing..." : "Import Issue"}
+                  onPress={onImportArchiveIssue}
+                  disabled={!archiveIssueUrl.trim() || archiveBusy}
+                  theme={theme}
+                  compact
+                />
+                <AppButton
+                  label="Browse"
+                  onPress={() => onOpenArchiveUrl("Royal Society Issue", archiveIssueUrl)}
+                  disabled={!archiveIssueUrl.trim()}
+                  theme={theme}
+                  variant="ghost"
+                  compact
+                />
+              </View>
+            </View>
+
+            {archiveIssues.length ? (
+              <>
+                <Text style={[styles.previewLabel, { color: theme.muted }]}>Local Journal Catalog</Text>
+                {archiveIssues.map((issue) => (
+                  <View key={issue.id} style={[styles.archiveCard, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+                    <Text style={[styles.libraryTitle, { color: theme.text }]}>{issue.journalName || issue.issueTitle}</Text>
+                    <Text style={[styles.libraryMeta, { color: theme.muted }]}>
+                      {[
+                        issue.publisherName,
+                        issue.year,
+                        issue.month ? `Month ${issue.month}` : "",
+                        issue.volume ? `Vol. ${issue.volume}` : "",
+                        issue.issue ? `Issue ${issue.issue}` : "",
+                        `${issue.articles.length} articles`,
+                      ].filter(Boolean).join(" - ")}
+                    </Text>
+                    <View style={styles.libraryActions}>
+                      <AppButton label="Open Issue" onPress={() => onOpenArchiveUrl(issue.issueTitle, issue.issueUrl)} theme={theme} variant="ghost" compact />
+                    </View>
+                    {issue.articles.slice(0, 12).map((article) => (
+                      <View key={article.id} style={[styles.archiveArticleRow, { borderColor: theme.border }]}>
+                        <View style={styles.archiveArticleText}>
+                          <Text numberOfLines={2} style={[styles.outlineEditorTitle, { color: theme.text }]}>{article.title}</Text>
+                          <Text numberOfLines={1} style={[styles.libraryMeta, { color: theme.muted }]}>
+                            {article.articleId}{article.importedBookId ? " - Imported" : ""}
+                          </Text>
+                        </View>
+                        <AppButton
+                          label={article.importedBookId ? "Open" : "Import"}
+                          onPress={() => article.importedBookId
+                            ? onOpenArchiveUrl(article.title, article.sourceUrl)
+                            : onImportArchiveArticle(issue, article)}
+                          disabled={paperBusy}
+                          theme={theme}
+                          compact
+                        />
+                      </View>
+                    ))}
+                    {issue.articles.length > 12 ? (
+                      <Text style={[styles.libraryMeta, { color: theme.muted }]}>
+                        Showing 12 of {issue.articles.length}. Use Browse to navigate the full issue.
+                      </Text>
+                    ) : null}
+                  </View>
+                ))}
+              </>
+            ) : null}
+
+            <Text style={[styles.previewLabel, { color: theme.muted }]}>Browse Archives</Text>
             <TextInput
               autoCapitalize="none"
               autoCorrect={false}
@@ -3013,6 +3172,17 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     borderWidth: 1,
     padding: 14,
+  },
+  archiveArticleRow: {
+    alignItems: "center",
+    borderTopWidth: 1,
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 10,
+    paddingTop: 10,
+  },
+  archiveArticleText: {
+    flex: 1,
   },
   notesList: {
     gap: 12,

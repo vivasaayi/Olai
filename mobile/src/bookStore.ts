@@ -148,7 +148,7 @@ function normalizeLegacyChapter(value: unknown, index: number): OutlineNode {
 function normalizeSource(value: unknown): BookSource | undefined {
   const raw = asRecord(value);
   const type = asString(raw.type);
-  if (!["bookforge", "arxiv", "open-web", "pdf"].includes(type)) {
+  if (!["bookforge", "arxiv", "open-web", "pdf", "archive-article"].includes(type)) {
     return undefined;
   }
 
@@ -164,6 +164,10 @@ function normalizeSource(value: unknown): BookSource | undefined {
     authors: asStringArray(raw.authors),
     publishedAt: asString(raw.publishedAt) || undefined,
     journal: asString(raw.journal) || undefined,
+    issueVolume: asString(raw.issueVolume) || undefined,
+    issueNumber: asString(raw.issueNumber) || undefined,
+    articleId: asString(raw.articleId) || undefined,
+    archiveProvider: asString(raw.archiveProvider) || undefined,
     offlineStatus: asStringArray(raw.offlineStatus),
   };
 }

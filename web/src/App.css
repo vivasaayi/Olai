@@ -81,6 +81,15 @@
   padding: 0 1.25rem 1.25rem;
 }
 
+.archive-view {
+  flex: 1;
+  min-height: 0;
+  padding: 0 1.25rem 1.25rem;
+  display: grid;
+  grid-template-columns: minmax(360px, 0.7fr) minmax(0, 1.3fr);
+  gap: 1rem;
+}
+
 .books-manager-panel {
   display: flex;
   flex-direction: column;
@@ -93,6 +102,18 @@
   display: flex;
   flex-direction: column;
   gap: 1rem;
+}
+
+.archive-import-panel,
+.archive-catalog-panel {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.archive-catalog-panel {
+  overflow: auto;
 }
 
 .contents-grid {
@@ -578,6 +599,61 @@ select:focus,
   grid-template-columns: 120px repeat(3, minmax(0, 1fr)) 2rem;
   gap: 0.55rem;
   align-items: start;
+}
+
+.archive-import-card,
+.archive-issue-card {
+  border: 1px solid #d8dee6;
+  border-radius: 8px;
+  background: #f8fafc;
+  padding: 1rem;
+}
+
+.archive-import-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.archive-issue-list,
+.archive-article-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.archive-issue-header,
+.archive-article-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.archive-issue-header h3 {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+}
+
+.archive-article-row {
+  border-top: 1px solid #d8dee6;
+  padding-top: 0.75rem;
+}
+
+.archive-article-row strong,
+.archive-article-row span {
+  display: block;
+}
+
+.archive-article-row strong {
+  color: #111827;
+  line-height: 1.35;
+}
+
+.archive-article-row span {
+  margin-top: 0.2rem;
+  color: #667085;
+  font-size: 0.82rem;
 }
 
 .assist-box {
