@@ -43,7 +43,7 @@ import type { InstalledPackage, PortableBookPage, PortablePageTranslation } from
 import type { AiNote, AiNoteKind, Book, OutlineNode, Resource, Section, TokenUsage } from "./src/types";
 
 type ThemeId = "paper" | "sepia" | "night";
-type AddMode = "book" | "paper" | "package" | "json";
+type AddMode = "book" | "paper" | "archive" | "package" | "json";
 
 const themes: Record<ThemeId, {
   background: string;
@@ -100,6 +100,14 @@ type SuggestionItem = {
   children: SuggestionItem[];
 };
 
+type ResearchArchiveSource = {
+  id: string;
+  title: string;
+  description: string;
+  homeUrl: string;
+  searchUrl: (query: string) => string;
+};
+
 const mobileAssistModels: AssistModelOption[] = [
   {
     id: "google/gemma-4-12b-qat",
@@ -119,6 +127,44 @@ const mobileAssistModels: AssistModelOption[] = [
 ];
 
 const mobileAssistModelIds = new Set(mobileAssistModels.map((model) => model.id));
+
+const researchArchiveSources: ResearchArchiveSource[] = [
+  {
+    id: "fraser",
+    title: "FRASER / FRS",
+    description: "Federal Reserve archival economic history, speeches, reports, and old policy documents.",
+    homeUrl: "https://fraser.stlouisfed.org/",
+    searchUrl: (query) => `https://fraser.stlouisfed.org/search?searchtype=keyword&text=${encodeURIComponent(query)}`,
+  },
+  {
+    id: "royal-society",
+    title: "Royal Society Archive",
+    description: "Historic scientific papers, including Philosophical Transactions and Proceedings.",
+    homeUrl: "https://royalsocietypublishing.org/action/showPublications",
+    searchUrl: (query) => `https://royalsocietypublishing.org/action/doSearch?AllField=${encodeURIComponent(query)}`,
+  },
+  {
+    id: "ieee",
+    title: "IEEE Xplore",
+    description: "Engineering, computing, electronics, standards, journals, and conference papers.",
+    homeUrl: "https://ieeexplore.ieee.org/",
+    searchUrl: (query) => `https://ieeexplore.ieee.org/search/searchresult.jsp?queryText=${encodeURIComponent(query)}`,
+  },
+  {
+    id: "arxiv",
+    title: "arXiv",
+    description: "Open preprints across computing, mathematics, physics, quantitative biology, and more.",
+    homeUrl: "https://arxiv.org/",
+    searchUrl: (query) => `https://arxiv.org/search/?query=${encodeURIComponent(query)}&searchtype=all`,
+  },
+  {
+    id: "pubmed",
+    title: "PubMed",
+    description: "Biomedical and life-science literature with strong metadata and abstract coverage.",
+    homeUrl: "https://pubmed.ncbi.nlm.nih.gov/",
+    searchUrl: (query) => `https://pubmed.ncbi.nlm.nih.gov/?term=${encodeURIComponent(query)}`,
+  },
+];
 
 function normalizeMobileAssistModel(model: string) {
   return mobileAssistModelIds.has(model.trim()) ? model.trim() : defaultReaderSettings.assistModel;
@@ -550,12 +596,14 @@ export default function App() {
   const [editOpen, setEditOpen] = useState(false);
   const [addMode, setAddMode] = useState<AddMode>("book");
   const [importText, setImportText] = useState("");
+  const [archiveQuery, setArchiveQuery] = useState("");
   const [packageUrl, setPackageUrl] = useState("");
   const [packageBusy, setPackageBusy] = useState(false);
   const [paperInput, setPaperInput] = useState("");
   const [paperBusy, setPaperBusy] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [webUrl, setWebUrl] = useState("");
+  const [webCurrentUrl, setWebCurrentUrl] = useState("");
   const [webTitle, setWebTitle] = useState("Source");
   const [paperTextOpen, setPaperTextOpen] = useState(false);
   const [paperText, setPaperText] = useState("");
@@ -629,6 +677,17 @@ export default function App() {
   const activeTopicNotes = useMemo(() => notesForSection(activeBook, activeSection), [activeBook, activeSection]);
   const aiNoteCount = activeTopicNotes.length;
   const activeAssistModel = normalizeMobileAssistModel(assistModel);
+  const readerChapterLabel = readingPublishedPackage
+    ? activePackage?.author || "Published Book"
+    : activeChapter?.title ?? "Chapter";
+  const readerSectionTitle = readingPublishedPackage
+    ? activePackageTranslation?.title || activePackagePage?.sectionTitle || `Page ${activePackageCurrentPageNumber}`
+    : activeSection.title;
+  const readerParagraphs = readingPublishedPackage
+    ? activePackageTranslation?.paragraphs.length
+      ? activePackageTranslation.paragraphs
+      : ["No readable text is available for this page."]
+    : contentParagraphs;
   const cachedAssistNote = useMemo(
     () => findAssistNote(activeBook, activeSection, assistMode, assistQuestion, activeAssistModel),
     [activeBook, activeSection, assistMode, assistQuestion, activeAssistModel],
@@ -812,6 +871,25 @@ export default function App() {
   const openResource = (resource: Resource) => {
     setWebTitle(resource.label || "Source");
     setWebUrl(resource.value);
+    setWebCurrentUrl(resource.value);
+  };
+
+  const openArchiveUrl = (title: string, url: string) => {
+    setWebTitle(title);
+    setWebUrl(url);
+    setWebCurrentUrl(url);
+    setAddOpen(false);
+  };
+
+  const importCurrentWebPage = () => {
+    const currentUrl = (webCurrentUrl || webUrl).trim();
+    if (!currentUrl) return;
+    setPaperInput(currentUrl);
+    setAddMode("paper");
+    setAddOpen(true);
+    setWebUrl("");
+    setWebCurrentUrl("");
+    setStatusText("Archive page copied into Paper import. Import it when the article page is ready.");
   };
 
   const openPaperText = async () => {
@@ -1004,7 +1082,9 @@ export default function App() {
         </View>
         <View style={styles.headerActions}>
           <AppButton label="Library" onPress={() => setLibraryOpen(true)} theme={theme} variant="ghost" compact />
-          <AppButton label="Edit" onPress={() => setEditOpen(true)} disabled={readingPublishedPackage} theme={theme} variant="ghost" compact />
+          {!readingPublishedPackage ? (
+            <AppButton label="Edit" onPress={() => setEditOpen(true)} theme={theme} variant="ghost" compact />
+          ) : null}
           <AppButton label="Add" onPress={() => setAddOpen(true)} theme={theme} compact />
         </View>
       </View>
@@ -1014,58 +1094,47 @@ export default function App() {
         contentContainerStyle={styles.readerContent}
         showsVerticalScrollIndicator={false}
       >
-        {readingPublishedPackage ? (
-          <>
-            <Text style={[styles.chapterTitle, { color: theme.muted }]}>
-              Published Package
-            </Text>
-            <Text style={[styles.sectionTitle, { color: theme.text }]}>
-              {activePackageTranslation?.title || activePackagePage?.sectionTitle || `Page ${activePackageCurrentPageNumber}`}
-            </Text>
-            <View style={styles.metaRow}>
+        <Text style={[styles.chapterTitle, { color: theme.muted }]}>
+          {readerChapterLabel}
+        </Text>
+        <Text style={[styles.sectionTitle, { color: theme.text }]}>
+          {readerSectionTitle}
+        </Text>
+
+        <View style={styles.metaRow}>
+          {readingPublishedPackage ? (
+            <>
               <Pill text={activePackageLanguageValue || "language"} theme={theme} />
               <Pill text={`Page ${activePackageCurrentPageNumber}`} theme={theme} />
-              {activePackageTranslation?.complexity ? <Pill text={activePackageTranslation.complexity} theme={theme} /> : null}
               {activePackage?.version ? <Pill text={`v${activePackage.version} r${activePackage.revision}`} theme={theme} /> : null}
-            </View>
-            {activePackage && activePackage.languages.length > 1 ? (
-              <View style={styles.packageLanguageRow}>
-                {activePackage.languages.map((language) => (
-                  <AppButton
-                    key={language}
-                    label={language}
-                    onPress={() => {
-                      const pageNumbers = packagePageNumbers(activePackage, language);
-                      setActivePackageLanguage(language);
-                      setActivePackagePageNumber(pageNumbers[0] ?? 1);
-                    }}
-                    theme={theme}
-                    variant={language === activePackageLanguageValue ? "solid" : "ghost"}
-                    compact
-                  />
-                ))}
-              </View>
-            ) : null}
-            <View style={[styles.readingSurface, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-              {(activePackageTranslation?.paragraphs.length ? activePackageTranslation.paragraphs : ["No translation is available for this page."]).map((paragraph, index) => (
-                <Text
-                  key={`package-${activePackage?.packageId}-${activePackageCurrentPageNumber}-${index}`}
-                  style={[styles.paragraph, { color: theme.text, fontSize, lineHeight: Math.round(fontSize * 1.58) }]}
-                >
-                  {paragraph}
-                </Text>
+            </>
+          ) : (
+            <>
+              <Pill text={activeSection.persona} theme={theme} />
+              {activeBook.source?.type ? <Pill text={activeBook.source.type} theme={theme} /> : null}
+              {activeSection.durationMinutes ? (
+                <Pill text={`${activeSection.durationMinutes} min`} theme={theme} />
+              ) : null}
+              {activeSection.keywords.slice(0, 3).map((keyword) => (
+                <Pill key={keyword} text={keyword} theme={theme} />
               ))}
-            </View>
-            {activePackagePage?.sourceLines.length ? (
-              <View style={styles.resourcePanel}>
-                <Text style={[styles.resourceTitle, { color: theme.muted }]}>Source Lines</Text>
-                {activePackagePage.sourceLines.slice(0, 8).map((line, index) => (
-                  <Text key={`${activePackageCurrentPageNumber}-source-${index}`} style={[styles.libraryMeta, { color: theme.muted }]}>
-                    {index + 1}. {line}
-                  </Text>
-                ))}
-              </View>
-            ) : null}
+            </>
+          )}
+        </View>
+
+        <View style={[styles.readingSurface, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+          {readerParagraphs.map((paragraph, index) => (
+            <Text
+              key={readingPublishedPackage ? `package-${activePackage?.packageId}-${activePackageCurrentPageNumber}-${index}` : `${activeSection.id}-${index}`}
+              style={[styles.paragraph, { color: theme.text, fontSize, lineHeight: Math.round(fontSize * 1.58) }]}
+            >
+              {paragraph}
+            </Text>
+          ))}
+        </View>
+
+        {readingPublishedPackage ? (
+          <>
             {activePackage?.glossary.length ? (
               <View style={styles.resourcePanel}>
                 <Text style={[styles.resourceTitle, { color: theme.muted }]}>Glossary</Text>
@@ -1079,35 +1148,6 @@ export default function App() {
           </>
         ) : (
           <>
-            <Text style={[styles.chapterTitle, { color: theme.muted }]}>
-              {activeChapter?.title ?? "Chapter"}
-            </Text>
-            <Text style={[styles.sectionTitle, { color: theme.text }]}>
-              {activeSection.title}
-            </Text>
-
-            <View style={styles.metaRow}>
-              <Pill text={activeSection.persona} theme={theme} />
-              {activeBook.source?.type ? <Pill text={activeBook.source.type} theme={theme} /> : null}
-              {activeSection.durationMinutes ? (
-                <Pill text={`${activeSection.durationMinutes} min`} theme={theme} />
-              ) : null}
-              {activeSection.keywords.slice(0, 3).map((keyword) => (
-                <Pill key={keyword} text={keyword} theme={theme} />
-              ))}
-            </View>
-
-            <View style={[styles.readingSurface, { backgroundColor: theme.surface, borderColor: theme.border }]}>
-              {contentParagraphs.map((paragraph, index) => (
-                <Text
-                  key={`${activeSection.id}-${index}`}
-                  style={[styles.paragraph, { color: theme.text, fontSize, lineHeight: Math.round(fontSize * 1.58) }]}
-                >
-                  {paragraph}
-                </Text>
-              ))}
-            </View>
-
             <TopicNotesAccordion
               notes={activeTopicNotes}
               onAskSelection={(action, selectedText) => {
@@ -1170,8 +1210,12 @@ export default function App() {
           />
         </View>
         <View style={styles.controlsRow}>
-          <AppButton label="Assist" onPress={() => setAssistOpen(true)} disabled={readingPublishedPackage} theme={theme} />
-          <AppButton label={aiNoteCount ? `Notes ${aiNoteCount}` : "Notes"} onPress={() => setNotesOpen(true)} disabled={readingPublishedPackage} theme={theme} variant="ghost" />
+          {!readingPublishedPackage ? (
+            <>
+              <AppButton label="Assist" onPress={() => setAssistOpen(true)} theme={theme} />
+              <AppButton label={aiNoteCount ? `Notes ${aiNoteCount}` : "Notes"} onPress={() => setNotesOpen(true)} theme={theme} variant="ghost" />
+            </>
+          ) : null}
           <AppButton label="A-" onPress={() => setFontSize((value) => Math.max(15, value - 1))} theme={theme} variant="ghost" compact />
           <AppButton label="A+" onPress={() => setFontSize((value) => Math.min(28, value + 1))} theme={theme} variant="ghost" compact />
           {(["paper", "sepia", "night"] as ThemeId[]).map((id) => (
@@ -1210,6 +1254,7 @@ export default function App() {
       <AddReadingModal
         addMode={addMode}
         apiKey={assistApiKey}
+        archiveQuery={archiveQuery}
         createBook={createBook}
         endpoint={assistEndpoint}
         importBook={importBook}
@@ -1218,12 +1263,14 @@ export default function App() {
         importText={importText}
         model={activeAssistModel}
         onClose={() => setAddOpen(false)}
+        onOpenArchiveUrl={openArchiveUrl}
         open={addOpen}
         paperBusy={paperBusy}
         paperInput={paperInput}
         packageBusy={packageBusy}
         packageUrl={packageUrl}
         setAddMode={setAddMode}
+        setArchiveQuery={setArchiveQuery}
         setImportText={setImportText}
         setPackageUrl={setPackageUrl}
         setPaperInput={setPaperInput}
@@ -1297,11 +1344,27 @@ export default function App() {
         <SafeAreaView style={[styles.webShell, { backgroundColor: theme.background }]}>
           <View style={[styles.webHeader, { borderColor: theme.border }]}>
             <Text numberOfLines={1} style={[styles.webTitle, { color: theme.text }]}>{webTitle}</Text>
-            <AppButton label="Close" onPress={() => setWebUrl("")} theme={theme} variant="ghost" compact />
+            <View style={styles.webHeaderActions}>
+              <AppButton label="Import" onPress={importCurrentWebPage} theme={theme} compact />
+              <AppButton
+                label="Close"
+                onPress={() => {
+                  setWebUrl("");
+                  setWebCurrentUrl("");
+                }}
+                theme={theme}
+                variant="ghost"
+                compact
+              />
+            </View>
           </View>
           {webUrl ? (
             <WebView
               originWhitelist={["*"]}
+              onNavigationStateChange={(event) => {
+                if (event.url) setWebCurrentUrl(event.url);
+                if (event.title) setWebTitle(event.title);
+              }}
               source={{ uri: webUrl }}
               startInLoadingState
               renderLoading={() => (
@@ -1382,6 +1445,7 @@ function Pill({ text, theme }: { text: string; theme: Theme }) {
 function AddReadingModal({
   addMode,
   apiKey,
+  archiveQuery,
   createBook,
   endpoint,
   importBook,
@@ -1390,12 +1454,14 @@ function AddReadingModal({
   importText,
   model,
   onClose,
+  onOpenArchiveUrl,
   open,
   paperBusy,
   paperInput,
   packageBusy,
   packageUrl,
   setAddMode,
+  setArchiveQuery,
   setImportText,
   setPackageUrl,
   setPaperInput,
@@ -1403,6 +1469,7 @@ function AddReadingModal({
 }: {
   addMode: AddMode;
   apiKey: string;
+  archiveQuery: string;
   createBook: (book: Book) => void;
   endpoint: string;
   importBook: () => void;
@@ -1411,12 +1478,14 @@ function AddReadingModal({
   importText: string;
   model: string;
   onClose: () => void;
+  onOpenArchiveUrl: (title: string, url: string) => void;
   open: boolean;
   paperBusy: boolean;
   paperInput: string;
   packageBusy: boolean;
   packageUrl: string;
   setAddMode: (mode: AddMode) => void;
+  setArchiveQuery: (value: string) => void;
   setImportText: (value: string) => void;
   setPackageUrl: (value: string) => void;
   setPaperInput: (value: string) => void;
@@ -1432,6 +1501,7 @@ function AddReadingModal({
         <View style={styles.segmentRow}>
           <AppButton label="Book" onPress={() => setAddMode("book")} theme={theme} variant={addMode === "book" ? "solid" : "ghost"} />
           <AppButton label="Paper" onPress={() => setAddMode("paper")} theme={theme} variant={addMode === "paper" ? "solid" : "ghost"} />
+          <AppButton label="Archive" onPress={() => setAddMode("archive")} theme={theme} variant={addMode === "archive" ? "solid" : "ghost"} />
           <AppButton label="Package" onPress={() => setAddMode("package")} theme={theme} variant={addMode === "package" ? "solid" : "ghost"} />
           <AppButton label="JSON" onPress={() => setAddMode("json")} theme={theme} variant={addMode === "json" ? "solid" : "ghost"} />
         </View>
@@ -1463,6 +1533,46 @@ function AddReadingModal({
             />
             <AppButton label={paperBusy ? "Importing..." : "Import Paper"} onPress={importPaper} disabled={!paperInput.trim() || paperBusy} theme={theme} />
           </View>
+        ) : addMode === "archive" ? (
+          <ScrollView contentContainerStyle={styles.archiveList} keyboardShouldPersistTaps="handled">
+            <Text style={[styles.helperText, { color: theme.muted }]}>
+              Browse research archives, search for older papers, then tap Import in the browser when you reach an article, PDF, or landing page.
+            </Text>
+            <TextInput
+              autoCapitalize="none"
+              autoCorrect={false}
+              onChangeText={setArchiveQuery}
+              placeholder="Search old research, authors, topics, years"
+              placeholderTextColor={theme.muted}
+              style={[styles.singleInput, { color: theme.text, borderColor: theme.border, backgroundColor: theme.surface }]}
+              value={archiveQuery}
+            />
+            {researchArchiveSources.map((source) => {
+              const query = archiveQuery.trim();
+              return (
+                <View key={source.id} style={[styles.archiveCard, { borderColor: theme.border, backgroundColor: theme.surface }]}>
+                  <Text style={[styles.libraryTitle, { color: theme.text }]}>{source.title}</Text>
+                  <Text style={[styles.libraryMeta, { color: theme.muted }]}>{source.description}</Text>
+                  <View style={styles.libraryActions}>
+                    <AppButton
+                      label="Open"
+                      onPress={() => onOpenArchiveUrl(source.title, source.homeUrl)}
+                      theme={theme}
+                      variant="ghost"
+                      compact
+                    />
+                    <AppButton
+                      label="Search"
+                      onPress={() => onOpenArchiveUrl(`${source.title}: ${query}`, source.searchUrl(query))}
+                      disabled={!query}
+                      theme={theme}
+                      compact
+                    />
+                  </View>
+                </View>
+              );
+            })}
+          </ScrollView>
         ) : addMode === "package" ? (
           <View style={styles.modalBody}>
             <Text style={[styles.helperText, { color: theme.muted }]}>
@@ -2895,6 +3005,15 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
   },
+  archiveList: {
+    gap: 12,
+    paddingBottom: 32,
+  },
+  archiveCard: {
+    borderRadius: 8,
+    borderWidth: 1,
+    padding: 14,
+  },
   notesList: {
     gap: 12,
     paddingBottom: 32,
@@ -3125,6 +3244,10 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     letterSpacing: 0,
     paddingRight: 12,
+  },
+  webHeaderActions: {
+    flexDirection: "row",
+    gap: 8,
   },
   webLoading: {
     alignItems: "center",
