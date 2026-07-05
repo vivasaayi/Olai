@@ -21,6 +21,7 @@ pub fn run() {
             save_old_book_snapshot,
             old_book_snapshot_dir,
             export_old_book_html,
+            export_old_book_binary,
             browse_old_book_exports,
             old_book_export_http_url,
             old_book_export_api_url,
@@ -296,6 +297,59 @@ fn old_book_export_file_name(file_name: &str) -> String {
     }
 }
 
+fn old_book_export_binary_file_name(file_name: &str) -> String {
+    let trimmed = file_name.trim();
+    let (stem, extension) = match trimmed.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-') =>
+        {
+            (stem, Some(extension.to_ascii_lowercase()))
+        }
+        _ => (trimmed, None),
+    };
+    let safe_stem = safe_path_segment(stem);
+    match extension {
+        Some(extension) => format!("{}.{}", safe_stem, extension),
+        None => format!("{}.bin", safe_stem),
+    }
+}
+
+fn reveal_file(file_path: &PathBuf) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(file_path)
+            .spawn()
+            .map_err(|e| format!("reveal export in Finder: {}", e))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg("/select,")
+            .arg(file_path)
+            .spawn()
+            .map_err(|e| format!("reveal export in Explorer: {}", e))?;
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        if let Some(parent) = file_path.parent() {
+            Command::new("xdg-open")
+                .arg(parent)
+                .spawn()
+                .map_err(|e| format!("open export folder: {}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
 fn open_folder(path: &PathBuf) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -369,33 +423,29 @@ fn export_old_book_html(
     fs::write(&file_path, html).map_err(|e| format!("write export file: {}", e))?;
 
     if reveal {
-        #[cfg(target_os = "macos")]
-        {
-            Command::new("open")
-                .arg("-R")
-                .arg(&file_path)
-                .spawn()
-                .map_err(|e| format!("reveal export in Finder: {}", e))?;
-        }
+        reveal_file(&file_path)?;
+    }
 
-        #[cfg(target_os = "windows")]
-        {
-            Command::new("explorer")
-                .arg("/select,")
-                .arg(&file_path)
-                .spawn()
-                .map_err(|e| format!("reveal export in Explorer: {}", e))?;
-        }
+    Ok(file_path.to_string_lossy().into_owned())
+}
 
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        {
-            if let Some(parent) = file_path.parent() {
-                Command::new("xdg-open")
-                    .arg(parent)
-                    .spawn()
-                    .map_err(|e| format!("open export folder: {}", e))?;
-            }
-        }
+#[tauri::command]
+fn export_old_book_binary(
+    book_id: String,
+    file_name: String,
+    bytes: Vec<u8>,
+    reveal: bool,
+) -> Result<String, String> {
+    let mut dir = old_book_book_dir(&book_id)?;
+    dir.push("exports");
+    fs::create_dir_all(&dir).map_err(|e| format!("create export dir: {}", e))?;
+
+    let mut file_path = dir;
+    file_path.push(old_book_export_binary_file_name(&file_name));
+    fs::write(&file_path, bytes).map_err(|e| format!("write export file: {}", e))?;
+
+    if reveal {
+        reveal_file(&file_path)?;
     }
 
     Ok(file_path.to_string_lossy().into_owned())

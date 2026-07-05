@@ -1313,6 +1313,22 @@ function downloadBlobFile(fileName: string, blob: Blob) {
   URL.revokeObjectURL(link.href)
 }
 
+async function saveOldBookBinaryExport(bookId: string, fileName: string, blob: Blob, reveal = false) {
+  try {
+    const bytes = Array.from(new Uint8Array(await blob.arrayBuffer()))
+    return (await invoke('export_old_book_binary', {
+      bookId,
+      fileName,
+      bytes,
+      reveal,
+    })) as string
+  } catch (error) {
+    if (!isTauriUnavailable(error)) throw error
+    downloadBlobFile(fileName, blob)
+    return null
+  }
+}
+
 async function sha256HexBytes(value: Uint8Array) {
   const digest = await crypto.subtle.digest('SHA-256', value)
   return Array.from(new Uint8Array(digest))
@@ -4354,6 +4370,7 @@ function TranslationWorkspace() {
       }
     }
 
+    const savedPaths: string[] = []
     for (const volumeRange of volumeRanges) {
       const volume = volumeRanges.length > 1
         ? {
@@ -4366,10 +4383,20 @@ function TranslationWorkspace() {
       const packagePayload = buildPortableBookPackage(activeBook, scope, snapshotImages, packageMetadata, packageAssetOptions, volume)
       const fileName = `${slugifyFileName(activeBook.title)}-${scope.kind === 'all' ? 'all-languages' : slugifyFileName(scopeLabel)}${volume ? `-vol-${volume.index}-of-${volume.total}` : ''}.bookpkg`
       const files = await buildPortablePackageFiles(packagePayload, packageAssetOptions, sourcePdfBlob)
-      downloadBlobFile(fileName, createZipBlob(files))
+      const savedPath = await saveOldBookBinaryExport(
+        activeBook.id,
+        fileName,
+        createZipBlob(files),
+        volumeRange.index === volumeRanges.length,
+      )
+      if (savedPath) savedPaths.push(savedPath)
       await yieldToBrowser()
     }
-    setOldBookStatus(`${scopeLabel} portable book package exported${volumeRanges.length > 1 ? ` in ${volumeRanges.length} volumes` : ''}.`)
+    setOldBookStatus(
+      savedPaths.length
+        ? `${scopeLabel} portable book package exported${volumeRanges.length > 1 ? ` in ${volumeRanges.length} volumes` : ''}. Saved to: ${savedPaths.join(' | ')}`
+        : `${scopeLabel} portable book package downloaded${volumeRanges.length > 1 ? ` in ${volumeRanges.length} volumes` : ''}. Browser downloads do not expose a saved path.`,
+    )
   }
 
   async function exportActiveBookAsEpub() {
@@ -4385,8 +4412,8 @@ function TranslationWorkspace() {
     )
     const fileName = `${slugifyFileName(activeBook.title)}-${slugifyFileName(languageLabel)}-${slugifyFileName(complexity)}.epub`
     const files = buildPortableEpubFiles(basePackage, translationLanguage, languageLabel, complexity)
-    downloadBlobFile(fileName, createZipBlob(files, 'application/epub+zip'))
-    setOldBookStatus(`${languageLabel} EPUB exported.`)
+    const savedPath = await saveOldBookBinaryExport(activeBook.id, fileName, createZipBlob(files, 'application/epub+zip'), true)
+    setOldBookStatus(savedPath ? `${languageLabel} EPUB exported. Saved to: ${savedPath}` : `${languageLabel} EPUB downloaded. Browser downloads do not expose a saved path.`)
   }
 
   async function exportActiveBookAsPdf() {
