@@ -5779,10 +5779,12 @@ function App() {
   const [selectedSuggestionIds, setSelectedSuggestionIds] = useState<Set<string>>(new Set())
   const [suggestBusy, setSuggestBusy] = useState(false)
   const [suggestError, setSuggestError] = useState('')
+  const suggestRequestRef = useRef(0)
   const [archiveIssueUrl, setArchiveIssueUrl] = useState('https://royalsocietypublishing.org/rstl/issue/1/8')
   const [archiveIssues, setArchiveIssues] = useState<JournalArchiveIssue[]>(() => loadArchiveIssuesFromStorage())
   const [archiveBusy, setArchiveBusy] = useState(false)
   const [archiveError, setArchiveError] = useState('')
+  const archiveRequestRef = useRef(0)
 
   const selectedLocation = useMemo(() => findNode(book.outline, activeNodeId), [book.outline, activeNodeId])
   const activeNode = selectedLocation?.node
@@ -5903,6 +5905,7 @@ function App() {
   }
 
   async function importRoyalSocietyIssueToDesktop() {
+    const requestId = ++archiveRequestRef.current
     setArchiveBusy(true)
     setArchiveError('')
     try {
@@ -5912,6 +5915,7 @@ function App() {
       }
       const response = await fetch(parsedUrl.toString(), {
         headers: { Accept: 'text/html,application/xhtml+xml' },
+        signal: AbortSignal.timeout(20000),
       })
       if (!response.ok) {
         throw new Error(`Royal Society issue request failed: ${response.status}`)
@@ -5920,14 +5924,18 @@ function App() {
       if (!issue.articles.length) {
         throw new Error('No article DOI links were found on this issue page.')
       }
+      if (archiveRequestRef.current !== requestId) return
       setArchiveIssues((current) => [issue, ...current.filter((entry) => entry.id !== issue.id)])
       setStatusText(`Imported ${issue.articles.length} article records from ${issue.journalName}.`)
     } catch (error) {
+      if (archiveRequestRef.current !== requestId) return
       const message = error instanceof Error ? error.message : String(error)
       setArchiveError(message)
       setStatusText(message)
     } finally {
-      setArchiveBusy(false)
+      if (archiveRequestRef.current === requestId) {
+        setArchiveBusy(false)
+      }
     }
   }
 
@@ -6243,6 +6251,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(60000),
       })
 
     let response = await send(payload)
@@ -6264,6 +6273,8 @@ function App() {
 
   async function openSuggestModal(targetId: string | null) {
     const target = targetId ? findNode(book.outline, targetId) : null
+    // Tag this request so a slower earlier response can't overwrite a newer one.
+    const requestId = ++suggestRequestRef.current
     setSuggestTargetId(targetId)
     setSuggestTargetLabel(target ? target.path.join(' > ') : book.title)
     setSuggestOpen(true)
@@ -6274,15 +6285,19 @@ function App() {
 
     try {
       const items = await fetchSuggestions(targetId)
+      if (suggestRequestRef.current !== requestId) return
       setSuggestions(items)
       setSelectedSuggestionIds(new Set(flattenSuggestionIds(items)))
       if (!items.length) {
         setSuggestError('The model returned no suggestions.')
       }
     } catch (error) {
+      if (suggestRequestRef.current !== requestId) return
       setSuggestError(error instanceof Error ? error.message : String(error))
     } finally {
-      setSuggestBusy(false)
+      if (suggestRequestRef.current === requestId) {
+        setSuggestBusy(false)
+      }
     }
   }
 

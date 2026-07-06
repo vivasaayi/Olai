@@ -377,7 +377,7 @@ export async function listVisionModels(endpoint: string): Promise<LocalVisionMod
 
   let response: Response
   try {
-    response = await fetch(url)
+    response = await fetch(url, { signal: AbortSignal.timeout(15000) })
   } catch (error) {
     throw new Error(
       `Could not load models from ${url}. Start the BookForge router on port 1235 and use the router endpoint.`,
