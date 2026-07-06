@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -665,6 +665,12 @@ export default function App() {
   }, [assistOpen]);
 
   const activeBook = books.find((book) => book.id === activeBookId) ?? books[0] ?? sampleBook;
+  // Mirror the latest books so async writes (e.g. a 45s assist call) merge onto
+  // the current book instead of a stale render-closure snapshot.
+  const booksRef = useRef(books);
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
   const activePackage = publishedPackages.find((pkg) => pkg.packageId === activePackageId);
   const activePackageLanguageValue = activePackageLanguage || activePackage?.defaultLanguage || activePackage?.languages[0] || "";
   const activePackagePageNumbers = useMemo(
@@ -974,7 +980,12 @@ export default function App() {
     const cleanAnswer = answer.trim();
     if (!cleanAnswer) return null;
 
-    const existing = findAssistNote(activeBook, activeSection, mode, question, model);
+    // Resolve the freshest copy of the target book. runAssist may have awaited a
+    // long LLM call, during which the user could have edited the book; merging
+    // onto the render-closure snapshot would clobber those edits.
+    const baseBook = booksRef.current.find((book) => book.id === activeBook.id) ?? activeBook;
+
+    const existing = findAssistNote(baseBook, activeSection, mode, question, model);
     const note: AiNote = {
       id: existing?.id ?? `ai-note-${Date.now()}`,
       kind: noteKindForMode(mode),
@@ -990,17 +1001,20 @@ export default function App() {
     };
 
     const updatedBook: Book = {
-      ...activeBook,
+      ...baseBook,
       aiNotes: [
         note,
-        ...(activeBook.aiNotes ?? []).filter((entry) => !noteMatchesAssist(entry, activeSection, mode, question, model)),
+        ...(baseBook.aiNotes ?? []).filter((entry) => !noteMatchesAssist(entry, activeSection, mode, question, model)),
       ],
     };
 
     await saveStoredBook(updatedBook);
-    setBooks((current) => current.map((book) => book.id === updatedBook.id ? updatedBook : book));
+    setBooks((current) => current.some((book) => book.id === updatedBook.id)
+      ? current.map((book) => book.id === updatedBook.id ? updatedBook : book)
+      : [...current, updatedBook]);
     setStoredBookIds((current) => current.includes(updatedBook.id) ? current : [...current, updatedBook.id]);
-    setActiveBookId(updatedBook.id);
+    // Do not force-activate the book: the user may have navigated to another
+    // book or a published package while the assist call was in flight.
     return note;
   };
 
@@ -1119,14 +1133,14 @@ export default function App() {
   };
 
   const removeAiNote = async (noteId: string) => {
+    const baseBook = booksRef.current.find((book) => book.id === activeBook.id) ?? activeBook;
     const updatedBook: Book = {
-      ...activeBook,
-      aiNotes: (activeBook.aiNotes ?? []).filter((note) => note.id !== noteId),
+      ...baseBook,
+      aiNotes: (baseBook.aiNotes ?? []).filter((note) => note.id !== noteId),
     };
 
     await saveStoredBook(updatedBook);
     setBooks((current) => current.map((book) => book.id === updatedBook.id ? updatedBook : book));
-    setActiveBookId(updatedBook.id);
   };
 
   return (
