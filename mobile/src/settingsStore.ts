@@ -1,4 +1,5 @@
 import * as FileSystem from "expo-file-system";
+import { readJsonFile, writeFileAtomic } from "./fsUtils";
 
 export type ReaderSettings = {
   assistEndpoint: string;
@@ -44,23 +45,17 @@ function readModel(value: unknown) {
 }
 
 export async function loadReaderSettings(): Promise<ReaderSettings> {
-  const path = settingsPath();
-  const info = await FileSystem.getInfoAsync(path);
-  if (!info.exists) {
+  const parsed = await readJsonFile<unknown>(settingsPath(), "reader settings");
+  if (parsed === undefined) {
     return defaultReaderSettings;
   }
-
-  try {
-    const raw = asRecord(JSON.parse(await FileSystem.readAsStringAsync(path)));
-    return {
-      assistEndpoint: readEndpoint(raw.assistEndpoint),
-      assistModel: readModel(raw.assistModel),
-    };
-  } catch {
-    return defaultReaderSettings;
-  }
+  const raw = asRecord(parsed);
+  return {
+    assistEndpoint: readEndpoint(raw.assistEndpoint),
+    assistModel: readModel(raw.assistModel),
+  };
 }
 
 export async function saveReaderSettings(settings: ReaderSettings) {
-  await FileSystem.writeAsStringAsync(settingsPath(), JSON.stringify(settings, null, 2));
+  await writeFileAtomic(settingsPath(), JSON.stringify(settings, null, 2));
 }

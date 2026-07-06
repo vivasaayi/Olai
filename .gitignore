@@ -5,3 +5,7 @@ mobile/logs/
 mobile/config/llm-router.local.json
 .playwright-mcp
 web/dist
+
+# Build artifacts & OS cruft
+src-tauri/target
+.DS_Store

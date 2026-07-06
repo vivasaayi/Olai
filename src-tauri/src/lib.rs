@@ -251,6 +251,18 @@ fn migrate_library_db(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_book_file_component(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name == "."
+    {
+        return Err("invalid book file name".into());
+    }
+    Ok(())
+}
+
 fn safe_path_segment(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -1191,7 +1203,16 @@ fn old_book_sqlite_get_pdf_asset(pdf_blob_id: String) -> Result<Option<StoredPdf
 #[tauri::command]
 fn old_book_sqlite_get_file_data_url(file_path: String) -> Result<StoredFileAsset, String> {
     let path = PathBuf::from(&file_path);
-    let extension = path
+    // Confine reads to the app data directory: resolve symlinks/.. and reject
+    // anything that escapes the bookforge dir, so a tampered DB/JSON path cannot
+    // turn this into an arbitrary local file read.
+    let canonical = fs::canonicalize(&path).map_err(|e| format!("resolve asset path: {}", e))?;
+    let canonical_base = fs::canonicalize(bookforge_dir()?)
+        .map_err(|e| format!("resolve app data dir: {}", e))?;
+    if !canonical.starts_with(&canonical_base) {
+        return Err("asset path is outside the app data directory".into());
+    }
+    let extension = canonical
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or("")
@@ -1201,7 +1222,7 @@ fn old_book_sqlite_get_file_data_url(file_path: String) -> Result<StoredFileAsse
         "webp" => "image/webp",
         _ => "image/jpeg",
     };
-    let bytes = fs::read(&path).map_err(|e| format!("read asset file: {}", e))?;
+    let bytes = fs::read(&canonical).map_err(|e| format!("read asset file: {}", e))?;
 
     Ok(StoredFileAsset {
         data_url: format!(
@@ -1378,6 +1399,7 @@ fn save_book(book_id: String, payload: String) -> Result<String, String> {
         let uuid = uuid::Uuid::new_v4().to_string();
         file.push(format!("{}.json", uuid));
     } else {
+        validate_book_file_component(&book_id)?;
         file.push(format!("{}.json", book_id));
     }
     fs::write(&file, payload).map_err(|e| format!("write file: {}", e))?;
@@ -1386,6 +1408,7 @@ fn save_book(book_id: String, payload: String) -> Result<String, String> {
 
 #[tauri::command]
 fn load_book(file_name: String) -> Result<String, String> {
+    validate_book_file_component(&file_name)?;
     let mut path = books_dir()?;
     path.push(file_name);
     fs::read_to_string(path).map_err(|e| format!("read_file: {}", e))
@@ -1393,10 +1416,7 @@ fn load_book(file_name: String) -> Result<String, String> {
 
 #[tauri::command]
 fn delete_book(file_name: String) -> Result<(), String> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name == "." || file_name == ".."
-    {
-        return Err("invalid book file name".into());
-    }
+    validate_book_file_component(&file_name)?;
 
     let mut path = books_dir()?;
     path.push(file_name);

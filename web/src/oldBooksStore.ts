@@ -22,7 +22,7 @@ export type TranslationMemoryEntry = TranslationGlossaryEntry & {
 export type TranslationJobState = {
   id: string
   kind: 'translate-all'
-  status: 'running' | 'complete' | 'failed'
+  status: 'running' | 'complete' | 'failed' | 'cancelled'
   complexity: TranslationComplexity
   language: TranslationLanguage
   currentPage: number
@@ -39,7 +39,7 @@ export type TranslationJobState = {
 export type SnapshotJobState = {
   id: string
   kind: 'snapshot-all'
-  status: 'running' | 'complete' | 'failed'
+  status: 'running' | 'complete' | 'failed' | 'cancelled'
   currentPage: number
   totalPages: number
   phase: 'preparing' | 'rendering' | 'saving' | 'persist' | 'complete'
@@ -638,8 +638,8 @@ class IndexedDbOldBookRepository extends BaseOldBookRepository {
 class TauriSqliteOldBookRepository extends BaseOldBookRepository {
   readonly kind = 'tauri-sqlite' as const
 
-  async isAvailable() {
-    await invoke('old_book_sqlite_available')
+  async isAvailable(): Promise<boolean> {
+    return (await invoke('old_book_sqlite_available')) as boolean
   }
 
   async listBooks() {
@@ -690,9 +690,30 @@ function prepareBookForTauriSqliteStorage(book: OldBookRecord): OldBookRecord {
 const indexedDbOldBookRepository = new IndexedDbOldBookRepository()
 let oldBookRepositoryPromise: Promise<OldBookRepository> | null = null
 
+const OLD_BOOK_MIGRATION_MARKER = 'bookforge:oldBookSqliteMigrated:v1'
+
+function oldBookMigrationComplete(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(OLD_BOOK_MIGRATION_MARKER) === '1'
+  } catch {
+    return false
+  }
+}
+
+function markOldBookMigrationComplete() {
+  try {
+    globalThis.localStorage?.setItem(OLD_BOOK_MIGRATION_MARKER, '1')
+  } catch {
+    // localStorage may be unavailable; migration will simply re-run (idempotent).
+  }
+}
+
 async function migrateIndexedDbOldBooksToSqlite(sqliteRepository: TauriSqliteOldBookRepository) {
+  // Once fully migrated we short-circuit to avoid re-scanning IndexedDB on every launch.
+  if (oldBookMigrationComplete()) return
+
   const sqliteBooks = await sqliteRepository.listBooks()
-  if (sqliteBooks.length > 0) return
+  const alreadyMigrated = new Set(sqliteBooks.map((book) => book.id))
 
   let indexedDbBooks: OldBookRecord[] = []
   try {
@@ -701,7 +722,11 @@ async function migrateIndexedDbOldBooksToSqlite(sqliteRepository: TauriSqliteOld
     if (!String(error).includes('IndexedDB')) throw error
   }
 
+  // Migrate only books not yet in SQLite so a partial/interrupted migration
+  // resumes on the next launch instead of being silently skipped. saveBookRecord
+  // upserts, so re-running is safe. The marker is only set after all books land.
   for (const book of indexedDbBooks) {
+    if (alreadyMigrated.has(book.id)) continue
     let bookForSave = book
     await sqliteRepository.saveBookRecord(bookForSave)
     if (book.pdfBlobId) {
@@ -718,22 +743,38 @@ async function migrateIndexedDbOldBooksToSqlite(sqliteRepository: TauriSqliteOld
       }
     }
   }
+
+  markOldBookMigrationComplete()
 }
 
 export async function getOldBookRepository() {
-  oldBookRepositoryPromise ??= (async () => {
-    const sqliteRepository = new TauriSqliteOldBookRepository()
-    try {
-      await sqliteRepository.isAvailable()
-      await migrateIndexedDbOldBooksToSqlite(sqliteRepository)
-      return sqliteRepository
-    } catch (error) {
-      if (isTauriUnavailable(error)) {
-        return indexedDbOldBookRepository
+  if (!oldBookRepositoryPromise) {
+    const pending = (async () => {
+      const sqliteRepository = new TauriSqliteOldBookRepository()
+      try {
+        if (!(await sqliteRepository.isAvailable())) {
+          // Command answered but the backend can't be used — fall back cleanly
+          // instead of proceeding and failing on the next operation.
+          return indexedDbOldBookRepository
+        }
+        await migrateIndexedDbOldBooksToSqlite(sqliteRepository)
+        return sqliteRepository
+      } catch (error) {
+        if (isTauriUnavailable(error)) {
+          return indexedDbOldBookRepository
+        }
+        throw error
       }
-      throw error
-    }
-  })()
+    })()
+    // Don't cache a rejected promise: a transient init/migration failure would
+    // otherwise wedge all persistence until reload. Clear it so the next call retries.
+    pending.catch(() => {
+      if (oldBookRepositoryPromise === pending) {
+        oldBookRepositoryPromise = null
+      }
+    })
+    oldBookRepositoryPromise = pending
+  }
   return oldBookRepositoryPromise
 }
 

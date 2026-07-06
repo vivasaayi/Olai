@@ -1134,6 +1134,10 @@ function decodeHtmlEntities(value: string) {
   return textarea.value.replace(/\s+/g, ' ').trim()
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
+}
+
 function stripHtml(value: string) {
   return decodeHtmlEntities(
     value
@@ -1330,7 +1334,7 @@ async function saveOldBookBinaryExport(bookId: string, fileName: string, blob: B
 }
 
 async function sha256HexBytes(value: Uint8Array) {
-  const digest = await crypto.subtle.digest('SHA-256', value)
+  const digest = await crypto.subtle.digest('SHA-256', value as BufferSource)
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('')
@@ -1397,10 +1401,6 @@ async function transformImageDataUrl(
   const mimeType = options.format === 'jpeg' ? 'image/jpeg' : 'image/png'
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, mimeType, options.jpegQuality))
   return blob ? blobToDataUrl(blob) : dataUrl
-}
-
-function portablePackageLanguages(book: PortableBook) {
-  return Array.from(new Set(book.pages.flatMap((page) => page.translations.map((translation) => translation.language)))).sort()
 }
 
 function sanitizePackagePathPart(value: string) {
@@ -1868,22 +1868,6 @@ async function buildPortablePackageFiles(
     ...contentFiles,
     ...assetFiles,
   ]
-}
-
-function getPageTranslation(
-  book: OldBookRecord,
-  pageNumber: number,
-  complexity: TranslationComplexity,
-  language: TranslationLanguage,
-  model?: string,
-  sourceModel?: string,
-) {
-  return book.translations.find((translation) =>
-    translation.pageNumber === pageNumber
-    && translation.complexity === complexity
-    && translation.language === language
-    && translationMatchesVariant(translation, model, sourceModel)
-  )
 }
 
 function getPageTranslations(
@@ -2847,6 +2831,7 @@ function yieldToBrowser() {
 function TranslationWorkspace() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const translationAbortRef = useRef<AbortController | null>(null)
+  const snapshotAbortRef = useRef<AbortController | null>(null)
   const pagePersistTimerRef = useRef<number | null>(null)
   const [oldBooks, setOldBooks] = useState<OldBookRecord[]>(() => mergeOldBookRecords([]))
   const [activeBookId, setActiveBookId] = useState('')
@@ -3127,6 +3112,12 @@ function TranslationWorkspace() {
     if (pagePersistTimerRef.current) {
       window.clearTimeout(pagePersistTimerRef.current)
     }
+    // Abort any in-flight bulk jobs so their async loops stop touching state
+    // after this component unmounts (e.g. when switching workspace tabs).
+    translationAbortRef.current?.abort()
+    translationAbortRef.current = null
+    snapshotAbortRef.current?.abort()
+    snapshotAbortRef.current = null
   }, [])
 
   async function persistOldBook(updatedBook: OldBookRecord) {
@@ -3194,12 +3185,19 @@ function TranslationWorkspace() {
   function stopTranslationRequest() {
     translationAbortRef.current?.abort()
     translationAbortRef.current = null
+    snapshotAbortRef.current?.abort()
+    snapshotAbortRef.current = null
     setOldBookBusy(false)
     setOldBookStatus('Translation request stopped.')
-    setActiveTranslationJob((current) => current ? {
+    setActiveTranslationJob((current) => current && current.status === 'running' ? {
       ...current,
-      status: 'failed',
-      error: 'Stopped by user.',
+      status: 'cancelled',
+      message: 'Stopped by user.',
+      updatedAt: new Date().toISOString(),
+    } : current)
+    setActiveSnapshotJob((current) => current && current.status === 'running' ? {
+      ...current,
+      status: 'cancelled',
       message: 'Stopped by user.',
       updatedAt: new Date().toISOString(),
     } : current)
@@ -3378,6 +3376,9 @@ function TranslationWorkspace() {
 
   async function snapshotAllPages() {
     if (!activeBook || !activePdfBlob) return
+    snapshotAbortRef.current?.abort()
+    const abortController = new AbortController()
+    snapshotAbortRef.current = abortController
     const startedAt = new Date().toISOString()
     let job: SnapshotJobState = {
       id: createId(),
@@ -3502,6 +3503,7 @@ function TranslationWorkspace() {
         maxWidth: 1000,
         pages: missingPages,
         concurrency: 2,
+        signal: abortController.signal,
         onProgress: (pageNumber, pageCount, started) => {
           setSnapshotProgress({
             phase: 'rendering',
@@ -3582,16 +3584,22 @@ function TranslationWorkspace() {
       setOldBookStatus(`Captured ${snapshotRecords.length} snapshots for ${savedBook.title}.`)
       setSnapshotsOpen(true)
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const cancelled = isAbortError(error)
+      const message = cancelled
+        ? 'Snapshot render stopped by user.'
+        : error instanceof Error ? error.message : String(error)
       setOldBookStatus(message)
       setActiveSnapshotJob((current) => current ? {
         ...current,
-        status: 'failed',
-        error: message,
+        status: cancelled ? 'cancelled' : 'failed',
+        error: cancelled ? undefined : message,
         message,
         updatedAt: new Date().toISOString(),
       } : current)
     } finally {
+      if (snapshotAbortRef.current === abortController) {
+        snapshotAbortRef.current = null
+      }
       setSnapshotProgress(null)
       setOldBookBusy(false)
     }
@@ -4105,23 +4113,26 @@ function TranslationWorkspace() {
       setActiveSection(workingBook.section)
       setOldBookStatus(completeJob.message)
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      const failedJob: TranslationJobState = {
+      const cancelled = isAbortError(error)
+      const message = cancelled
+        ? 'Bulk translation stopped by user.'
+        : error instanceof Error ? error.message : String(error)
+      const endedJob: TranslationJobState = {
         ...job,
-        status: 'failed',
-        error: message,
+        status: cancelled ? 'cancelled' : 'failed',
+        error: cancelled ? undefined : message,
         message,
         updatedAt: new Date().toISOString(),
       }
       setOldBookStatus(message)
-      setActiveTranslationJob(failedJob)
+      setActiveTranslationJob(endedJob)
       try {
         await persistOldBook({
           ...workingBook,
           status: message,
           translationJobs: [
-            failedJob,
-            ...(workingBook.translationJobs ?? []).filter((entry) => entry.id !== failedJob.id),
+            endedJob,
+            ...(workingBook.translationJobs ?? []).filter((entry) => entry.id !== endedJob.id),
           ],
         })
       } catch {
@@ -5779,7 +5790,7 @@ function App() {
   const keywordsValue = activeNode?.keywords.join(', ') ?? ''
   const activeLibraryEntry = library.find((entry) => entry.fileName === activeFileName)
   const bookTabs = useMemo<BookTab[]>(() => {
-    const tabs = library.map((entry) => ({
+    const tabs: BookTab[] = library.map((entry) => ({
       key: entry.fileName,
       label: entry.book.title,
       fileName: entry.fileName,

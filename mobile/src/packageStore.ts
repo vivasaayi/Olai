@@ -7,6 +7,7 @@ import type {
   PortableGlossaryTerm,
   PortablePageTranslationRow,
 } from "./packageTypes";
+import { readJsonFile, writeFileAtomic } from "./fsUtils";
 
 const maxPackageBytes = 750 * 1024 * 1024;
 const maxFileCount = 6000;
@@ -330,7 +331,7 @@ export async function installPackageFromBytes(bytes: Uint8Array) {
   await ensurePackageDirectory();
   const path = packagePath(manifest.packageId);
   const installed = buildInstalledPackage(manifest, files, path);
-  await FileSystem.writeAsStringAsync(path, JSON.stringify(installed, null, 2));
+  await writeFileAtomic(path, JSON.stringify(installed, null, 2));
   return installed;
 }
 
@@ -341,11 +342,19 @@ export async function installPackageFromUrl(url: string) {
   if (!response.ok) {
     throw new Error(`Package download failed: ${response.status}`);
   }
+  const tooLargeError = () =>
+    new Error(`Package is too large. Limit is ${Math.round(maxPackageBytes / 1024 / 1024)} MB.`);
   const contentLength = Number(response.headers.get("content-length") ?? 0);
   if (contentLength > maxPackageBytes) {
-    throw new Error(`Package is too large. Limit is ${Math.round(maxPackageBytes / 1024 / 1024)} MB.`);
+    throw tooLargeError();
   }
-  return installPackageFromBytes(new Uint8Array(await response.arrayBuffer()));
+  // Servers may omit content-length, so re-check the actual payload size before
+  // handing the buffer off to the ZIP parser.
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.byteLength > maxPackageBytes) {
+    throw tooLargeError();
+  }
+  return installPackageFromBytes(bytes);
 }
 
 export async function loadInstalledPackages() {
@@ -354,15 +363,13 @@ export async function loadInstalledPackages() {
   const packages: InstalledPackage[] = [];
 
   for (const entry of entries.filter((name) => name.endsWith(".json"))) {
-    try {
-      const raw = JSON.parse(await FileSystem.readAsStringAsync(`${directory}${entry}`)) as InstalledPackage;
+    const raw = await readJsonFile<InstalledPackage>(`${directory}${entry}`, "installed package");
+    if (raw !== undefined) {
       packages.push({
         ...raw,
         title: asString(raw.title, raw.manifest?.book?.title ?? "Published book"),
         languages: Array.isArray(raw.languages) ? raw.languages : [],
       });
-    } catch {
-      // Ignore malformed local package records.
     }
   }
 

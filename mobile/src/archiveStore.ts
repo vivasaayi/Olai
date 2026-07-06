@@ -1,4 +1,5 @@
 import * as FileSystem from "expo-file-system";
+import { readJsonFile, writeFileAtomic } from "./fsUtils";
 
 export type ArchiveProvider = "royal-society" | "fraser" | "ieee" | "arxiv" | "pubmed" | "open-web";
 
@@ -129,11 +130,10 @@ export async function loadJournalArchiveIssues() {
   const issues: JournalArchiveIssue[] = [];
 
   for (const entry of entries.filter((name) => name.endsWith(".json"))) {
-    try {
-      const issue = normalizeIssue(JSON.parse(await FileSystem.readAsStringAsync(`${directory}${entry}`)));
+    const parsed = await readJsonFile<unknown>(`${directory}${entry}`, "journal archive issue");
+    if (parsed !== undefined) {
+      const issue = normalizeIssue(parsed);
       if (issue) issues.push(issue);
-    } catch {
-      // Ignore malformed local catalog files.
     }
   }
 
@@ -144,7 +144,7 @@ export async function loadJournalArchiveIssues() {
 
 export async function saveJournalArchiveIssue(issue: JournalArchiveIssue) {
   await ensureArchiveDirectory();
-  await FileSystem.writeAsStringAsync(archivePath(issue.id), JSON.stringify(issue, null, 2));
+  await writeFileAtomic(archivePath(issue.id), JSON.stringify(issue, null, 2));
   return issue;
 }
 

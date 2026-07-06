@@ -1,5 +1,6 @@
 import * as FileSystem from "expo-file-system";
 import { deletePaperAssets } from "./paperAssets";
+import { readJsonFile, writeFileAtomic } from "./fsUtils";
 import type {
   AiNote,
   AiNoteKind,
@@ -268,11 +269,9 @@ export async function loadStoredBooks() {
   const books: Book[] = [];
 
   for (const entry of entries.filter((name) => name.endsWith(".json"))) {
-    try {
-      const raw = await FileSystem.readAsStringAsync(`${directory}${entry}`);
-      books.push(normalizeBook(JSON.parse(raw)));
-    } catch {
-      // Ignore malformed local files and keep the reader usable.
+    const parsed = await readJsonFile<unknown>(`${directory}${entry}`, "book");
+    if (parsed !== undefined) {
+      books.push(normalizeBook(parsed));
     }
   }
 
@@ -282,7 +281,7 @@ export async function loadStoredBooks() {
 export async function saveStoredBook(book: Book) {
   await ensureBookDirectory();
   const prepared = prepareBookForSave(book);
-  await FileSystem.writeAsStringAsync(bookPath(prepared.id), JSON.stringify(prepared, null, 2));
+  await writeFileAtomic(bookPath(prepared.id), JSON.stringify(prepared, null, 2));
 }
 
 export async function deleteStoredBook(bookId: string) {

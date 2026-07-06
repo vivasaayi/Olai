@@ -172,12 +172,18 @@ export async function renderPdfPageSnapshotsParallelStream(
     maxWidth?: number
     pages?: number[]
     concurrency?: number
+    signal?: AbortSignal
     onProgress?: (pageNumber: number, pageCount: number, started: number, total: number) => void
     onSnapshot: (snapshot: RenderedPdfSnapshot, completed: number, total: number) => Promise<void> | void
   },
 ): Promise<{ pageCount: number, renderedCount: number }> {
   const maxWidth = options.maxWidth ?? 1400
   const concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency ?? 2)))
+  const throwIfAborted = () => {
+    if (options.signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError')
+    }
+  }
   const data = await pdfBlob.arrayBuffer()
   const documentTask = getDocument({
     data,
@@ -196,6 +202,7 @@ export async function renderPdfPageSnapshotsParallelStream(
 
     async function worker() {
       while (nextIndex < pageNumbers.length) {
+        throwIfAborted()
         const pageNumber = pageNumbers[nextIndex]
         nextIndex += 1
         startedCount += 1

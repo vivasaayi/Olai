@@ -7,6 +7,7 @@
     "dev": "vite",
     "dev:host": "vite --host",
     "build": "vite build",
+    "typecheck": "tsc -p tsconfig.json",
     "tauri:ios:dev": "cd .. && cargo tauri ios dev",
     "tauri:ios:build": "cd .. && cargo tauri ios build",
     "tauri:android:dev": "cd .. && cargo tauri android dev",

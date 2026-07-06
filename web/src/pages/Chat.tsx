@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import type { Book } from '../types'
 
 export default function ChatPage() {
   const [models, setModels] = useState<string[]>([])
