@@ -761,10 +761,22 @@ export default function App() {
     [activeBook, activeSection, assistMode, assistQuestion, activeAssistModel],
   );
 
+  const assistSyncKeyRef = useRef("");
   useEffect(() => {
     if (!assistOpen || assistBusy) return;
-    setAssistAnswer(cachedAssistNote?.content ?? "");
-    setAssistUsage(cachedAssistNote?.tokenUsage);
+    const contextKey = `${activeSection.id}|${assistMode}|${assistQuestion}|${activeAssistModel}`;
+    const contextChanged = assistSyncKeyRef.current !== contextKey;
+    assistSyncKeyRef.current = contextKey;
+    if (cachedAssistNote) {
+      setAssistAnswer(cachedAssistNote.content);
+      setAssistUsage(cachedAssistNote.tokenUsage);
+    } else if (contextChanged) {
+      // Only clear when the topic actually changed. Otherwise (e.g. assistBusy
+      // just flipped false after a run whose note hasn't propagated yet) keep
+      // the freshly produced answer instead of blanking it.
+      setAssistAnswer("");
+      setAssistUsage(undefined);
+    }
   }, [assistOpen, assistBusy, cachedAssistNote?.id, cachedAssistNote?.content, cachedAssistNote?.tokenUsage, assistMode, assistQuestion, activeAssistModel, activeSection.id]);
 
   useEffect(() => {

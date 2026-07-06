@@ -1306,13 +1306,19 @@ function slugifyFileName(value: string) {
     || 'bookforge-export'
 }
 
+// Revoke on a later tick: revoking in the same synchronous frame as click()
+// can cancel the download of a large blob in some browsers.
+function revokeObjectUrlSoon(url: string) {
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
 function downloadTextFile(fileName: string, content: string, type: string) {
   const blob = new Blob([content], { type })
   const link = document.createElement('a')
   link.href = URL.createObjectURL(blob)
   link.download = fileName
   link.click()
-  URL.revokeObjectURL(link.href)
+  revokeObjectUrlSoon(link.href)
 }
 
 function downloadBlobFile(fileName: string, blob: Blob) {
@@ -1320,7 +1326,7 @@ function downloadBlobFile(fileName: string, blob: Blob) {
   link.href = URL.createObjectURL(blob)
   link.download = fileName
   link.click()
-  URL.revokeObjectURL(link.href)
+  revokeObjectUrlSoon(link.href)
 }
 
 async function saveOldBookBinaryExport(bookId: string, fileName: string, blob: Blob, reveal = false) {
