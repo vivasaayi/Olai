@@ -794,12 +794,46 @@ export function mergeOldBookRecords(storedBooks: OldBookRecord[]) {
   return [...importedBooks, ...seedOldBooks.map((book) => seedById.get(book.id)!)]
 }
 
+// Serialize writes per book id. Whole-book saves are read-modify-write against a
+// caller-held snapshot, so overlapping writes (e.g. a debounced page-position
+// autosave firing while a bulk snapshot/translation job is persisting) could
+// interleave and clobber each other. Chaining per id makes them run in order.
+const bookWriteChains = new Map<string, Promise<unknown>>()
+
+function runExclusiveForBook<T>(bookId: string, task: () => Promise<T>): Promise<T> {
+  const prior = bookWriteChains.get(bookId) ?? Promise.resolve()
+  const run = prior.then(task, task)
+  // Store a settled-swallowing tail so a rejected write doesn't break the chain
+  // or surface as an unhandled rejection; the real result still flows to callers.
+  bookWriteChains.set(bookId, run.then(() => undefined, () => undefined))
+  return run
+}
+
 export async function readOldBooks() {
   return (await getOldBookRepository()).listBooks()
 }
 
 export async function saveOldBookRecord(book: OldBookRecord) {
-  return (await getOldBookRepository()).saveBookRecord(book)
+  const repository = await getOldBookRepository()
+  return runExclusiveForBook(book.id, () => repository.saveBookRecord(book))
+}
+
+// Persist only the reading position. Re-reads the latest committed record inside
+// the serialized write and updates just the scalar position fields, so a stale
+// autosave can never overwrite collections (snapshots/translations) that a
+// concurrent job just wrote.
+export async function saveOldBookPagePosition(
+  bookId: string,
+  pageNumber: number,
+  section: string,
+  updatedAt: string,
+) {
+  const repository = await getOldBookRepository()
+  return runExclusiveForBook(bookId, async () => {
+    const latest = await repository.getBook(bookId)
+    if (!latest) return
+    await repository.saveBookRecord({ ...latest, pageNumber, section, updatedAt })
+  })
 }
 
 export async function importOldBookPdf(file: File) {

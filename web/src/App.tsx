@@ -14,6 +14,7 @@ import {
   languageOptions,
   mergeOldBookRecords,
   readOldBooks,
+  saveOldBookPagePosition,
   saveOldBookRecord,
   sourcePageLines,
   type OldBookRecord,
@@ -3150,7 +3151,14 @@ function TranslationWorkspace() {
 
     pagePersistTimerRef.current = window.setTimeout(() => {
       pagePersistTimerRef.current = null
-      void saveOldBookRecord(updatedBook).catch((error) => {
+      // Persist only the reading position so a stale autosave can't overwrite
+      // snapshots/translations a concurrent bulk job just wrote.
+      void saveOldBookPagePosition(
+        updatedBook.id,
+        updatedBook.pageNumber,
+        updatedBook.section,
+        updatedBook.updatedAt ?? new Date().toISOString(),
+      ).catch((error) => {
         setOldBookStatus(error instanceof Error ? error.message : String(error))
       })
     }, 600)
