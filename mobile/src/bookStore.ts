@@ -99,15 +99,24 @@ export function createInitialBook(): Book {
   };
 }
 
-function normalizeOutlineNode(value: unknown, fallbackType: OutlineNodeType, index: number): OutlineNode {
+// Guard against stack overflow from deeply nested (crafted or corrupt) imported
+// outline JSON. Real books nest only a few levels deep.
+const MAX_OUTLINE_DEPTH = 32;
+
+function normalizeOutlineNode(
+  value: unknown,
+  fallbackType: OutlineNodeType,
+  index: number,
+  depth = 0,
+): OutlineNode {
   const raw = asRecord(value);
   const rawType = asString(raw.type, fallbackType) as OutlineNodeType;
   const type: OutlineNodeType = rawType === "chapter" || rawType === "section" ? rawType : fallbackType;
   const persona = asString(raw.persona, "default") as NodePersona;
   const legacySections = Array.isArray(raw.sections) ? raw.sections : undefined;
   const rawChildren = Array.isArray(raw.children) ? raw.children : legacySections;
-  const children = rawChildren
-    ? rawChildren.map((child, childIndex) => normalizeOutlineNode(child, "section", childIndex))
+  const children = rawChildren && depth < MAX_OUTLINE_DEPTH
+    ? rawChildren.map((child, childIndex) => normalizeOutlineNode(child, "section", childIndex, depth + 1))
     : [];
 
   return {

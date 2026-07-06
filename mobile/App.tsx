@@ -337,7 +337,57 @@ function suggestionToNode(item: SuggestionItem, type: OutlineNode["type"]): Outl
   };
 }
 
-function parseSuggestionItems(value: unknown): SuggestionItem[] {
+function parseEndpointHost(endpoint: string): { protocol: string; host: string } | null {
+  const match = endpoint.trim().match(/^(https?):\/\/([^/?#]+)/i);
+  if (!match) return null;
+  const authority = match[2];
+  const hostPort = authority.split("@").pop() ?? authority;
+  return { protocol: match[1].toLowerCase(), host: hostPort.replace(/:\d+$/, "").toLowerCase() };
+}
+
+function isPrivateOrLoopbackHost(host: string): boolean {
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  if (host === "::1") return true;
+  if (host.startsWith("127.") || host.startsWith("10.") || host.startsWith("192.168.")) return true;
+  const octet = (prefix: string) => {
+    const m = host.match(new RegExp(`^${prefix}\\.(\\d+)\\.`));
+    return m ? Number(m[1]) : null;
+  };
+  const o172 = octet("172");
+  if (o172 !== null && o172 >= 16 && o172 <= 31) return true;
+  // CGNAT / Tailscale range 100.64.0.0/10
+  const o100 = octet("100");
+  if (o100 !== null && o100 >= 64 && o100 <= 127) return true;
+  return false;
+}
+
+/** True when a non-empty API key would be sent to a public host over plain http. */
+function sendsKeyOverCleartext(endpoint: string, apiKey: string): boolean {
+  if (!apiKey.trim()) return false;
+  const parsed = parseEndpointHost(endpoint);
+  if (!parsed || parsed.protocol !== "http") return false;
+  return !isPrivateOrLoopbackHost(parsed.host);
+}
+
+function confirmAsync(title: string, message: string, confirmLabel: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    Alert.alert(
+      title,
+      message,
+      [
+        { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+        { text: confirmLabel, style: "destructive", onPress: () => resolve(true) },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) },
+    );
+  });
+}
+
+// Cap recursion depth: suggestion JSON comes straight from an LLM and could be
+// arbitrarily/maliciously deeply nested, which would otherwise blow the stack.
+const MAX_SUGGESTION_DEPTH = 32;
+
+function parseSuggestionItems(value: unknown, depth = 0): SuggestionItem[] {
   const source = Array.isArray(value)
     ? value
     : value && typeof value === "object" && Array.isArray((value as { items?: unknown[] }).items)
@@ -357,7 +407,7 @@ function parseSuggestionItems(value: unknown): SuggestionItem[] {
           : typeof raw.description === "string"
             ? raw.description
             : "",
-        children: parseSuggestionItems(raw.children),
+        children: depth < MAX_SUGGESTION_DEPTH ? parseSuggestionItems(raw.children, depth + 1) : [],
       };
     })
     .filter((entry): entry is SuggestionItem => Boolean(entry));
@@ -1060,6 +1110,17 @@ export default function App() {
         setAssistAnswer(localAssistFallback(prompt));
         setAssistUsage(undefined);
       } else {
+        if (sendsKeyOverCleartext(endpoint, assistApiKey)) {
+          const proceed = await confirmAsync(
+            "Insecure connection",
+            "Your API key will be sent to a public server over an unencrypted http connection, where it can be intercepted. Use https instead, or continue only if you trust this network.",
+            "Send anyway",
+          );
+          if (!proceed) {
+            setStatusText("Assist cancelled: API key not sent over an unencrypted connection.");
+            return;
+          }
+        }
         const result = await runOpenAiCompatibleAssist({
           endpoint,
           apiKey: assistApiKey,

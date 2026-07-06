@@ -361,13 +361,17 @@ function normalizeResource(value: unknown, index: number): Resource {
   }
 }
 
-function normalizeOutlineNode(value: unknown, fallbackType: OutlineNodeType, index: number): OutlineNode {
+// Guard against stack overflow from deeply nested (crafted or corrupt) imported
+// outline JSON. Real books nest only a few levels deep.
+const MAX_OUTLINE_DEPTH = 32
+
+function normalizeOutlineNode(value: unknown, fallbackType: OutlineNodeType, index: number, depth = 0): OutlineNode {
   const raw = asRecord(value)
   const rawType = asString(raw.type, fallbackType) as OutlineNodeType
   const type: OutlineNodeType = rawType === 'chapter' || rawType === 'section' ? rawType : fallbackType
   const persona = asString(raw.persona, 'default') as NodePersona
-  const children = Array.isArray(raw.children)
-    ? raw.children.map((child, childIndex) => normalizeOutlineNode(child, 'section', childIndex))
+  const children = Array.isArray(raw.children) && depth < MAX_OUTLINE_DEPTH
+    ? raw.children.map((child, childIndex) => normalizeOutlineNode(child, 'section', childIndex, depth + 1))
     : []
 
   return {
@@ -525,7 +529,7 @@ function extractJsonPayload(text: string): unknown {
   }
 }
 
-function normalizeSuggestionItems(value: unknown): SuggestionItem[] {
+function normalizeSuggestionItems(value: unknown, depth = 0): SuggestionItem[] {
   const raw = asRecord(value)
   const source = Array.isArray(value) ? value : Array.isArray(raw.items) ? raw.items : []
   return source
@@ -537,7 +541,9 @@ function normalizeSuggestionItems(value: unknown): SuggestionItem[] {
         id: `suggestion-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`,
         title,
         summary: asString(item.summary) || asString(item.description),
-        children: normalizeSuggestionItems(item.children),
+        // Cap recursion: suggestion JSON comes straight from an LLM and could be
+        // arbitrarily deeply nested, which would otherwise blow the stack.
+        children: depth < MAX_OUTLINE_DEPTH ? normalizeSuggestionItems(item.children, depth + 1) : [],
       } satisfies SuggestionItem
     })
     .filter((entry): entry is SuggestionItem => Boolean(entry))
