@@ -1,5 +1,23 @@
 import type { Book } from './types'
 
+export function createId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+export async function sha256HexBytes(value: Uint8Array) {
+  if (crypto.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(value))
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  }
+  const result = await request<{ sha256: string }>('/api/digest', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: new Uint8Array(value),
+  })
+  return result.sha256
+}
+
 export class ApiError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message)
@@ -54,7 +72,7 @@ export async function saveAsset(id: string, bookId: string, fileName: string, bl
 export async function saveSnapshot(bookId: string, pageNumber: number, dataUrl: string) {
   const blob = await (await fetch(dataUrl)).blob()
   // Each snapshot has immutable bytes so existing book revisions remain consistent during replacement.
-  const id = crypto.randomUUID()
+  const id = createId()
   return saveAsset(id, bookId, `page-${pageNumber}.${blob.type === 'image/png' ? 'png' : 'jpg'}`, blob)
 }
 

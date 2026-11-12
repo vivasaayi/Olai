@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test')
 const fs = require('node:fs')
+const { execFileSync } = require('node:child_process')
 
 function samplePdf() {
   const stream = 'BT /F1 18 Tf 30 150 Td (Historical science sample) Tj ET'
@@ -59,6 +60,10 @@ test('author creates, edits, exports and reopens a book in another browser sessi
 
 test('PDF import, snapshot, translation, persistent notes and portable exports work in the browser', async ({ page, browser, request }) => {
   const errors = []
+  const digestRequests = []
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/digest') digestRequests.push(request.url())
+  })
   page.on('pageerror', error => errors.push(error.message))
   await mockModels(page)
   await page.route('**/api/llm-router/v1/chat/completions', async route => {
@@ -96,6 +101,10 @@ test('PDF import, snapshot, translation, persistent notes and portable exports w
   expect(packageDownload.suggestedFilename()).toMatch(/\.bookpkg$/)
   const packageBytes = fs.readFileSync(await packageDownload.path())
   expect(packageBytes.subarray(0, 2).toString()).toBe('PK')
+  execFileSync('python3', ['tests/verify_package.py'], { input: packageBytes })
+  if (!await page.evaluate(() => Boolean(crypto.subtle))) {
+    expect(digestRequests.length).toBeGreaterThan(0)
+  }
   expect(packageBytes.toString()).toContain('source/original.pdf')
   expect(packageBytes.toString()).toContain('image/jpeg')
   await page.getByRole('button', { name: 'Browse Exports', exact: true }).click()

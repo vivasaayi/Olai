@@ -3,6 +3,7 @@
 import base64
 import concurrent.futures
 import json
+import hashlib
 import sys
 import urllib.error
 import urllib.request
@@ -20,6 +21,10 @@ def call(path, method='GET', value=None, headers=None):
     return response.status, json.loads(body) if 'application/json' in response.headers.get('Content-Type','') else body
 
 assert call('/health')[1]['status'] == 'ok'
+binary = bytes(range(256))
+request = urllib.request.Request(base+'/api/digest', data=binary, method='POST', headers={'Content-Type':'application/octet-stream'})
+with urllib.request.urlopen(request) as response:
+    assert json.load(response)['sha256'] == hashlib.sha256(binary).hexdigest()
 assert b'<html' in call('/')[1]
 id = 'acceptance-'+uuid.uuid4().hex
 book = {'id':id,'title':'Acceptance book','outline':[],'tags':[]}

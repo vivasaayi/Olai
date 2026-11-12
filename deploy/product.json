@@ -6,7 +6,7 @@
   "database_service": null,
   "staging_port": 20480,
   "production_port": 30480,
-  "staging_bind": "127.0.0.1",
+  "staging_bind": "100.108.139.101",
   "production_bind": "127.0.0.1",
   "health_path": "/health",
   "migration_command": [
@@ -14,5 +14,6 @@
   ],
   "seed_command": [
     "seed-demo"
-  ]
+  ],
+  "worktree_bind": "100.108.139.101"
 }

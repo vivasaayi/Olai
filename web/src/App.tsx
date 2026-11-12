@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent } from 'react'
-import { listAuthorBooks, saveAuthorBook, deleteAuthorBook, saveSnapshot, saveHtmlExport, exportUrl, request } from './api'
+import { listAuthorBooks, saveAuthorBook, deleteAuthorBook, saveSnapshot, saveHtmlExport, exportUrl, request, createId, sha256HexBytes } from './api'
 import './App.css'
 import antiqueFolioUrl from './assets/mock-antique-folio.png'
 import {
@@ -193,11 +193,6 @@ const legacyRouterModel = 'gpt-5.4-nano'
 const defaultRouterEndpoint = llmRouterEndpoint
 const defaultRouterModel = llmRouterModel
 const defaultSourceExtractionModel = llmRouterSourceModel
-
-const createId = () =>
-  typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `id-${Math.random().toString(36).slice(2, 10)}`
 
 function createResource(): Resource {
   return {
@@ -1040,13 +1035,6 @@ function downloadBlobFile(fileName: string, blob: Blob) {
   URL.revokeObjectURL(link.href)
 }
 
-async function sha256HexBytes(value: Uint8Array) {
-  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(value))
-  return Array.from(new Uint8Array(digest))
-    .map((byte) => byte.toString(16).padStart(2, '0'))
-    .join('')
-}
-
 function jsonBytes(value: unknown) {
   return new TextEncoder().encode(`${JSON.stringify(value, null, 2)}\n`)
 }
@@ -1425,13 +1413,16 @@ async function buildPortablePackageFiles(
     book: bookMetadata,
   }
   const filesForManifest = [...contentFiles, ...assetFiles]
+  const packageMimeTypes: Record<string, string> = {
+    json: 'application/json',
+    pdf: 'application/pdf',
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    webp: 'image/webp',
+  }
   const fileManifest: PortablePackageFileManifest[] = await Promise.all(filesForManifest.map(async (file) => ({
     path: file.path,
-    mimeType: file.path.endsWith('.json')
-      ? 'application/json'
-      : file.path.endsWith('.pdf')
-        ? 'application/pdf'
-        : 'image/png',
+    mimeType: packageMimeTypes[file.path.split('.').pop() ?? ''] || 'application/octet-stream',
     sizeBytes: file.bytes.length,
     sha256: `sha256:${await sha256HexBytes(file.bytes)}`,
   })))

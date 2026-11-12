@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{env, path::PathBuf, time::Duration};
 use store::Store;
 use tower_http::services::{ServeDir, ServeFile};
@@ -67,6 +68,7 @@ fn validate_kind(kind: &str) -> Result<(), ApiError> {
 
 fn app(state: AppState, web: &str) -> Router {
     let api = Router::new()
+        .route("/digest", axum::routing::post(digest))
         .route("/{kind}", get(list_records))
         .route("/{kind}/{id}", get(get_record).put(save_record).delete(delete_record))
         .route("/translations/{id}/position", patch(save_position))
@@ -83,6 +85,10 @@ fn app(state: AppState, web: &str) -> Router {
         .nest("/api", api)
         .fallback_service(ServeDir::new(web).not_found_service(ServeFile::new(format!("{web}/index.html"))))
         .with_state(state)
+}
+
+async fn digest(body: Bytes) -> Json<Value> {
+    Json(json!({ "sha256": format!("{:x}", Sha256::digest(body)) }))
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

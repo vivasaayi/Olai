@@ -1,4 +1,4 @@
-import { request, putJson, saveAsset, fileDataUrl } from './api'
+import { request, putJson, saveAsset, fileDataUrl, createId as createRandomId } from './api'
 
 export type TranslationComplexity = 'original' | 'kid-friendly' | 'concept-guide' | 'simplified' | 'high-school' | 'college'
 export type TranslationLanguage = 'ml' | 'en' | 'ta' | 'hi' | 'es'
@@ -293,10 +293,7 @@ export const translationSamples: Record<TranslationComplexity, Record<Translatio
 export const seedOldBooks: OldBookRecord[] = []
 
 function createId(prefix: string) {
-  const suffix = typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-  return `${prefix}-${suffix}`
+  return `${prefix}-${createRandomId()}`
 }
 
 function openOldBooksDb(): Promise<IDBDatabase> {
@@ -657,7 +654,7 @@ export async function importBrowserDrafts() {
     for (const snapshot of book.pageSnapshots) {
       if (!snapshot.imageDataUrl) throw new Error(`Page ${snapshot.pageNumber} needs the desktop importer`)
       const blob = await (await fetch(snapshot.imageDataUrl)).blob()
-      snapshot.filePath = await saveAsset(crypto.randomUUID(), book.id, `page-${snapshot.pageNumber}`, blob)
+      snapshot.filePath = await saveAsset(createRandomId(), book.id, `page-${snapshot.pageNumber}`, blob)
       snapshot.imageDataUrl = ''
     }
     delete book._revision

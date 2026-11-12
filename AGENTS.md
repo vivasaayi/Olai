@@ -6,4 +6,6 @@ The web application uses the Rust server in `server/` and the existing React fro
 
 Run `bash scripts/test unit`, `bash scripts/test integration`, and `bash scripts/test ui` before declaring development complete. Verify environment adoption with `bash scripts/test isolation`.
 
+Run each branch in a separate Git worktree. Development and staging run on the Mac Studio and bind to its Tailscale address, so tests and browser links should use the URL returned by `python3 scripts/endpoint`. Preserve per-worktree databases, assets, networks, ports, and images. Host-specific binding overrides belong in private environment configuration as `OLAI_BIND_ADDRESS`.
+
 The actual default branch is `main`. Merge and staging deployment follow user review. Build staging from the merged clean default branch, then run `bash scripts/deploy staging` and `bash scripts/test staging`. Promote the same tested image to production when requested.

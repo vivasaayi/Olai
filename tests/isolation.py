@@ -82,6 +82,7 @@ def stable_adapter_rehearsal(image):
         'APP_IMAGE': image,
         'APP_PORT': '8080',
         'BIND_ADDRESS': '127.0.0.1',
+        'OLAI_BIND_ADDRESS': '127.0.0.1',
         'PUBLISHED_PORT': '0',
     }
     command = [

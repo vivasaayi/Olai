@@ -12,7 +12,7 @@ bash scripts/env worktree up
 python3 scripts/endpoint
 ```
 
-Open the printed URL. Each checkout/worktree has an independent Compose project, dynamic loopback port, and library volume. The initial library includes a disposable authoring sample.
+Open the printed URL from a device connected to your tailnet. The development and staging host is the Mac Studio at `100.108.139.101`. Each branch uses its own Git worktree, with an independent Compose project, dynamically assigned Tailscale port, image, and library volume. The initial library includes a disposable authoring sample.
 
 ```sh
 npm ci
@@ -50,9 +50,15 @@ bash scripts/deploy staging
 bash scripts/test staging
 ```
 
-Staging reserves `127.0.0.1:20480`. Production reserves port `30480` on the remote host and consumes an explicit tested image through `bash scripts/deploy production --image <tested-image>`. Transfer the tested platform-compatible image using a registry or Docker save/load. Environment configuration lives outside the checkout under `~/.local/share/work-environments/`.
+Staging reserves `http://100.108.139.101:20480` on the Mac Studio. Production reserves port `30480` on the remote host and consumes an explicit tested image through `bash scripts/deploy production --image <tested-image>`. Transfer the tested platform-compatible image using a registry or Docker save/load. Environment configuration lives outside the checkout under `~/.local/share/work-environments/`.
 
-This first web version is a private authoring workspace with loopback bindings. Team identities, permissions, public catalog publishing, and reader synchronization are subsequent product work. Bulk translation retains its page-by-page checkpoint/resume workflow and needs the workspace open while processing. Reloading allows it to resume saved work. Revision checks reject conflicting saves.
+Worktree and staging ports bind to the Mac Studio's Tailscale address. Browser uploads, snapshots, reading, and package exports use that same origin. Package checksums use the Rust API when browser Web Crypto is unavailable over HTTP.
+
+For a different host, set `OLAI_BIND_ADDRESS` to that host's Tailscale IPv4 address in its private environment file before starting or deploying. The launcher retains environment-specific values in `~/.local/share/work-environments/<project>/environment.env`. The variable overrides the tracked host defaults and is read by all three Compose adapters. Production starts with a loopback default until its host address is configured. Use `python3 scripts/endpoint production` to obtain the actual published URL on that host.
+
+Keep one persistent staging environment on the Mac Studio for feedback on merged `main`. Apply fixes in feature worktrees, verify them independently, merge them, and rebuild staging from the clean default branch. Before production promotion, confirm the production OS and CPU architecture and build and test a compatible Linux image in staging. Promote its exact image digest or Docker save/load artifact, with independent production storage and provider configuration. Credentials and production data stay on their deployment host.
+
+This first web version is a private authoring workspace accessed through the tailnet. Team identities, permissions, public catalog publishing, and reader synchronization are subsequent product work. Bulk translation retains its page-by-page checkpoint/resume workflow and needs the workspace open while processing. Reloading allows it to resume saved work. Revision checks reject conflicting saves.
 
 The shared environment contract is at `~/work/.org/environments.md`. Stop a worktree with `bash scripts/env worktree stop`, or remove its disposable data with `bash scripts/env worktree destroy` after merge or abandonment.
 

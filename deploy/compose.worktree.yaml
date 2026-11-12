@@ -7,7 +7,7 @@ services:
       args:
         BUILD_COMMIT: ${BUILD_COMMIT:-development}
     ports:
-      - "${BIND_ADDRESS}:${PUBLISHED_PORT}:${APP_PORT}"
+      - "${OLAI_BIND_ADDRESS:-${BIND_ADDRESS}}:${PUBLISHED_PORT}:${APP_PORT}"
     environment:
       OLAI_BIND: 0.0.0.0:8080
       OLAI_DATA_DIR: /data
