@@ -1,3 +1,63 @@
+# Olai web workspace
+
+Authoring and translation now run in a browser, served by a Rust/Axum API. SQLite stores books, translation variants, PDFs, page snapshots, and generated exports in one persistent database. The existing React frontend is reused. The original desktop and mobile sources remain in this repository.
+
+## Development on the Mac
+
+Install Docker Desktop and Node.js. A host Rust installation is optional because the container builds the server.
+
+```sh
+git switch -c your-feature
+bash scripts/env worktree up
+python3 scripts/endpoint
+```
+
+Open the printed URL. Each checkout/worktree has an independent Compose project, dynamic loopback port, and library volume. The initial library includes a disposable authoring sample.
+
+```sh
+npm ci
+npm --prefix web ci
+npx playwright install chromium
+bash scripts/test unit
+bash scripts/test integration
+bash scripts/test ui
+bash scripts/test isolation
+```
+
+For frontend hot reload, keep the worktree API running and set `OLAI_API_URL` to its printed URL when running `npm --prefix web run dev`. For a native Rust development server, run `cargo run --manifest-path server/Cargo.toml` after building `web/`. Override `OLAI_DATA_DIR`, `OLAI_BIND`, and `OLAI_WEB_DIR` as needed.
+
+The server forwards model listing and generation to `OLAI_LLM_URL`, defaulting to `http://host.docker.internal:1235/v1` in Docker. Configure the existing LLM router on the Mac with the desired local or remote provider. API keys stay in that router. An unavailable provider produces an explicit error.
+
+## Existing desktop data
+
+Use the Rust importer with a copy of the desktop `bookforge` directory. It reads authoring JSON, translation SQLite records, source PDFs, and page snapshots. Imports run transactionally and skip already imported books on retry.
+
+```sh
+OLAI_DATA_DIR=./data cargo run --manifest-path server/Cargo.toml -- import-desktop /path/to/bookforge
+```
+
+For a container deployment, run the same image with its library volume and mount the copied desktop directory read-only at `/legacy`, passing `import-desktop /legacy`. The importer requires referenced PDF and snapshot files to be present. The Translation Lab also has an **Import Browser Drafts** action for IndexedDB drafts saved at the same browser origin.
+
+## Review and promotion
+
+Development is performed on a feature branch. The actual default branch is `main`. After review and merge, build from its clean checkout and deploy staging on the Mac.
+
+```sh
+bash scripts/build staging
+bash scripts/deploy staging
+bash scripts/test staging
+```
+
+Staging reserves `127.0.0.1:20480`. Production reserves port `30480` on the remote host and consumes an explicit tested image through `bash scripts/deploy production --image <tested-image>`. Transfer the tested platform-compatible image using a registry or Docker save/load. Environment configuration lives outside the checkout under `~/.local/share/work-environments/`.
+
+This first web version is a private authoring workspace with loopback bindings. Team identities, permissions, public catalog publishing, and reader synchronization are subsequent product work. Bulk translation retains its page-by-page checkpoint/resume workflow and needs the workspace open while processing. Reloading allows it to resume saved work. Revision checks reject conflicting saves.
+
+The shared environment contract is at `~/work/.org/environments.md`. Stop a worktree with `bash scripts/env worktree stop`, or remove its disposable data with `bash scripts/env worktree destroy` after merge or abandonment.
+
+---
+
+## Original desktop product documentation
+
 # BookForge – AI-Guided Education App
 
 ## Current Implementation Status

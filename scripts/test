@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+product_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$product_root"
+case "${1:-unit}" in
+  unit)
+    docker run --rm -v "$product_root/server:/build" -v olai-rust-registry:/usr/local/cargo/registry -w /build rust:1-bookworm cargo test --locked
+    npm --prefix web run typecheck
+    npm --prefix web run build
+    ;;
+  integration|staging)
+    profile=worktree
+    if [[ "$1" == staging ]]; then profile=staging; fi
+    endpoint=$(python3 scripts/endpoint "$profile")
+    python3 tests/integration.py "$endpoint"
+    ;;
+  ui)
+    PLAYWRIGHT_BASE_URL=$(python3 scripts/endpoint worktree)
+    export PLAYWRIGHT_BASE_URL
+    npx playwright test
+    ;;
+  isolation)
+    python3 tests/isolation.py
+    ;;
+  *) echo 'Usage: scripts/test unit|integration|ui|isolation|staging' >&2; exit 2 ;;
+esac

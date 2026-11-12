@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ChangeEvent } from 'react'
-import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { listAuthorBooks, saveAuthorBook, deleteAuthorBook, saveSnapshot, saveHtmlExport, exportUrl, request } from './api'
 import './App.css'
 import antiqueFolioUrl from './assets/mock-antique-folio.png'
 import {
@@ -11,6 +11,7 @@ import {
   getOldBookFileDataUrl,
   getOldBookPdfBlob,
   importOldBookPdf,
+  importBrowserDrafts,
   languageOptions,
   mergeOldBookRecords,
   readOldBooks,
@@ -328,6 +329,7 @@ function normalizeBook(value: unknown): Book {
     : legacyChapters
 
   return {
+    _revision: typeof raw._revision === 'number' ? raw._revision : undefined,
     id: asString(raw.id) || title.toLowerCase().replace(/[^a-z0-9]+/g, '-') || createId(),
     title,
     synopsis: asString(raw.synopsis),
@@ -390,20 +392,8 @@ function formatDate(value: string | undefined) {
   return Number.isNaN(date.getTime()) ? '-' : date.toLocaleString()
 }
 
-function isTauriUnavailable(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error)
-  return message.includes('reading \'invoke\'') || message.includes('__TAURI__') || message.includes('not a function')
-}
-
 function getSnapshotImageSrc(snapshot: PageSnapshotRecord | undefined) {
-  if (!snapshot) return ''
-  if (snapshot.imageDataUrl) return snapshot.imageDataUrl
-  if (!snapshot.filePath) return ''
-  try {
-    return convertFileSrc(snapshot.filePath)
-  } catch {
-    return ''
-  }
+  return snapshot?.imageDataUrl || (snapshot?.filePath?.startsWith('/api/assets/') ? snapshot.filePath : '') || ''
 }
 
 function routerCompletionsUrl(endpoint: string) {
@@ -1051,7 +1041,7 @@ function downloadBlobFile(fileName: string, blob: Blob) {
 }
 
 async function sha256HexBytes(value: Uint8Array) {
-  const digest = await crypto.subtle.digest('SHA-256', value)
+  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(value))
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, '0'))
     .join('')
@@ -1251,17 +1241,22 @@ function buildPortableBookPackage(
   const snapshotAssets: PortableBookAsset[] = book.pageSnapshots
     .filter((snapshot) => pageNumbers.includes(snapshot.pageNumber))
     .sort((left, right) => left.pageNumber - right.pageNumber)
-    .map((snapshot) => ({
-      id: snapshot.id,
-      kind: 'page-snapshot',
-      pageNumber: snapshot.pageNumber,
-      fileName: `${slugifyFileName(book.title)}-page-${snapshot.pageNumber}.png`,
-      mimeType: 'image/png',
-      dataUrl: snapshotImages.get(snapshot.pageNumber) || snapshot.imageDataUrl || undefined,
-      path: snapshot.filePath,
-      width: snapshot.width,
-      height: snapshot.height,
-    }))
+    .map((snapshot) => {
+      const dataUrl = snapshotImages.get(snapshot.pageNumber) || snapshot.imageDataUrl || undefined
+      const mimeType = dataUrl?.match(/^data:([^;]+)/)?.[1] || 'image/png'
+      const extension = mimeType === 'image/jpeg' ? 'jpg' : mimeType === 'image/webp' ? 'webp' : 'png'
+      return {
+        id: snapshot.id,
+        kind: 'page-snapshot' as const,
+        pageNumber: snapshot.pageNumber,
+        fileName: `${slugifyFileName(book.title)}-page-${snapshot.pageNumber}.${extension}`,
+        mimeType,
+        dataUrl,
+        path: snapshot.filePath,
+        width: snapshot.width,
+        height: snapshot.height,
+      }
+    })
   const snapshotAssetByPage = new Map(snapshotAssets.map((asset) => [asset.pageNumber, asset]))
   const translationsByPage = new Map<number, typeof publishableTranslations>()
 
@@ -1343,7 +1338,7 @@ async function buildPortablePackageFiles(
 ) {
   const book = packagePayload.book
   const assetFiles: PortablePackageFile[] = []
-  const archiveAssets = book.assets.map((asset) => {
+  const archiveAssets: PortableBookAsset[] = book.assets.map((asset) => {
     if (asset.kind === 'page-snapshot' && asset.dataUrl) {
       const path = pageAssetPath(asset)
       const bytes = dataUrlToBytes(asset.dataUrl)
@@ -2205,6 +2200,7 @@ function TranslationWorkspace() {
   const [liveExportOpen, setLiveExportOpen] = useState(false)
   const [liveExportHtml, setLiveExportHtml] = useState('')
   const [liveExportTitle, setLiveExportTitle] = useState('')
+  const [exportFiles, setExportFiles] = useState<{ fileName: string, url: string, sizeBytes: number }[] | null>(null)
   const [forceRetranslate, setForceRetranslate] = useState(false)
   const [translationPageSelection, setTranslationPageSelection] = useState('all')
   const [activeTranslationJob, setActiveTranslationJob] = useState<TranslationJobState | null>(null)
@@ -2321,6 +2317,16 @@ function TranslationWorkspace() {
   const snapshotProgressPercent = snapshotProgress?.total
     ? Math.min(100, Math.max(0, Math.round((snapshotProgress.current / snapshotProgress.total) * 100)))
     : 0
+
+  async function migrateBrowserDrafts() {
+    try {
+      const count = await importBrowserDrafts()
+      setOldBooks(mergeOldBookRecords(await readOldBooks()))
+      setOldBookStatus(`Imported ${count} browser drafts.`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
+  }
 
   async function refreshVisionModels(
     endpointOverride = visionEndpoint,
@@ -2450,7 +2456,7 @@ function TranslationWorkspace() {
 
     pagePersistTimerRef.current = window.setTimeout(() => {
       pagePersistTimerRef.current = null
-      void saveOldBookRecord(updatedBook).catch((error) => {
+      void request(`/api/translations/${encodeURIComponent(updatedBook.id)}/position`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pageNumber: updatedBook.pageNumber }) }).catch((error) => {
         setOldBookStatus(error instanceof Error ? error.message : String(error))
       })
     }, 600)
@@ -2581,18 +2587,7 @@ function TranslationWorkspace() {
   }
 
   async function saveRenderedSnapshotToFolder(bookId: string, snapshot: RenderedPdfSnapshot) {
-    if (!bookId) return undefined
-
-    try {
-      return (await invoke('save_old_book_snapshot', {
-        bookId,
-        pageNumber: snapshot.pageNumber,
-        imageDataUrl: snapshot.imageDataUrl,
-      })) as string
-    } catch (error) {
-      if (isTauriUnavailable(error)) return undefined
-      throw error
-    }
+    return saveSnapshot(bookId, snapshot.pageNumber, snapshot.imageDataUrl)
   }
 
   async function getSnapshotImageDataUrl(snapshot: PageSnapshotRecord) {
@@ -3611,75 +3606,35 @@ function TranslationWorkspace() {
   }
 
   async function exportActiveBookAsHtml() {
-    if (!activeBook) return
-    setOldBookStatus('Preparing HTML export...')
-    const exportPayload = await buildActiveBookExportHtml()
-    if (!exportPayload) return
-    const { html, fileName } = exportPayload
-
-    invoke('export_old_book_html', {
-      bookId: activeBook.id,
-      fileName,
-      html,
-      reveal: true,
-    })
-      .then((filePath) => {
-        setOldBookStatus(`Exported and revealed: ${filePath}`)
-      })
-      .catch((error) => {
-        if (!isTauriUnavailable(error)) {
-          setOldBookStatus(error instanceof Error ? error.message : String(error))
-          return
-        }
-
-        downloadTextFile(fileName, html, 'text/html;charset=utf-8')
-        setOldBookStatus('Exported through the browser download folder.')
-      })
+    try {
+      const payload = await buildActiveBookExportHtml()
+      if (!activeBook || !payload) return
+      await saveHtmlExport(activeBook.id, payload.fileName, payload.html)
+      downloadTextFile(payload.fileName, payload.html, 'text/html;charset=utf-8')
+      setOldBookStatus(`Exported ${payload.fileName}.`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    }
   }
 
   async function renderActiveBookExport() {
-    if (!activeBook) return
-    setOldBookStatus('Rendering live export...')
-    const exportPayload = await buildActiveBookExportHtml()
-    if (!exportPayload) return
-    setLiveExportHtml(exportPayload.html)
-    setLiveExportTitle(exportPayload.title)
+    const payload = await buildActiveBookExportHtml()
+    if (!payload) return
+    setLiveExportHtml(payload.html)
+    setLiveExportTitle(payload.title)
     setLiveExportOpen(true)
     setOldBookStatus('Live export render ready.')
   }
 
   async function exposeActiveBookExportUrl() {
-    if (!activeBook) return
-    setOldBookStatus('Preparing browser export URL...')
-    const exportPayload = await buildActiveBookExportHtml()
-    if (!exportPayload) return
-    const { html, fileName } = exportPayload
-
     try {
-      await invoke('export_old_book_html', {
-        bookId: activeBook.id,
-        fileName,
-        html,
-        reveal: false,
-      })
-      const urlInfo = await invoke('old_book_export_http_url', {
-        bookId: activeBook.id,
-        fileName,
-      }) as { localUrl: string, networkUrl?: string | null, port: number }
-      const preferredUrl = urlInfo.networkUrl || urlInfo.localUrl
-      try {
-        await navigator.clipboard?.writeText(preferredUrl)
-      } catch {
-        // Clipboard can be unavailable depending on host permissions.
-      }
-      setOldBookStatus(
-        `Browser URL copied: ${preferredUrl}${urlInfo.networkUrl ? ` · Mac-only URL: ${urlInfo.localUrl}` : ''}`,
-      )
+      const payload = await buildActiveBookExportHtml()
+      if (!activeBook || !payload) return
+      await saveHtmlExport(activeBook.id, payload.fileName, payload.html)
+      const url = exportUrl(activeBook.id, payload.fileName)
+      try { await navigator.clipboard?.writeText(url) } catch { /* The URL is also shown below. */ }
+      setOldBookStatus(`Export URL: ${url}`)
     } catch (error) {
-      if (isTauriUnavailable(error)) {
-        setOldBookStatus('Browser URL is available only in the Tauri app.')
-        return
-      }
       setOldBookStatus(error instanceof Error ? error.message : String(error))
     }
   }
@@ -3687,53 +3642,22 @@ function TranslationWorkspace() {
   async function browseActiveBookExports() {
     if (!activeBook) return
     try {
-      const exportDir = await invoke('browse_old_book_exports', {
-        bookId: activeBook.id,
-      }) as string
-      setOldBookStatus(`Opened export folder: ${exportDir}`)
+      const result = await request<{ files: { fileName: string, url: string, sizeBytes: number }[] }>(exportUrl(activeBook.id))
+      setExportFiles(result.files)
     } catch (error) {
-      if (isTauriUnavailable(error)) {
-        setOldBookStatus('Browse Files is available only in the Tauri app.')
-        return
-      }
       setOldBookStatus(error instanceof Error ? error.message : String(error))
     }
   }
 
   async function exposeActiveBookExportApiUrl() {
     if (!activeBook) return
-    setOldBookStatus('Preparing export API URL...')
-
     try {
-      if (activeBook.translations.length) {
-        const exportPayload = await buildActiveBookExportHtml()
-        if (exportPayload) {
-          await invoke('export_old_book_html', {
-            bookId: activeBook.id,
-            fileName: exportPayload.fileName,
-            html: exportPayload.html,
-            reveal: false,
-          })
-        }
-      }
-
-      const urlInfo = await invoke('old_book_export_api_url', {
-        bookId: activeBook.id,
-      }) as { localUrl: string, networkUrl?: string | null, port: number }
-      const preferredUrl = urlInfo.networkUrl || urlInfo.localUrl
-      try {
-        await navigator.clipboard?.writeText(preferredUrl)
-      } catch {
-        // Clipboard can be unavailable depending on host permissions.
-      }
-      setOldBookStatus(
-        `Export API URL copied: ${preferredUrl}${urlInfo.networkUrl ? ` · Mac-only URL: ${urlInfo.localUrl}` : ''}`,
-      )
+      const payload = await buildActiveBookExportHtml()
+      if (payload) await saveHtmlExport(activeBook.id, payload.fileName, payload.html)
+      const url = exportUrl(activeBook.id)
+      try { await navigator.clipboard?.writeText(url) } catch { /* The URL is also shown below. */ }
+      setOldBookStatus(`Export API URL: ${url}`)
     } catch (error) {
-      if (isTauriUnavailable(error)) {
-        setOldBookStatus('Export API is available only in the Tauri app.')
-        return
-      }
       setOldBookStatus(error instanceof Error ? error.message : String(error))
     }
   }
@@ -3874,6 +3798,9 @@ function TranslationWorkspace() {
           </label>
 
           <div className="translation-actions compact-actions">
+            <button className="button secondary" type="button" onClick={() => void migrateBrowserDrafts()} disabled={oldBookBusy}>
+              Import Browser Drafts
+            </button>
             <label className="button secondary import-file-button" htmlFor="old-book-pdf-import">
               PDF Import
             </label>
@@ -3980,7 +3907,7 @@ function TranslationWorkspace() {
               disabled={!activeBook}
               type="button"
             >
-              Browse Files
+              Browse Exports
             </button>
             <button
               className="button secondary"
@@ -4206,7 +4133,7 @@ function TranslationWorkspace() {
               <div>
                 <h3>{hasImportedPdf ? 'Ask this page' : 'Ask this section'}</h3>
               </div>
-              <span>Local notes</span>
+              <span>Saved notes</span>
             </div>
             <div className="question-input-row">
               <input value={question} onChange={(event) => setQuestion(event.currentTarget.value)} />
@@ -4349,7 +4276,7 @@ function TranslationWorkspace() {
                   disabled={!activeBook}
                   type="button"
                 >
-                  Browse Files
+                  Browse Exports
                 </button>
                 <button className="icon-button" onClick={() => setLiveExportOpen(false)} type="button">x</button>
               </div>
@@ -4579,6 +4506,23 @@ function TranslationWorkspace() {
         </div>
       ) : null}
 
+      {exportFiles !== null ? (
+        <div className="modal-backdrop">
+          <section className="modal-panel" role="dialog" aria-label="Saved exports">
+            <header className="modal-header">
+              <h2>Saved exports</h2>
+              <button className="icon-button" onClick={() => setExportFiles(null)} type="button" aria-label="Close exports">x</button>
+            </header>
+            {exportFiles.length ? exportFiles.map((file) => (
+              <p key={file.url}>
+                <a href={file.url} target="_blank" rel="noreferrer">{file.fileName}</a>
+                {' · '}{formatFileSize(file.sizeBytes)}
+              </p>
+            )) : <p>No exports saved yet.</p>}
+          </section>
+        </div>
+      ) : null}
+
       {snapshotsOpen ? (
         <div className="modal-backdrop">
           <section className="modal-panel snapshot-modal">
@@ -4629,7 +4573,7 @@ function TranslationWorkspace() {
                       <img src={getSnapshotImageSrc(selectedSnapshot)} alt={`Snapshot of page ${selectedSnapshot.pageNumber}`} />
                     </div>
                     <p className="snapshot-path">
-                      {selectedSnapshot.filePath ?? 'Stored in local app database'}
+                      {selectedSnapshot.filePath ?? 'Stored in the server database'}
                     </p>
                   </>
                 ) : (
@@ -4689,7 +4633,7 @@ function App() {
   const keywordsValue = activeNode?.keywords.join(', ') ?? ''
   const activeLibraryEntry = library.find((entry) => entry.fileName === activeFileName)
   const bookTabs = useMemo<BookTab[]>(() => {
-    const tabs = library.map((entry) => ({
+    const tabs: BookTab[] = library.map((entry) => ({
       key: entry.fileName,
       label: entry.book.title,
       fileName: entry.fileName,
@@ -4745,26 +4689,19 @@ function App() {
   async function refreshLibrary() {
     setLibraryBusy(true)
     try {
-      const fileNames = (await invoke('list_books')) as string[]
-      const entries = await Promise.all(
-        fileNames
-          .filter((fileName) => fileName.endsWith('.json'))
-          .map(async (fileName) => {
-            const content = (await invoke('load_book', { fileName })) as string
-            const parsed = normalizeBook(JSON.parse(content))
-            return {
-              fileName,
-              book: parsed,
-              chapterCount: parsed.outline.filter((node) => node.type === 'chapter').length,
-              itemCount: countNodes(parsed.outline),
-            } satisfies LibraryEntry
-          }),
-      )
+      const books = await listAuthorBooks()
+      const entries = books.map((value) => {
+        const parsed = normalizeBook(value)
+        return {
+          fileName: `${parsed.id}.json`,
+          book: parsed,
+          chapterCount: parsed.outline.filter((node) => node.type === 'chapter').length,
+          itemCount: countNodes(parsed.outline),
+        } satisfies LibraryEntry
+      })
       setLibrary(entries.sort((left, right) => (right.book.updatedAt ?? '').localeCompare(left.book.updatedAt ?? '')))
     } catch (error) {
-      if (!isTauriUnavailable(error)) {
-        setStatusText(error instanceof Error ? error.message : String(error))
-      }
+      setStatusText(error instanceof Error ? error.message : String(error))
     } finally {
       setLibraryBusy(false)
     }
@@ -4783,12 +4720,11 @@ function App() {
 
   async function persistBook(bookToPersist: Book) {
     const updated = { ...bookToPersist, updatedAt: new Date().toISOString() }
-    const payload = JSON.stringify(updated, null, 2)
-    const fileName = (await invoke('save_book', { bookId: updated.id, payload })) as string
-    setBook(updated)
-    setActiveFileName(fileName)
+    const saved = await saveAuthorBook(updated)
+    setBook(saved)
+    setActiveFileName(`${saved.id}.json`)
     await refreshLibrary()
-    return updated
+    return saved
   }
 
   function openCreateBookModal(options: { tab?: WorkspaceTab } = {}) {
@@ -4839,7 +4775,7 @@ function App() {
     }
   }
 
-  async function saveToLocal() {
+  async function saveCurrentBook() {
     try {
       const saved = await persistBook(book)
       setStatusText(`Saved ${saved.title}.`)
@@ -4900,7 +4836,7 @@ function App() {
     try {
       const entry = deleteConfirm.entry
       setDeleteConfirm((current) => current ? { ...current, busy: true } : current)
-      await invoke('delete_book', { fileName: entry.fileName })
+      await deleteAuthorBook(entry.book)
       if (entry.fileName === activeFileName) {
         newBook()
       }
@@ -4996,17 +4932,6 @@ function App() {
 
   async function fetchSuggestions(targetId: string | null) {
     const prompt = buildSuggestionPrompt(targetId)
-
-    try {
-      const content = (await invoke('suggest_outline_topics', {
-        endpoint: routerEndpoint,
-        model: routerModel.trim() || 'default',
-        prompt,
-      })) as string
-      return normalizeSuggestionItems(extractJsonPayload(content))
-    } catch {
-      // Browser preview cannot use Tauri commands; fall back to direct fetch for that case.
-    }
 
     const url = routerCompletionsUrl(routerEndpoint)
     if (!url) throw new Error('Enter an LLM router endpoint.')
@@ -5106,7 +5031,7 @@ function App() {
           <h1 className="app-title">BookForge Designer</h1>
         </div>
         <div className="header-actions">
-          <button className="button" onClick={saveToLocal} type="button">
+          <button className="button" onClick={saveCurrentBook} type="button">
             Save
           </button>
           <button className="button secondary" onClick={exportStructure} type="button">
@@ -5638,7 +5563,7 @@ function App() {
             {deleteConfirm.step === 1 ? (
               <div className="delete-confirm-body">
                 <p>
-                  This removes the local JSON file for this book. Export it first if you need a separate copy.
+                  This deletes the saved book from the server. Export it first if you need a separate copy.
                 </p>
                 <dl className="delete-book-summary">
                   <div>

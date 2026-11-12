@@ -26,6 +26,7 @@ export interface OutlineNode {
 }
 
 export interface Book {
+  _revision?: number
   id: string
   title: string
   synopsis: string

@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+import json
+import pathlib
+import subprocess
+import sys
+root = pathlib.Path(__file__).resolve().parent.parent
+profile = sys.argv[1] if len(sys.argv) > 1 else 'worktree'
+plan = json.loads(subprocess.check_output(['bash', str(root/'scripts/env'), profile, 'plan'], text=True))
+containers = subprocess.check_output(['docker','ps','-q','--filter',f'label=com.docker.compose.project={plan["project"]}','--filter','label=com.docker.compose.service=app'],text=True).split()
+if len(containers) != 1:
+    raise SystemExit(f'Expected one running app for {plan["project"]}. Start its environment first.')
+info = json.loads(subprocess.check_output(['docker','inspect',containers[0]],text=True))[0]
+port = info['NetworkSettings']['Ports']['8080/tcp'][0]
+print(f'http://{port["HostIp"]}:{port["HostPort"]}')

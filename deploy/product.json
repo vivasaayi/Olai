@@ -1,0 +1,18 @@
+{
+  "id": "olai",
+  "default_branch": "main",
+  "app_service": "app",
+  "app_port": 8080,
+  "database_service": null,
+  "staging_port": 20480,
+  "production_port": 30480,
+  "staging_bind": "127.0.0.1",
+  "production_bind": "127.0.0.1",
+  "health_path": "/health",
+  "migration_command": [
+    "migrate"
+  ],
+  "seed_command": [
+    "seed-demo"
+  ]
+}

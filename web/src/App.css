@@ -808,6 +808,7 @@ select:focus,
 }
 
 .translation-view {
+  grid-template-columns: minmax(0, 1fr);
   flex: 1;
   min-height: 0;
   display: grid;
@@ -817,6 +818,7 @@ select:focus,
 }
 
 .translation-toolbar {
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 0.9rem;
@@ -846,7 +848,7 @@ select:focus,
 }
 
 .translation-compact-row-secondary {
-  grid-template-columns: minmax(300px, 0.85fr) minmax(210px, 0.55fr) minmax(210px, 0.55fr) minmax(130px, 0.35fr) minmax(420px, max-content);
+  grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr)) minmax(100px, 0.6fr);
 }
 
 .translation-title-block {
@@ -1033,7 +1035,8 @@ select:focus,
 }
 
 .translation-actions.compact-actions {
-  align-items: end;
+  grid-column: 1 / -1;
+  align-items: center;
   justify-content: flex-end;
   gap: 0.35rem;
 }
@@ -1566,7 +1569,8 @@ select:focus,
 .page-action-bar {
   flex-shrink: 0;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: stretch;
   justify-content: space-between;
   gap: 0.75rem;
   border-bottom: 1px solid #e5e7eb;
@@ -1599,7 +1603,7 @@ select:focus,
 }
 
 .page-action-buttons {
-  flex: 0 0 auto;
+  min-width: 0;
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -2115,5 +2119,46 @@ select:focus,
 
   .translation-pane {
     min-height: 620px;
+  }
+}
+
+.translation-compact-bar .force-retranslate-toggle {
+  flex-direction: row;
+  align-items: center;
+}
+
+.translation-compact-bar .force-retranslate-toggle input {
+  height: 0.9rem;
+  min-height: 0.9rem;
+}
+
+@media (max-width: 900px) {
+  .translation-compact-row-primary,
+  .translation-compact-row-secondary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .translation-title-block,
+  .translation-book-field {
+    grid-column: 1 / -1;
+  }
+
+  .translation-actions.compact-actions,
+  .page-action-buttons {
+    justify-content: flex-start;
+  }
+
+  .workspace-tabs {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 480px) {
+  .translation-compact-row-secondary {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .app-header {
+    padding: 1.25rem;
   }
 }

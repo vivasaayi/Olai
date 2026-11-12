@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import type { Book } from '../types'
+import { request } from '../api'
 
 export default function ChatPage() {
   const [models, setModels] = useState<string[]>([])
@@ -9,7 +8,8 @@ export default function ChatPage() {
   const [messages, setMessages] = useState<{ role: string; text: string }[]>([])
 
   async function refreshModels() {
-    const local = (await invoke('list_local_models')) as string[]
+    const result = await request<{ data: { id: string }[] }>('/api/llm-router/v1/models')
+    const local = result.data.map(({ id }) => id)
     setModels(local)
     if (local.length && !selected) {
       setSelected(local[0])
@@ -22,11 +22,11 @@ export default function ChatPage() {
 
   async function send() {
     if (!selected || !prompt) return
-    // The rust backend accepts filename or id. If the filename contains .bin we pass it through.
     const modelName = selected
     setMessages((m) => [...m, { role: 'user', text: prompt }])
     try {
-      const reply = (await invoke('chat_with_model', { modelName, prompt })) as string
+      const result = await request<{ choices: { message: { content: string } }[] }>('/api/llm-router/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: prompt }] }) })
+      const reply = result.choices[0].message.content
       setMessages((m) => [...m, { role: 'assistant', text: reply }])
       setPrompt('')
     } catch (err) {
@@ -37,8 +37,8 @@ export default function ChatPage() {
   return (
     <div className="panel card">
       <header className="card-header">
-        <h2>Chat (Local Model)</h2>
-        <p>Send prompts to a locally downloaded mobile model</p>
+        <h2>Model Chat</h2>
+        <p>Choose an available model and start a conversation.</p>
       </header>
       <div className="form-grid">
         <label>

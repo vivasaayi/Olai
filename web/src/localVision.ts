@@ -95,11 +95,7 @@ function fallbackCompletionsUrls(endpoint: string) {
   const primary = completionsUrl(endpoint)
   if (!primary) return []
 
-  const urls = [primary]
-  if (primary.startsWith('/api/llm-router')) {
-    urls.push(`http://localhost:1235${primary.replace(/^\/api\/llm-router/, '')}`)
-  }
-  return urls
+  return [primary]
 }
 
 function modelsUrl(endpoint: string) {

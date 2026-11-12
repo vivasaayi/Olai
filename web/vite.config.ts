@@ -6,10 +6,9 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      '/api/llm-router': {
-        target: 'http://localhost:1235',
+      '/api': {
+        target: process.env.OLAI_API_URL || 'http://127.0.0.1:8080',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api\/llm-router/, ''),
       },
     },
   },

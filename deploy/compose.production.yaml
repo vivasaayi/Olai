@@ -1,0 +1,25 @@
+services:
+  app:
+    image: ${APP_IMAGE:?Supply the product image}
+    ports:
+      - "${BIND_ADDRESS}:${PUBLISHED_PORT}:${APP_PORT}"
+    environment:
+      OLAI_BIND: 0.0.0.0:8080
+      OLAI_DATA_DIR: /data
+      OLAI_WEB_DIR: /app/web
+      OLAI_LLM_URL: ${OLAI_LLM_URL:-http://host.docker.internal:1235/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - library:/data
+    networks: [services]
+    healthcheck:
+      test: ["CMD", "olai-server", "check-health"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: "unless-stopped"
+networks:
+  services: {}
+volumes:
+  library: {}

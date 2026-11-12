@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { request, putJson, saveAsset, fileDataUrl } from './api'
 
 export type TranslationComplexity = 'original' | 'kid-friendly' | 'concept-guide' | 'simplified' | 'high-school' | 'college'
 export type TranslationLanguage = 'ml' | 'en' | 'ta' | 'hi' | 'es'
@@ -88,6 +88,7 @@ export type QuestionRecord = {
 }
 
 export type OldBookRecord = {
+  _revision?: number
   id: string
   title: string
   author: string
@@ -416,7 +417,7 @@ function normalizeOldBookRecord(value: OldBookRecord): OldBookRecord {
 }
 
 export interface OldBookRepository {
-  readonly kind: 'indexeddb' | 'tauri-sqlite'
+  readonly kind: 'indexeddb' | 'http'
   listBooks(): Promise<OldBookRecord[]>
   getBook(bookId: string): Promise<OldBookRecord | null>
   saveBookRecord(book: OldBookRecord): Promise<void>
@@ -436,42 +437,6 @@ export interface OldBookRepository {
   saveTranslationMemoryTerm(book: OldBookRecord, term: TranslationMemoryEntry): Promise<OldBookRecord>
   saveTranslationJob(book: OldBookRecord, job: TranslationJobState): Promise<OldBookRecord>
   appendQuestionAnswer(book: OldBookRecord, question: QuestionRecord): Promise<OldBookRecord>
-}
-
-async function blobToBase64(blob: Blob) {
-  return new Promise<string>((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      const result = typeof reader.result === 'string' ? reader.result : ''
-      resolve(result.includes(',') ? result.split(',', 2)[1] : result)
-    }
-    reader.onerror = () => reject(reader.error ?? new Error('Unable to read file.'))
-    reader.readAsDataURL(blob)
-  })
-}
-
-function base64ToBlob(base64: string, mimeType: string) {
-  const binary = atob(base64)
-  const chunks = []
-  for (let offset = 0; offset < binary.length; offset += 8192) {
-    const slice = binary.slice(offset, offset + 8192)
-    const bytes = new Uint8Array(slice.length)
-    for (let index = 0; index < slice.length; index += 1) {
-      bytes[index] = slice.charCodeAt(index)
-    }
-    chunks.push(bytes)
-  }
-  return new Blob(chunks, { type: mimeType || 'application/pdf' })
-}
-
-function isTauriUnavailable(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error)
-  return message.includes('__TAURI_INTERNALS__')
-    || message.includes('__TAURI__')
-    || message.includes('reading \'invoke\'')
-    || message.includes('not available')
-    || message.includes('is not a function')
-    || message.includes('unknown command')
 }
 
 function upsertById<T extends { id: string }>(items: T[], item: T) {
@@ -635,106 +600,71 @@ class IndexedDbOldBookRepository extends BaseOldBookRepository {
   }
 }
 
-class TauriSqliteOldBookRepository extends BaseOldBookRepository {
-  readonly kind = 'tauri-sqlite' as const
-
-  async isAvailable() {
-    await invoke('old_book_sqlite_available')
-  }
+class HttpOldBookRepository extends BaseOldBookRepository {
+  readonly kind = 'http' as const
 
   async listBooks() {
-    const records = (await invoke('old_book_sqlite_list_records')) as string[]
-    return records.map((record) => normalizeOldBookRecord(JSON.parse(record) as OldBookRecord))
+    return (await request<OldBookRecord[]>('/api/translations')).map(normalizeOldBookRecord)
   }
 
   async saveBookRecord(book: OldBookRecord) {
-    await invoke('old_book_sqlite_save_record', { payload: JSON.stringify(prepareBookForTauriSqliteStorage(book)) })
+    const payload = normalizeOldBookRecord(book)
+    payload.pageSnapshots = payload.pageSnapshots.map((snapshot) => ({
+      ...snapshot,
+      imageDataUrl: snapshot.filePath ? '' : snapshot.imageDataUrl,
+    }))
+    const saved = await putJson<OldBookRecord>(`/api/translations/${encodeURIComponent(book.id)}`, payload)
+    book._revision = saved._revision
   }
 
   async importPdf(file: File) {
-    const importedBook = createImportedOldBook(file)
-    await this.saveBookRecord(importedBook)
-    const pdfFilePath = await this.savePdfAsset(importedBook.pdfBlobId!, file, file.name, importedBook.id)
-    const bookWithAsset = { ...importedBook, pdfFilePath }
-    await this.saveBookRecord(bookWithAsset)
-    return bookWithAsset
+    const book = createImportedOldBook(file)
+    const path = await this.savePdfAsset(book.pdfBlobId!, file, file.name, book.id)
+    book.pdfFilePath = path
+    await this.saveBookRecord(book)
+    return book
   }
 
   async savePdfAsset(pdfBlobId: string, blob: Blob, fileName: string, bookId?: string) {
-    return (await invoke('old_book_sqlite_save_pdf_asset', {
-      bookId: bookId ?? pdfBlobId,
-      pdfBlobId,
-      fileName,
-      pdfBase64: await blobToBase64(blob),
-    })) as string
+    return saveAsset(pdfBlobId, bookId ?? pdfBlobId, fileName, blob)
   }
 
   async getPdfAsset(pdfBlobId: string) {
-    const asset = (await invoke('old_book_sqlite_get_pdf_asset', { pdfBlobId })) as StoredPdfAsset | null
-    return asset ? base64ToBlob(asset.base64, asset.mimeType) : null
-  }
-
-}
-
-function prepareBookForTauriSqliteStorage(book: OldBookRecord): OldBookRecord {
-  const normalizedBook = normalizeOldBookRecord(book)
-  return {
-    ...normalizedBook,
-    pageSnapshots: normalizedBook.pageSnapshots.map((snapshot) => ({
-      ...snapshot,
-      imageDataUrl: snapshot.filePath ? '' : snapshot.imageDataUrl,
-    })),
+    const response = await fetch(`/api/assets/${encodeURIComponent(pdfBlobId)}`)
+    if (response.status === 404) return null
+    if (!response.ok) throw new Error(`Could not load PDF (${response.status})`)
+    return response.blob()
   }
 }
 
-const indexedDbOldBookRepository = new IndexedDbOldBookRepository()
-let oldBookRepositoryPromise: Promise<OldBookRepository> | null = null
+const httpOldBookRepository = new HttpOldBookRepository()
+export async function getOldBookRepository(): Promise<OldBookRepository> {
+  return httpOldBookRepository
+}
 
-async function migrateIndexedDbOldBooksToSqlite(sqliteRepository: TauriSqliteOldBookRepository) {
-  const sqliteBooks = await sqliteRepository.listBooks()
-  if (sqliteBooks.length > 0) return
-
-  let indexedDbBooks: OldBookRecord[] = []
-  try {
-    indexedDbBooks = await indexedDbOldBookRepository.listBooks()
-  } catch (error) {
-    if (!String(error).includes('IndexedDB')) throw error
-  }
-
-  for (const book of indexedDbBooks) {
-    let bookForSave = book
-    await sqliteRepository.saveBookRecord(bookForSave)
+// Explicit migration for drafts created in the browser preview before the server existed.
+export async function importBrowserDrafts() {
+  const local = new IndexedDbOldBookRepository()
+  const existing = new Set((await httpOldBookRepository.listBooks()).map((book) => book.id))
+  let imported = 0
+  for (const book of await local.listBooks()) {
+    if (existing.has(book.id)) continue
     if (book.pdfBlobId) {
-      const blob = await indexedDbOldBookRepository.getPdfAsset(book.pdfBlobId)
-      if (blob) {
-        const pdfFilePath = await sqliteRepository.savePdfAsset(
-          book.pdfBlobId,
-          blob,
-          book.pdfFileName ?? 'original.pdf',
-          book.id,
-        )
-        bookForSave = { ...bookForSave, pdfFilePath }
-        await sqliteRepository.saveBookRecord(bookForSave)
-      }
+      const blob = await local.getPdfAsset(book.pdfBlobId)
+      if (!blob) throw new Error(`PDF missing for ${book.title}`)
+      book.pdfFilePath = await httpOldBookRepository.savePdfAsset(book.pdfBlobId, blob, book.pdfFileName || 'original.pdf', book.id)
     }
+    for (const snapshot of book.pageSnapshots) {
+      if (!snapshot.imageDataUrl) throw new Error(`Page ${snapshot.pageNumber} needs the desktop importer`)
+      const blob = await (await fetch(snapshot.imageDataUrl)).blob()
+      snapshot.filePath = await saveAsset(crypto.randomUUID(), book.id, `page-${snapshot.pageNumber}`, blob)
+      snapshot.imageDataUrl = ''
+    }
+    delete book._revision
+    await httpOldBookRepository.saveBookRecord(book)
+    imported += 1
   }
-}
-
-export async function getOldBookRepository() {
-  oldBookRepositoryPromise ??= (async () => {
-    const sqliteRepository = new TauriSqliteOldBookRepository()
-    try {
-      await sqliteRepository.isAvailable()
-      await migrateIndexedDbOldBooksToSqlite(sqliteRepository)
-      return sqliteRepository
-    } catch (error) {
-      if (isTauriUnavailable(error)) {
-        return indexedDbOldBookRepository
-      }
-      throw error
-    }
-  })()
-  return oldBookRepositoryPromise
+  return imported
 }
 
 export function mergeOldBookRecords(storedBooks: OldBookRecord[]) {
@@ -774,8 +704,7 @@ export async function getOldBookPdfBlob(pdfBlobId: string) {
 }
 
 export async function getOldBookFileDataUrl(filePath: string) {
-  const asset = (await invoke('old_book_sqlite_get_file_data_url', { filePath })) as StoredFileAsset
-  return asset.dataUrl
+  return fileDataUrl(filePath)
 }
 
 export function createImportedOldBook(file: File): OldBookRecord {
