@@ -24,6 +24,8 @@ bash scripts/test ui
 bash scripts/test isolation
 ```
 
+The isolation check starts two disposable Git worktrees and verifies separate authoring books, translations, PDF assets, ports, and volumes. It also exercises the staging Compose configuration in an ephemeral rehearsal project, checking image identity and data persistence across replacement. Actual staging deployment follows review and merge.
+
 For frontend hot reload, keep the worktree API running and set `OLAI_API_URL` to its printed URL when running `npm --prefix web run dev`. For a native Rust development server, run `cargo run --manifest-path server/Cargo.toml` after building `web/`. Override `OLAI_DATA_DIR`, `OLAI_BIND`, and `OLAI_WEB_DIR` as needed.
 
 The server forwards model listing and generation to `OLAI_LLM_URL`, defaulting to `http://host.docker.internal:1235/v1` in Docker. Configure the existing LLM router on the Mac with the desired local or remote provider. API keys stay in that router. An unavailable provider produces an explicit error.
