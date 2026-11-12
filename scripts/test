@@ -8,9 +8,9 @@ case "${1:-unit}" in
     npm --prefix web run typecheck
     npm --prefix web run build
     ;;
-  integration|staging)
+  integration|staging|production)
     profile=worktree
-    if [[ "$1" == staging ]]; then profile=staging; fi
+    if [[ "$1" != integration ]]; then profile="$1"; fi
     endpoint=$(python3 scripts/endpoint "$profile")
     python3 tests/integration.py "$endpoint"
     ;;
@@ -22,5 +22,5 @@ case "${1:-unit}" in
   isolation)
     python3 tests/isolation.py
     ;;
-  *) echo 'Usage: scripts/test unit|integration|ui|isolation|staging' >&2; exit 2 ;;
+  *) echo 'Usage: scripts/test unit|integration|ui|isolation|staging|production' >&2; exit 2 ;;
 esac
