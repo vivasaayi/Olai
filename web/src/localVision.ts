@@ -487,6 +487,71 @@ export async function requestVisionTranslation({
   return normalizeVisionTranslation(content, fallbackSectionTitle)
 }
 
+export type ColumnLayoutResult = {
+  cuts: number[]
+  columns: number
+  confidence: number
+}
+
+/**
+ * Ask a vision model where the column / two-page-spread gutters are. Used as the
+ * "power tier" escalation when the deterministic detector is low-confidence.
+ * Returns interior vertical cut fractions (0..1) in left-to-right reading order.
+ */
+export async function requestColumnLayout({
+  endpoint,
+  model,
+  imageDataUrl,
+  signal,
+}: {
+  endpoint: string
+  model: string
+  imageDataUrl: string
+  signal?: AbortSignal
+}): Promise<ColumnLayoutResult> {
+  const content = await sendVisionChat(endpoint, {
+    model: model.trim() || 'default',
+    ...modelRuntimeControls(model),
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'You analyze scanned book page images for layout only. You do not transcribe text.',
+          'Identify how many vertical text columns the page has, treating a two-page spread as multiple columns split at the binding gutter.',
+          'Report the vertical boundaries BETWEEN columns as fractions of the page width from the left edge (0 = left edge, 1 = right edge).',
+          'Exclude the outer page margins. Only report interior gutters between blocks of text. A single-column page has an empty list.',
+          'Order boundaries left to right, which is the reading order. Return compact JSON only, no markdown.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Return JSON only with this shape: {"columns": <integer>, "columnCuts": [<fraction between 0 and 1>], "confidence": <0..1>}. columnCuts must have exactly columns-1 entries.',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: imageDataUrl },
+          },
+        ],
+      },
+    ],
+    temperature: 0,
+  }, signal)
+
+  const payload = asRecord(parseJsonish(content))
+  const rawCuts = Array.isArray(payload.columnCuts) ? payload.columnCuts : []
+  const cuts = rawCuts
+    .map((value) => (typeof value === 'number' ? value : Number(value)))
+    .filter((value) => Number.isFinite(value) && value > 0.02 && value < 0.98)
+    .sort((left, right) => left - right)
+  const confidence = typeof payload.confidence === 'number'
+    ? Math.min(1, Math.max(0, payload.confidence))
+    : 0.7
+  return { cuts, columns: cuts.length + 1, confidence }
+}
+
 export async function requestTextTranslation({
   endpoint,
   model,

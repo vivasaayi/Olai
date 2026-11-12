@@ -1,4 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
+import type { PageRegion } from './pageSplit'
+
+export type { PageRegion } from './pageSplit'
 
 export type TranslationComplexity = 'original' | 'kid-friendly' | 'concept-guide' | 'simplified' | 'high-school' | 'college'
 export type TranslationLanguage = 'ml' | 'en' | 'ta' | 'hi' | 'es'
@@ -59,6 +62,10 @@ export type PageSnapshotRecord = {
   height: number
   filePath?: string
   createdAt: string
+  // Ordered reading-order regions (normalized 0..1 fractions of the full image)
+  // for multi-column / two-page-spread pages. Absent or single-whole-page means
+  // the page is OCR'd as one image.
+  regions?: PageRegion[]
 }
 
 export type TranslationRecord = {
@@ -106,6 +113,9 @@ export type OldBookRecord = {
   importedAt?: string
   pageSnapshots: PageSnapshotRecord[]
   snapshotJobs: SnapshotJobState[]
+  // Default column/spread split applied to newly captured page snapshots
+  // (normalized 0..1 regions). Editable per book from the snapshot viewer.
+  defaultPageRegions?: PageRegion[]
   translations: TranslationRecord[]
   translationMemory: TranslationMemoryEntry[]
   translationJobs: TranslationJobState[]
@@ -399,12 +409,42 @@ function normalizeTranslationRecord(translation: TranslationRecord): Translation
   })
 }
 
+function clamp01(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(1, Math.max(0, value))
+    : fallback
+}
+
+function normalizePageRegions(value: unknown): PageRegion[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const regions = value
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === 'object')
+    .map((entry, index) => ({
+      id: typeof entry.id === 'string' && entry.id ? entry.id : `region-${index}`,
+      order: typeof entry.order === 'number' ? entry.order : index,
+      x: clamp01(entry.x, 0),
+      y: clamp01(entry.y, 0),
+      width: clamp01(entry.width, 1),
+      height: clamp01(entry.height, 1),
+    }))
+    .filter((region) => region.width > 0.001 && region.height > 0.001)
+    .sort((a, b) => a.order - b.order)
+    .map((region, index) => ({ ...region, order: index }))
+  return regions.length ? regions : undefined
+}
+
+function normalizePageSnapshot(snapshot: PageSnapshotRecord): PageSnapshotRecord {
+  const regions = normalizePageRegions((snapshot as { regions?: unknown }).regions)
+  return regions ? { ...snapshot, regions } : { ...snapshot, regions: undefined }
+}
+
 function normalizeOldBookRecord(value: OldBookRecord): OldBookRecord {
   return {
     ...value,
     tags: Array.isArray(value.tags) ? value.tags : [],
     pageNumber: value.pageNumber || 1,
-    pageSnapshots: Array.isArray(value.pageSnapshots) ? value.pageSnapshots : [],
+    pageSnapshots: Array.isArray(value.pageSnapshots) ? value.pageSnapshots.map(normalizePageSnapshot) : [],
+    defaultPageRegions: normalizePageRegions(value.defaultPageRegions),
     snapshotJobs: Array.isArray(value.snapshotJobs) ? value.snapshotJobs : [],
     translations: Array.isArray(value.translations) ? value.translations.map(normalizeTranslationRecord) : [],
     translationMemory: Array.isArray(value.translationMemory) ? value.translationMemory : [],
@@ -943,6 +983,7 @@ export function createPageSnapshotRecord(
   width: number,
   height: number,
   filePath?: string,
+  regions?: PageRegion[],
 ): PageSnapshotRecord {
   return {
     id: createId('snapshot'),
@@ -952,5 +993,6 @@ export function createPageSnapshotRecord(
     height,
     filePath,
     createdAt: new Date().toISOString(),
+    regions: regions && regions.length ? regions : undefined,
   }
 }

@@ -2195,6 +2195,105 @@ select:focus,
   white-space: nowrap;
 }
 
+.split-badge {
+  display: inline-block;
+  margin-top: 0.15rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: #145d52;
+  color: #ffffff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  width: fit-content;
+}
+
+.snapshot-split-stage {
+  touch-action: none;
+}
+
+.split-image-wrap {
+  position: relative;
+  display: block;
+  max-width: min(100%, 820px);
+  margin: 0 auto;
+  line-height: 0;
+}
+
+.split-image-wrap img {
+  max-width: 100%;
+  width: 100%;
+}
+
+.split-cut {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  transform: translateX(-1px);
+  border-left: 2px dashed #ffb020;
+  cursor: ew-resize;
+  z-index: 2;
+}
+
+.split-cut::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -7px;
+  width: 16px;
+}
+
+.split-cut.dragging {
+  border-left-color: #ff6a00;
+  border-left-style: solid;
+}
+
+.split-cut-remove {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: #ff6a00;
+  color: #ffffff;
+  font-size: 0.7rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.snapshot-split-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  border-top: 1px solid #dfe5ec;
+  padding: 0.55rem 0.75rem;
+  background: #ffffff;
+}
+
+.split-toolbar-spacer {
+  flex: 1;
+}
+
+.mini-button.primary {
+  background: #145d52;
+  border-color: #145d52;
+  color: #ffffff;
+}
+
+.mini-button.primary:hover {
+  background: #0f4a41;
+}
+
 .delete-modal {
   width: min(560px, 100%);
 }

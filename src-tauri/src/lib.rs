@@ -1,8 +1,11 @@
+mod page_split;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             app_data_dir,
+            page_split::detect_page_regions,
             save_book,
             load_book,
             list_books,

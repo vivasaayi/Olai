@@ -29,6 +29,7 @@ import {
 } from './oldBooksStore'
 import {
   listVisionModels,
+  requestColumnLayout,
   requestTextTranslation,
   requestTranslationMemoryReview,
   requestVisionAnswer,
@@ -37,6 +38,13 @@ import {
   type VisionTranslationResult,
 } from './localVision'
 import { getPdfPageCount, renderPdfPageSnapshot, renderPdfPageSnapshotsParallelStream, type RenderedPdfSnapshot } from './pdfPageSnapshot'
+import {
+  cropRegionFromImage,
+  cutsToRegions,
+  detectColumnCuts,
+  regionsToCuts,
+  type PageRegion,
+} from './pageSplit'
 import type { Book, NodePersona, OutlineNode, OutlineNodeType, Resource, ResourceType } from './types'
 
 type LibraryEntry = {
@@ -1143,6 +1151,20 @@ function decodeHtmlEntities(value: string) {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
+}
+
+// Merge per-region glossaries from a split page, keeping the first entry for each
+// source term so duplicates across columns don't pile up.
+function dedupeGlossaryEntries(entries: TranslationGlossaryEntry[]): TranslationGlossaryEntry[] {
+  const seen = new Set<string>()
+  const merged: TranslationGlossaryEntry[] = []
+  for (const entry of entries) {
+    const key = (entry.sourceTerm || entry.englishTerm || entry.translatedTerm || '').trim().toLowerCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    merged.push(entry)
+  }
+  return merged
 }
 
 function stripHtml(value: string) {
@@ -2866,6 +2888,11 @@ function TranslationWorkspace() {
   const [snapshotsOpen, setSnapshotsOpen] = useState(false)
   const [activeSnapshotPage, setActiveSnapshotPage] = useState<number | null>(null)
   const [snapshotViewMode, setSnapshotViewMode] = useState<'all' | 'page'>('all')
+  // Column/spread split editor for the selected snapshot: working cut fractions.
+  const [splitCuts, setSplitCuts] = useState<number[]>([])
+  const [splitDetecting, setSplitDetecting] = useState(false)
+  const [draggingCutIndex, setDraggingCutIndex] = useState<number | null>(null)
+  const splitStageRef = useRef<HTMLDivElement | null>(null)
   const [memoryOpen, setMemoryOpen] = useState(false)
   const [sourceInspectorOpen, setSourceInspectorOpen] = useState(false)
   const [sourceInspectorTab, setSourceInspectorTab] = useState<'source' | 'faithful'>('source')
@@ -2997,6 +3024,165 @@ function TranslationWorkspace() {
     ?? sortedSnapshots.find((snapshot) => snapshot.pageNumber === activeBook?.pageNumber)
     ?? sortedSnapshots[0]
   const snapshotBrowserItems = snapshotViewMode === 'page' && selectedSnapshot ? [selectedSnapshot] : sortedSnapshots
+
+  // Load the selected snapshot's saved split into the editor when it changes.
+  useEffect(() => {
+    if (!selectedSnapshot) {
+      setSplitCuts([])
+      return
+    }
+    const saved = selectedSnapshot.regions?.length ? regionsToCuts(selectedSnapshot.regions) : []
+    setSplitCuts(saved)
+    setDraggingCutIndex(null)
+  }, [selectedSnapshot?.id])
+
+  function regionsFromCuts(cuts: number[]): PageRegion[] | undefined {
+    const regions = cutsToRegions(cuts)
+    return regions.length > 1 ? regions : undefined
+  }
+
+  // Confidence below this from the deterministic detector triggers an automatic
+  // LLM escalation (the "power tier").
+  const SPLIT_CONFIDENCE_FLOOR = 0.45
+
+  // Stage 1: deterministic detection. Prefer the pure-Rust backend (deskew +
+  // XY-cut); fall back to the in-browser projection profile on mobile / web where
+  // the Tauri command isn't available.
+  async function detectColumnsDeterministic(
+    imageDataUrl: string,
+  ): Promise<{ cuts: number[]; confidence: number; source: string }> {
+    try {
+      const result = await invoke('detect_page_regions', { imageDataUrl }) as {
+        cuts?: number[]
+        confidence?: number
+      }
+      return {
+        cuts: Array.isArray(result.cuts) ? result.cuts : [],
+        confidence: typeof result.confidence === 'number' ? result.confidence : 0,
+        source: 'backend',
+      }
+    } catch (error) {
+      if (!isTauriUnavailable(error)) {
+        console.warn('Backend column detection failed; using in-browser detector.', error)
+      }
+      const cuts = await detectColumnCuts(imageDataUrl)
+      return { cuts, confidence: cuts.length ? 0.5 : 0.85, source: 'in-browser' }
+    }
+  }
+
+  // Stage 2 (power tier): ask the vision model for the column layout.
+  async function detectColumnsWithAi(imageDataUrl: string): Promise<number[]> {
+    const layout = await requestColumnLayout({
+      endpoint: visionEndpoint,
+      model: visionModel,
+      imageDataUrl,
+    })
+    return layout.cuts
+  }
+
+  async function detectSnapshotSplit() {
+    if (!selectedSnapshot) return
+    if (!getSnapshotImageSrc(selectedSnapshot)) {
+      setOldBookStatus('This snapshot has no image to analyze.')
+      return
+    }
+    setSplitDetecting(true)
+    try {
+      const imageDataUrl = await getSnapshotImageDataUrl(selectedSnapshot)
+      const detected = await detectColumnsDeterministic(imageDataUrl)
+      let cuts = detected.cuts
+      let note = `${detected.source} detector`
+
+      // Escalate to the vision model when the deterministic pass is unsure.
+      if (detected.confidence < SPLIT_CONFIDENCE_FLOOR) {
+        try {
+          setOldBookStatus(`Low-confidence layout on page ${selectedSnapshot.pageNumber} — asking the vision model...`)
+          const aiCuts = await detectColumnsWithAi(imageDataUrl)
+          cuts = aiCuts
+          note = 'vision model'
+        } catch (error) {
+          console.warn('Vision-model column detection failed; keeping deterministic result.', error)
+          note = `${detected.source} detector (AI escalation unavailable)`
+        }
+      }
+
+      setSplitCuts(cuts)
+      setOldBookStatus(cuts.length
+        ? `Detected ${cuts.length + 1} columns on page ${selectedSnapshot.pageNumber} via ${note}. Adjust and apply.`
+        : `No column split detected on page ${selectedSnapshot.pageNumber} via ${note}.`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSplitDetecting(false)
+    }
+  }
+
+  async function detectSnapshotSplitWithAi() {
+    if (!selectedSnapshot) return
+    if (!getSnapshotImageSrc(selectedSnapshot)) {
+      setOldBookStatus('This snapshot has no image to analyze.')
+      return
+    }
+    setSplitDetecting(true)
+    try {
+      const imageDataUrl = await getSnapshotImageDataUrl(selectedSnapshot)
+      const cuts = await detectColumnsWithAi(imageDataUrl)
+      setSplitCuts(cuts)
+      setOldBookStatus(cuts.length
+        ? `Vision model detected ${cuts.length + 1} columns on page ${selectedSnapshot.pageNumber}. Adjust and apply.`
+        : `Vision model found no column split on page ${selectedSnapshot.pageNumber}.`)
+    } catch (error) {
+      setOldBookStatus(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSplitDetecting(false)
+    }
+  }
+
+  function addSnapshotSplitCut() {
+    setSplitCuts((current) => {
+      const bounds = [0, ...[...current].sort((a, b) => a - b), 1]
+      let bestMid = 0.5
+      let bestSpan = -1
+      for (let index = 0; index < bounds.length - 1; index += 1) {
+        const span = bounds[index + 1] - bounds[index]
+        if (span > bestSpan) {
+          bestSpan = span
+          bestMid = (bounds[index] + bounds[index + 1]) / 2
+        }
+      }
+      return [...current, bestMid]
+    })
+  }
+
+  function updateDraggedCut(clientX: number) {
+    const stage = splitStageRef.current
+    if (!stage || draggingCutIndex === null) return
+    const rect = stage.getBoundingClientRect()
+    if (rect.width <= 0) return
+    const fraction = Math.min(0.98, Math.max(0.02, (clientX - rect.left) / rect.width))
+    setSplitCuts((current) => current.map((cut, index) => (index === draggingCutIndex ? fraction : cut)))
+  }
+
+  async function applySnapshotSplit() {
+    if (!activeBook || !selectedSnapshot) return
+    const regions = regionsFromCuts(splitCuts)
+    const updatedSnapshots = activeBook.pageSnapshots.map((entry) =>
+      entry.id === selectedSnapshot.id ? { ...entry, regions } : entry,
+    )
+    await persistOldBook({ ...activeBook, pageSnapshots: updatedSnapshots })
+    setOldBookStatus(regions
+      ? `Saved ${regions.length}-region split for page ${selectedSnapshot.pageNumber}.`
+      : `Cleared split for page ${selectedSnapshot.pageNumber}.`)
+  }
+
+  async function saveSplitAsBookDefault() {
+    if (!activeBook) return
+    const regions = regionsFromCuts(splitCuts)
+    await persistOldBook({ ...activeBook, defaultPageRegions: regions })
+    setOldBookStatus(regions
+      ? `Set a ${regions.length}-region split as the default for new snapshots in ${activeBook.title}.`
+      : `Cleared the default split for ${activeBook.title}.`)
+  }
   const translationMemoryRows = useMemo(() => getTranslationMemoryRows(activeBook), [activeBook])
   const approvedMemoryCount = translationMemoryRows.filter((entry) => entry.approved).length
   const displayedTranslationJob = activeTranslationJob
@@ -3330,6 +3516,7 @@ function TranslationWorkspace() {
       renderedSnapshot.width,
       renderedSnapshot.height,
       await saveRenderedSnapshotToFolder(bookToSnapshot.id, renderedSnapshot),
+      bookToSnapshot.defaultPageRegions,
     )
     const existingSnapshots = bookToSnapshot.pageSnapshots.filter((entry) => entry.pageNumber !== snapshot.pageNumber)
     const updatedBook = await persistOldBook({
@@ -3366,6 +3553,7 @@ function TranslationWorkspace() {
       renderedSnapshot.width,
       renderedSnapshot.height,
       await saveRenderedSnapshotToFolder(bookToSnapshot.id, renderedSnapshot),
+      bookToSnapshot.defaultPageRegions,
     )
     const updatedBook = {
       ...bookToSnapshot,
@@ -3546,6 +3734,7 @@ function TranslationWorkspace() {
             renderedSnapshot.width,
             renderedSnapshot.height,
             await saveRenderedSnapshotToFolder(activeBook.id, renderedSnapshot),
+            activeBook.defaultPageRegions,
           )
           if (!snapshotRecordPages.has(snapshotRecord.pageNumber)) {
             snapshotRecordPages.add(snapshotRecord.pageNumber)
@@ -3627,35 +3816,99 @@ function TranslationWorkspace() {
 
   async function createOriginalTranslationFromSnapshot(
     bookForTranslation: OldBookRecord,
-    snapshotImageDataUrl: string,
+    snapshot: PageSnapshotRecord,
     signal?: AbortSignal,
   ) {
-    const result = await requestVisionTranslation({
-      endpoint: visionEndpoint,
-      model: sourceExtractionModel,
-      imageDataUrl: snapshotImageDataUrl,
-      bookTitle: bookForTranslation.title,
-      pageNumber: bookForTranslation.pageNumber,
-      complexityLabel: 'Original',
-      languageLabel: 'English',
-      complexity: 'original',
-      language: 'en',
-      previousOriginalParagraphs: getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)?.paragraphs,
-      previousSourceLines: getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)?.sourceLines,
-      priorGlossary: getPriorGlossary(bookForTranslation),
-      signal,
-    })
+    const fullImageDataUrl = await getSnapshotImageDataUrl(snapshot)
+    // Multi-column / two-page-spread pages are cut into ordered regions so each
+    // column is OCR'd on its own and the model can't read across the gutter.
+    const orderedRegions = snapshot.regions && snapshot.regions.length > 1
+      ? [...snapshot.regions].sort((a, b) => a.order - b.order)
+      : []
+
+    const priorOriginal = getPreviousOriginalTranslation(bookForTranslation, sourceExtractionModel)
+    const priorGlossary = getPriorGlossary(bookForTranslation)
+
+    if (orderedRegions.length <= 1) {
+      const result = await requestVisionTranslation({
+        endpoint: visionEndpoint,
+        model: sourceExtractionModel,
+        imageDataUrl: fullImageDataUrl,
+        bookTitle: bookForTranslation.title,
+        pageNumber: bookForTranslation.pageNumber,
+        complexityLabel: 'Original',
+        languageLabel: 'English',
+        complexity: 'original',
+        language: 'en',
+        previousOriginalParagraphs: priorOriginal?.paragraphs,
+        previousSourceLines: priorOriginal?.sourceLines,
+        priorGlossary,
+        signal,
+      })
+
+      return createTranslationRecord(
+        bookForTranslation,
+        'original',
+        'en',
+        result.sectionTitle || `Page ${bookForTranslation.pageNumber}`,
+        {
+          paragraphs: result.paragraphs,
+          sourceLines: result.sourceLines,
+          glossary: result.glossary,
+          notes: result.notes,
+          model: sourceExtractionModel,
+          sourceModel: sourceExtractionModel,
+        },
+      )
+    }
+
+    // OCR each region in reading order, stitching the passes into one page. Each
+    // region is fed the running transcript of earlier regions (plus the previous
+    // page) as continuity context so sentence flow survives the column breaks.
+    const paragraphs: string[] = []
+    const sourceLines: string[] = []
+    const glossary: TranslationGlossaryEntry[] = []
+    const notes: string[] = []
+    let sectionTitle = ''
+    let contextParagraphs = priorOriginal?.paragraphs ?? []
+    let contextSourceLines = priorOriginal?.sourceLines ?? []
+
+    for (const region of orderedRegions) {
+      const regionImageDataUrl = await cropRegionFromImage(fullImageDataUrl, region)
+      const result = await requestVisionTranslation({
+        endpoint: visionEndpoint,
+        model: sourceExtractionModel,
+        imageDataUrl: regionImageDataUrl,
+        bookTitle: bookForTranslation.title,
+        pageNumber: bookForTranslation.pageNumber,
+        complexityLabel: 'Original',
+        languageLabel: 'English',
+        complexity: 'original',
+        language: 'en',
+        previousOriginalParagraphs: contextParagraphs,
+        previousSourceLines: contextSourceLines,
+        priorGlossary,
+        signal,
+      })
+      if (!sectionTitle && result.sectionTitle) sectionTitle = result.sectionTitle
+      paragraphs.push(...result.paragraphs)
+      sourceLines.push(...result.sourceLines)
+      if (result.glossary?.length) glossary.push(...result.glossary)
+      if (result.notes?.length) notes.push(...result.notes)
+      contextParagraphs = [...contextParagraphs, ...result.paragraphs]
+      contextSourceLines = [...contextSourceLines, ...result.sourceLines]
+    }
 
     return createTranslationRecord(
       bookForTranslation,
       'original',
       'en',
-      result.sectionTitle || `Page ${bookForTranslation.pageNumber}`,
+      sectionTitle || `Page ${bookForTranslation.pageNumber}`,
       {
-        paragraphs: result.paragraphs,
-        sourceLines: result.sourceLines,
-        glossary: result.glossary,
-        notes: result.notes,
+        paragraphs,
+        sourceLines,
+        glossary: dedupeGlossaryEntries(glossary),
+        notes,
         model: sourceExtractionModel,
         sourceModel: sourceExtractionModel,
       },
@@ -3739,7 +3992,7 @@ function TranslationWorkspace() {
           setOldBookStatus(`Transcribing source text and creating Original English for page ${updatedBook.pageNumber}...`)
           originalTranslation = await createOriginalTranslationFromSnapshot(
             updatedBook,
-            await getSnapshotImageDataUrl(snapshot),
+            snapshot,
             abortController.signal,
           )
           translationsForSave = replaceTranslationRecord(translationsForSave, originalTranslation)
@@ -3996,7 +4249,7 @@ function TranslationWorkspace() {
           job = updatedJob
           originalTranslation = await createOriginalTranslationFromSnapshot(
             pageBook,
-            await getSnapshotImageDataUrl(snapshot),
+            snapshot,
             abortController.signal,
           )
           translationsForSave = replaceTranslationRecord(translationsForSave, originalTranslation)
@@ -5736,14 +5989,72 @@ function TranslationWorkspace() {
                       <div>
                         <strong>Page {selectedSnapshot.pageNumber}</strong>
                         <span>{selectedSnapshot.width} x {selectedSnapshot.height}</span>
+                        {splitCuts.length ? <span className="split-badge">{splitCuts.length + 1} columns</span> : null}
                       </div>
                       <a className="mini-button" href={getSnapshotImageSrc(selectedSnapshot)} target="_blank" rel="noreferrer">
                         Open Image
                       </a>
                     </div>
-                    <div className="snapshot-preview-stage">
-                      <img src={getSnapshotImageSrc(selectedSnapshot)} alt={`Snapshot of page ${selectedSnapshot.pageNumber}`} />
+                    <div
+                      className="snapshot-preview-stage snapshot-split-stage"
+                      onPointerMove={(event) => updateDraggedCut(event.clientX)}
+                      onPointerUp={() => setDraggingCutIndex(null)}
+                      onPointerLeave={() => setDraggingCutIndex(null)}
+                    >
+                      <div className="split-image-wrap" ref={splitStageRef}>
+                        <img src={getSnapshotImageSrc(selectedSnapshot)} alt={`Snapshot of page ${selectedSnapshot.pageNumber}`} />
+                        {[...splitCuts]
+                          .map((cut, index) => ({ cut, index }))
+                          .sort((left, right) => left.cut - right.cut)
+                          .map(({ cut, index }, order) => (
+                            <div
+                              key={index}
+                              className={draggingCutIndex === index ? 'split-cut dragging' : 'split-cut'}
+                              style={{ left: `${cut * 100}%` }}
+                              onPointerDown={(event) => {
+                                event.preventDefault()
+                                setDraggingCutIndex(index)
+                              }}
+                              role="separator"
+                              aria-label={`Column cut ${order + 1}`}
+                            >
+                              <button
+                                type="button"
+                                className="split-cut-remove"
+                                onPointerDown={(event) => event.stopPropagation()}
+                                onClick={() => setSplitCuts((current) => current.filter((_, position) => position !== index))}
+                                title="Remove this cut"
+                              >
+                                x
+                              </button>
+                            </div>
+                          ))}
+                      </div>
                     </div>
+                    <div className="snapshot-split-toolbar">
+                      <button type="button" className="mini-button" onClick={detectSnapshotSplit} disabled={splitDetecting}>
+                        {splitDetecting ? 'Detecting...' : 'Re-detect columns'}
+                      </button>
+                      <button type="button" className="mini-button" onClick={detectSnapshotSplitWithAi} disabled={splitDetecting}>
+                        Detect with AI
+                      </button>
+                      <button type="button" className="mini-button" onClick={addSnapshotSplitCut}>+ Add cut</button>
+                      <button type="button" className="mini-button" onClick={() => setSplitCuts([])} disabled={!splitCuts.length}>
+                        Clear
+                      </button>
+                      <span className="split-toolbar-spacer" />
+                      <button type="button" className="mini-button" onClick={saveSplitAsBookDefault}>
+                        Save as book default
+                      </button>
+                      <button type="button" className="mini-button primary" onClick={applySnapshotSplit}>
+                        Apply to page
+                      </button>
+                    </div>
+                    <p className="snapshot-path">
+                      {splitCuts.length
+                        ? 'Columns are OCR’d left-to-right as separate passes, then stitched into one page.'
+                        : 'No split: this page is OCR’d as a single image. Detect or add a cut for multi-column pages.'}
+                    </p>
                     <p className="snapshot-path">
                       {selectedSnapshot.filePath ?? 'Stored in local app database'}
                     </p>
