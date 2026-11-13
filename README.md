@@ -7,7 +7,9 @@ Authoring and translation now run in a browser, served by a Rust/Axum API. SQLit
 Install Docker Desktop and Node.js. A host Rust installation is optional because the container builds the server.
 
 ```sh
-git switch -c your-feature
+# Run from the mainline checkout
+git worktree add ../Olai-my-feature -b feature/my-change
+cd ../Olai-my-feature
 bash scripts/env worktree up
 python3 scripts/endpoint
 ```
@@ -42,7 +44,7 @@ For a container deployment, run the same image with its library volume and mount
 
 ## Review and promotion
 
-Development uses one Git worktree per feature branch. Keep a separate checkout of the actual default branch, `main`, for Mac staging. These checkouts share repository history and have independent runtime environments.
+Development uses one Git worktree per feature branch. Keep a separate checkout of the actual default branch, `main`, for Mac staging. These checkouts share repository history and have independent runtime environments. On this Mac, `/Users/rajanthegoat/work/Olai-mainline` is the `main` checkout and `/Users/rajanthegoat/work/Olai` holds the migration feature branch.
 
 After the reviewed changes are merged into the remote `main`, run this from the mainline checkout:
 
