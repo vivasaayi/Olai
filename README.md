@@ -44,7 +44,7 @@ For a container deployment, run the same image with its library volume and mount
 
 ## Review and promotion
 
-Development uses one Git worktree per feature branch. Keep a separate checkout of the actual default branch, `main`, for Mac staging. These checkouts share repository history and have independent runtime environments. On this Mac, `/Users/rajanthegoat/work/Olai-mainline` is the `main` checkout and `/Users/rajanthegoat/work/Olai` holds the migration feature branch.
+Development uses one Git worktree per feature branch. Keep a separate checkout of the actual default branch, `main`, for Mac staging. These checkouts share repository history and have independent runtime environments. On this Mac, `/Users/rajanthegoat/work/Olai` is the canonical `main` checkout. Create feature worktrees in sibling directories such as `/Users/rajanthegoat/work/Olai-my-feature`, and run staging updates from the canonical checkout.
 
 After the reviewed changes are merged into the remote `main`, run this from the mainline checkout:
 
