@@ -37,6 +37,17 @@ impl Store {
         )?;
         Ok(store)
     }
+    pub fn backup(source: &Path, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = destination.parent().filter(|path| !path.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        let db = Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let file = fs::OpenOptions::new().write(true).create_new(true).open(destination)?;
+        drop(file);
+        db.backup(rusqlite::DatabaseName::Main, destination, None)?;
+        Ok(())
+    }
+
     fn connect(&self) -> Result<Connection, rusqlite::Error> {
         let db = Connection::open(&self.path)?;
         db.busy_timeout(Duration::from_secs(10))?;

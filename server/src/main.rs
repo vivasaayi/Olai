@@ -307,6 +307,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let data_dir = PathBuf::from(env::var("OLAI_DATA_DIR").unwrap_or_else(|_| "./data".into()));
+    if args.get(1).map(String::as_str) == Some("backup") {
+        let destination = args.get(2).ok_or("Usage: olai-server backup /path/to/library.sqlite")?;
+        Store::backup(&data_dir.join("library.sqlite"), std::path::Path::new(destination))?;
+        println!("Library backup saved to {destination}");
+        return Ok(());
+    }
     let store = Store::open(data_dir)?;
     match args.get(1).map(String::as_str) {
         Some("migrate") => {
@@ -367,6 +373,21 @@ mod tests {
         };
         (temp, state)
     }
+    #[tokio::test]
+    async fn backup_preserves_books_and_assets_and_refuses_to_overwrite() {
+        let (temp, state) = fixture();
+        state.store.save("books".into(), "saved".into(), json!({"id":"saved","title":"Before migration"})).await.unwrap();
+        state.store.asset_save("pdf".into(), "saved".into(), "original.pdf".into(), "application/pdf".into(), b"%PDF-backup".to_vec()).await.unwrap();
+        let destination = temp.path().join("backups/library.sqlite");
+        Store::backup(&temp.path().join("library.sqlite"), &destination).unwrap();
+        let backup = rusqlite::Connection::open(&destination).unwrap();
+        let books: i64 = backup.query_row("SELECT count(*) FROM records", [], |row| row.get(0)).unwrap();
+        let bytes: Vec<u8> = backup.query_row("SELECT data FROM assets WHERE id='pdf'", [], |row| row.get(0)).unwrap();
+        assert_eq!(books, 1);
+        assert_eq!(bytes, b"%PDF-backup");
+        assert!(Store::backup(&temp.path().join("library.sqlite"), &destination).is_err());
+    }
+
     #[tokio::test]
     async fn conflicting_sessions_cannot_overwrite_each_other() {
         let (_temp, state) = fixture();

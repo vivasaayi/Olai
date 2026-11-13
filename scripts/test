@@ -15,12 +15,13 @@ case "${1:-unit}" in
     python3 tests/integration.py "$endpoint"
     ;;
   ui)
-    PLAYWRIGHT_BASE_URL=$(python3 scripts/endpoint worktree)
+    profile=${2:-worktree}
+    PLAYWRIGHT_BASE_URL=$(python3 scripts/endpoint "$profile")
     export PLAYWRIGHT_BASE_URL
     npx playwright test
     ;;
   isolation)
     python3 tests/isolation.py
     ;;
-  *) echo 'Usage: scripts/test unit|integration|ui|isolation|staging|production' >&2; exit 2 ;;
+  *) echo 'Usage: scripts/test unit|integration|ui [worktree|staging]|isolation|staging|production' >&2; exit 2 ;;
 esac

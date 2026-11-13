@@ -42,12 +42,23 @@ For a container deployment, run the same image with its library volume and mount
 
 ## Review and promotion
 
-Development is performed on a feature branch. The actual default branch is `main`. After review and merge, build from its clean checkout and deploy staging on the Mac.
+Development uses one Git worktree per feature branch. Keep a separate checkout of the actual default branch, `main`, for Mac staging. These checkouts share repository history and have independent runtime environments.
+
+After the reviewed changes are merged into the remote `main`, run this from the mainline checkout:
+
+```sh
+python3 scripts/update-staging
+```
+
+The command requires a clean `main` checkout, pulls with `--ff-only`, builds a commit-tagged image, backs up an existing staging library before migrations, deploys its exact image ID, and runs API and browser acceptance checks. It records the commit, image, schema version, backup and results under the staging environment's private state directory. Repeated updates preserve staging books, PDFs, translations and exports. Concurrent invocations serialize through a staging-specific lock.
+
+The component commands are also available:
 
 ```sh
 bash scripts/build staging
 bash scripts/deploy staging
 bash scripts/test staging
+bash scripts/test ui staging
 ```
 
 Staging reserves `http://100.108.139.101:20480` on the Mac Studio. Production reserves port `30480` on the remote host and consumes an explicit tested image through `bash scripts/deploy production --image <tested-image>`. Transfer the tested platform-compatible image using a registry or Docker save/load. Environment configuration lives outside the checkout under `~/.local/share/work-environments/`.
